@@ -63,6 +63,7 @@ import { buildTableSelectSql, quoteTableIdentifier } from "@/lib/tableSelectSql"
 import { isHiddenGridColumn, usesSyntheticRowIdKey } from "@/lib/tableEditing";
 import { formatGridSqlLiteral } from "@/lib/dataGridSql";
 import { matchesRowStatusFilter, type RowStatus, type RowStatusFilter } from "@/lib/gridRowStatus";
+import { displayCellValue, type CellValue } from "@/lib/cellValue";
 
 import { useToast } from "@/composables/useToast";
 import { useDataGridExport } from "@/composables/useDataGridExport";
@@ -817,7 +818,6 @@ function changePageSize(size: number) {
 }
 
 // --- Editing (composable) ---
-type CellValue = string | number | boolean | null;
 
 interface RowItem {
   id: number;
@@ -1041,7 +1041,7 @@ const activeCellDetail = computed(() => {
   const column = props.result.columns[cell.col];
   if (!item || !column) return null;
   const value = item.data[cell.col] ?? null;
-  const rawValue = formatCell(value);
+  const rawValue = displayCellValue(value);
   const valueText = value === null ? "" : typeof value === "object" ? JSON.stringify(value) : String(value);
   const trimmed = valueText.trim();
   const maybeJson = typeof value === "string" && (trimmed.startsWith("{") || trimmed.startsWith("["));
@@ -1339,7 +1339,6 @@ const {
   selectedCells,
   contextCell: exportContextCell,
   getRowItem: (rowId: number) => visibleDisplayItems.value.find((item) => item.id === rowId),
-  formatCell,
   quoteIdent,
   escapeVal,
 });
@@ -1419,8 +1418,10 @@ async function onGridKeydown(event: KeyboardEvent) {
 }
 
 function copyDetailValue() {
-  if (!activeCellDetail.value) return;
-  copyText(activeCellDetail.value.rawValue);
+  const detail = activeCellDetail.value;
+  if (!detail) return;
+  const text = detail.value === null ? "" : displayCellValue(detail.value);
+  copyText(text);
 }
 
 function copyDetailColumnName() {
@@ -2326,7 +2327,8 @@ defineExpose({
                   <div class="text-muted-foreground">{{ t("grid.formattedJson") }}</div>
                   <pre
                     class="max-h-72 overflow-auto rounded border bg-muted/20 p-2 font-mono text-xs whitespace-pre-wrap break-words"
-                    >{{ activeCellDetail.formattedJson }}</pre
+                  >
+        {{ activeCellDetail.formattedJson }}</pre
                   >
                 </div>
               </div>
@@ -2618,9 +2620,11 @@ defineExpose({
   color: oklch(0.6 0.15 250);
   font-weight: 600;
 }
+
 .ddl-code :deep(.ddl-ident) {
   color: oklch(0.65 0.15 150);
 }
+
 .ddl-code :deep(.ddl-str) {
   color: oklch(0.65 0.15 50);
 }
