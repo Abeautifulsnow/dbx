@@ -38,6 +38,11 @@ interface LoadTreeOptions {
   force?: boolean;
 }
 
+function redisDbLabel(db: number, loadedKeyCount?: number, totalKeyCount?: number): string {
+  if (totalKeyCount == null) return `db${db}`;
+  return `db${db} (${loadedKeyCount ?? 0}/${totalKeyCount})`;
+}
+
 export const useConnectionStore = defineStore("connection", () => {
   const connections = ref<ConnectionConfig[]>([]);
   const isDesktop = isTauriRuntime();
@@ -581,11 +586,13 @@ export const useConnectionStore = defineStore("connection", () => {
         withSavedSqlRoot(
           connectionId,
           dbs.map((db) => ({
-            id: `${connectionId}:db${db}`,
-            label: `db${db}`,
+            id: `${connectionId}:db${db.db}`,
+            label: redisDbLabel(db.db, 0, db.keys),
             type: "redis-db" as const,
             connectionId,
-            database: String(db),
+            database: String(db.db),
+            loadedKeyCount: 0,
+            totalKeyCount: db.keys,
             isExpanded: false,
             children: [],
           })),
@@ -596,6 +603,21 @@ export const useConnectionStore = defineStore("connection", () => {
     } finally {
       node.isLoading = false;
     }
+  }
+
+  function updateRedisDbKeyStats(
+    connectionId: string,
+    db: number,
+    stats: { loaded?: number; total?: number; totalDelta?: number },
+  ) {
+    const node = findNode(treeNodes.value, `${connectionId}:db${db}`);
+    if (!node || node.type !== "redis-db") return;
+    if (stats.loaded != null) node.loadedKeyCount = stats.loaded;
+    if (stats.total != null) node.totalKeyCount = stats.total;
+    if (stats.totalDelta != null && node.totalKeyCount != null) {
+      node.totalKeyCount = Math.max(0, node.totalKeyCount + stats.totalDelta);
+    }
+    node.label = redisDbLabel(db, node.loadedKeyCount, node.totalKeyCount);
   }
 
   async function loadMongoDatabases(connectionId: string) {
@@ -1442,6 +1464,7 @@ export const useConnectionStore = defineStore("connection", () => {
     initFromDisk,
     loadDatabases,
     loadRedisDatabases,
+    updateRedisDbKeyStats,
     loadMongoDatabases,
     loadMongoCollections,
     loadSchemas,

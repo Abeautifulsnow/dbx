@@ -156,6 +156,7 @@ export type {
   AiChatMessage,
   AiConversation,
   UpdateInfo,
+  RedisDatabaseInfo,
   RedisKeyInfo,
   RedisValue,
   RedisScanResult,

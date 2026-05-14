@@ -355,6 +355,11 @@ export interface RedisKeyInfo {
   value_preview: string;
 }
 
+export interface RedisDatabaseInfo {
+  db: number;
+  keys: number;
+}
+
 export interface RedisValue {
   key_display: string;
   key_raw: string;
@@ -369,6 +374,7 @@ export interface RedisValue {
 export interface RedisScanResult {
   cursor: number;
   keys: RedisKeyInfo[];
+  total_keys: number;
 }
 
 export type RedisCommandSafety = "allowed" | "confirm" | "blocked";
@@ -379,7 +385,7 @@ export interface RedisCommandResult {
   value: any;
 }
 
-export async function redisListDatabases(connectionId: string): Promise<number[]> {
+export async function redisListDatabases(connectionId: string): Promise<RedisDatabaseInfo[]> {
   return invoke("redis_list_databases", { connectionId });
 }
 

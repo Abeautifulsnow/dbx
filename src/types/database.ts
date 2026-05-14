@@ -231,6 +231,8 @@ export interface TreeNode {
   schema?: string;
   tableName?: string;
   objectCount?: number;
+  loadedKeyCount?: number;
+  totalKeyCount?: number;
   hiddenChildren?: TreeNode[];
   savedSqlId?: string;
   savedSqlFolderId?: string;

@@ -2,10 +2,13 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::commands::connection::AppState;
-use dbx_core::db::redis_driver::{RedisCommandResult, RedisScanResult, RedisValue};
+use dbx_core::db::redis_driver::{RedisCommandResult, RedisDatabaseInfo, RedisScanResult, RedisValue};
 
 #[tauri::command]
-pub async fn redis_list_databases(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<Vec<u32>, String> {
+pub async fn redis_list_databases(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<Vec<RedisDatabaseInfo>, String> {
     dbx_core::redis_ops::redis_list_databases_core(&state, &connection_id).await
 }
 

@@ -24,6 +24,7 @@ import type {
   AiStreamChunk,
   AiConversation,
   UpdateInfo,
+  RedisDatabaseInfo,
   RedisValue,
   RedisScanResult,
   RedisCommandResult,
@@ -547,7 +548,7 @@ export async function cancelDatabaseExport(exportId: string): Promise<void> {
 // Redis
 // ---------------------------------------------------------------------------
 
-export async function redisListDatabases(connectionId: string): Promise<number[]> {
+export async function redisListDatabases(connectionId: string): Promise<RedisDatabaseInfo[]> {
   return post("/api/redis/list-databases", { connectionId });
 }
 

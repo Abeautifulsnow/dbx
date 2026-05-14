@@ -1,7 +1,10 @@
 use crate::connection::{AppState, PoolKind};
-use crate::db::redis_driver::{self, RedisCommandResult, RedisScanResult, RedisValue};
+use crate::db::redis_driver::{self, RedisCommandResult, RedisDatabaseInfo, RedisScanResult, RedisValue};
 
-pub async fn redis_list_databases_core(state: &AppState, connection_id: &str) -> Result<Vec<u32>, String> {
+pub async fn redis_list_databases_core(
+    state: &AppState,
+    connection_id: &str,
+) -> Result<Vec<RedisDatabaseInfo>, String> {
     let connections = state.connections.read().await;
     let pool = connections.get(connection_id).ok_or("Connection not found")?;
     match pool {

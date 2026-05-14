@@ -7,6 +7,12 @@ const COLLECTION_PAGE_SIZE: usize = 200;
 const DEFAULT_REDIS_DATABASES: u32 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisDatabaseInfo {
+    pub db: u32,
+    pub keys: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisKeyInfo {
     pub key_display: String,
     pub key_raw: String,
@@ -20,6 +26,7 @@ pub struct RedisKeyInfo {
 pub struct RedisScanResult {
     pub cursor: u64,
     pub keys: Vec<RedisKeyInfo>,
+    pub total_keys: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,16 +71,20 @@ pub async fn connect(url: &str) -> Result<redis::aio::MultiplexedConnection, Str
     Ok(con)
 }
 
-pub async fn list_databases(con: &mut redis::aio::MultiplexedConnection) -> Result<Vec<u32>, String> {
+pub async fn list_databases(con: &mut redis::aio::MultiplexedConnection) -> Result<Vec<RedisDatabaseInfo>, String> {
     let configured_count =
         redis::cmd("CONFIG").arg("GET").arg("databases").query_async(con).await.ok().and_then(parse_database_count);
 
     let keyspace_dbs = list_keyspace_databases(con).await.unwrap_or_default();
     let database_count = configured_count.unwrap_or(DEFAULT_REDIS_DATABASES);
-    let max_db = keyspace_dbs.iter().copied().max().map(|db| db + 1).unwrap_or(0);
+    let max_db = keyspace_dbs.iter().map(|db| db.db).max().map(|db| db + 1).unwrap_or(0);
     let visible_count = database_count.max(max_db).max(1);
+    let keyspace_counts =
+        keyspace_dbs.into_iter().map(|db| (db.db, db.keys)).collect::<std::collections::HashMap<_, _>>();
 
-    Ok((0..visible_count).collect())
+    Ok((0..visible_count)
+        .map(|db| RedisDatabaseInfo { db, keys: keyspace_counts.get(&db).copied().unwrap_or(0) })
+        .collect())
 }
 
 fn parse_database_count(value: redis::Value) -> Option<u32> {
@@ -92,15 +103,23 @@ fn parse_database_count(value: redis::Value) -> Option<u32> {
     })
 }
 
-async fn list_keyspace_databases(con: &mut redis::aio::MultiplexedConnection) -> Result<Vec<u32>, String> {
+async fn list_keyspace_databases(
+    con: &mut redis::aio::MultiplexedConnection,
+) -> Result<Vec<RedisDatabaseInfo>, String> {
     let info: String = redis::cmd("INFO").arg("keyspace").query_async(con).await.map_err(|e| e.to_string())?;
 
     let mut dbs = Vec::new();
     for line in info.lines() {
         if line.starts_with("db") {
-            if let Some(num) = line.strip_prefix("db").and_then(|s| s.split(':').next()) {
-                if let Ok(n) = num.parse::<u32>() {
-                    dbs.push(n);
+            if let Some((db_part, stats_part)) = line.split_once(':') {
+                if let Some(num) = db_part.strip_prefix("db") {
+                    if let Ok(db) = num.parse::<u32>() {
+                        let keys = stats_part
+                            .split(',')
+                            .find_map(|part| part.strip_prefix("keys=").and_then(|value| value.parse::<u64>().ok()))
+                            .unwrap_or(0);
+                        dbs.push(RedisDatabaseInfo { db, keys });
+                    }
                 }
             }
         }
@@ -276,8 +295,9 @@ pub async fn scan_keys_page(
         .map_err(|e| e.to_string())?;
 
     let (next_cursor, keys) = parse_scan_keys(raw)?;
+    let total_keys: u64 = redis::cmd("DBSIZE").query_async(con).await.unwrap_or(0);
     if keys.is_empty() {
-        return Ok(RedisScanResult { cursor: next_cursor, keys: Vec::new() });
+        return Ok(RedisScanResult { cursor: next_cursor, keys: Vec::new(), total_keys });
     }
 
     let mut pipe = redis::pipe();
@@ -297,7 +317,7 @@ pub async fn scan_keys_page(
             value_preview: String::new(),
         });
     }
-    Ok(RedisScanResult { cursor: next_cursor, keys: result })
+    Ok(RedisScanResult { cursor: next_cursor, keys: result, total_keys })
 }
 
 pub async fn get_value(con: &mut redis::aio::MultiplexedConnection, key: &[u8]) -> Result<RedisValue, String> {

@@ -25,6 +25,7 @@ import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import RedisValueViewer from "./RedisValueViewer.vue";
 import * as api from "@/lib/api";
 import type { RedisKeyInfo } from "@/lib/api";
+import { useConnectionStore } from "@/stores/connectionStore";
 import {
   buildRedisKeyTree,
   collectExpandedGroupIds,
@@ -36,6 +37,7 @@ import { classifyRedisCommandSafety } from "@/lib/redisCommandSafety";
 import { isCancelSearchShortcut } from "@/lib/keyboardShortcuts";
 
 const { t } = useI18n();
+const connectionStore = useConnectionStore();
 
 const props = defineProps<{
   connectionId: string;
@@ -134,6 +136,10 @@ async function scanNextPage() {
   scanCursor.value = result.cursor;
   hasMore.value = result.cursor !== 0;
   rebuildTree(isSearchMode.value);
+  connectionStore.updateRedisDbKeyStats(props.connectionId, props.db, {
+    loaded: isSearchMode.value ? undefined : flatKeys.value.length,
+    total: result.total_keys,
+  });
 }
 
 async function loadKeys() {
@@ -180,6 +186,10 @@ function onKeyDeleted() {
   flatKeys.value = flatKeys.value.filter((key) => key.key_raw !== selectedKeyRaw.value);
   selectedKeyRaw.value = null;
   rebuildTree(false);
+  connectionStore.updateRedisDbKeyStats(props.connectionId, props.db, {
+    loaded: isSearchMode.value ? undefined : flatKeys.value.length,
+    totalDelta: -1,
+  });
 }
 
 function toggleCheck(keyRaw: string, event: Event) {
@@ -220,7 +230,7 @@ function resetLoadedKeys() {
 }
 
 async function deleteKeyRaws(keys: string[]) {
-  await api.redisDeleteKeys(props.connectionId, props.db, keys);
+  const deletedCount = await api.redisDeleteKeys(props.connectionId, props.db, keys);
   const deleted = new Set(keys);
   flatKeys.value = flatKeys.value.filter((k) => !deleted.has(k.key_raw));
   if (selectedKeyRaw.value && deleted.has(selectedKeyRaw.value)) {
@@ -228,6 +238,10 @@ async function deleteKeyRaws(keys: string[]) {
   }
   checkedKeys.value = new Set();
   rebuildTree(false);
+  connectionStore.updateRedisDbKeyStats(props.connectionId, props.db, {
+    loaded: isSearchMode.value ? undefined : flatKeys.value.length,
+    totalDelta: -deletedCount,
+  });
 }
 
 async function runRedisCommand(command: string) {
@@ -280,6 +294,7 @@ async function applyDangerAction() {
   } else if (pending.kind === "flush-db") {
     await api.redisFlushDb(props.connectionId, props.db);
     resetLoadedKeys();
+    connectionStore.updateRedisDbKeyStats(props.connectionId, props.db, { loaded: 0, total: 0 });
   } else {
     await runRedisCommand(pending.command);
   }
