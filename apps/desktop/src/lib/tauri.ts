@@ -62,6 +62,11 @@ export interface AiCompletionRequest {
   temperature?: number;
 }
 
+export interface AiModelInfo {
+  id: string;
+  displayName?: string;
+}
+
 export async function aiComplete(request: AiCompletionRequest): Promise<string> {
   return invoke("ai_complete", { request });
 }
@@ -98,6 +103,10 @@ export async function saveAiConfig(config: AiConfig): Promise<void> {
 
 export async function aiTestConnection(config: AiConfig): Promise<string> {
   return invoke("ai_test_connection", { config });
+}
+
+export async function aiListModels(config: AiConfig): Promise<AiModelInfo[]> {
+  return invoke("ai_list_models", { config });
 }
 
 export async function aiCancelStream(sessionId: string): Promise<boolean> {

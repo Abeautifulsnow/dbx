@@ -2,7 +2,7 @@ use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{Notify, RwLock};
@@ -135,6 +135,14 @@ pub struct AiConversation {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModelInfo {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -176,6 +184,29 @@ fn resolve_gemini_stream_endpoint(config: &AiConfig) -> String {
     } else {
         endpoint.replace(":generateContent", ":streamGenerateContent")
     }
+}
+
+pub fn resolve_model_list_endpoint(config: &AiConfig) -> Result<String, String> {
+    if matches!(config.provider, AiProvider::Gemini) {
+        return Err("Model listing is only supported for OpenAI-compatible and Claude providers".to_string());
+    }
+
+    let ep = config.endpoint.trim().trim_end_matches('/');
+    if ep.is_empty() {
+        return Err("Endpoint is required".to_string());
+    }
+    if ep.ends_with("/models") {
+        return Ok(ep.to_string());
+    }
+
+    let base = ep
+        .strip_suffix("/chat/completions")
+        .or_else(|| ep.strip_suffix("/responses"))
+        .or_else(|| ep.strip_suffix("/messages"))
+        .unwrap_or(ep)
+        .trim_end_matches('/');
+
+    Ok(format!("{base}/models"))
 }
 
 pub fn stream_data_payload(line: &str) -> Option<&str> {
@@ -264,6 +295,13 @@ fn validate_config(config: &AiConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_model_list_config(config: &AiConfig) -> Result<(), String> {
+    if !matches!(config.provider, AiProvider::Ollama) && config.api_key.trim().is_empty() {
+        return Err("API key is required".to_string());
+    }
+    resolve_model_list_endpoint(config).map(|_| ())
+}
+
 fn maybe_bearer_headers(config: &AiConfig) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -273,6 +311,14 @@ fn maybe_bearer_headers(config: &AiConfig) -> Result<HeaderMap, String> {
             HeaderValue::from_str(&format!("Bearer {}", config.api_key)).map_err(|e| e.to_string())?,
         );
     }
+    Ok(headers)
+}
+
+fn claude_headers(config: &AiConfig) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("x-api-key", HeaderValue::from_str(&config.api_key).map_err(|e| e.to_string())?);
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     Ok(headers)
 }
 
@@ -286,15 +332,95 @@ pub fn build_ai_http_client(config: &AiConfig, timeout_secs: u64) -> Result<reqw
 }
 
 // ---------------------------------------------------------------------------
+// Model listing
+// ---------------------------------------------------------------------------
+
+fn parse_model_list_response(data: &serde_json::Value) -> Result<Vec<AiModelInfo>, String> {
+    let items = data["data"].as_array().ok_or_else(|| "Invalid model list response".to_string())?;
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
+
+    for item in items {
+        let Some(id) = item["id"].as_str().filter(|id| !id.trim().is_empty()) else {
+            continue;
+        };
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+
+        let display_name = item["display_name"]
+            .as_str()
+            .or_else(|| item["name"].as_str())
+            .filter(|name| !name.trim().is_empty() && *name != id)
+            .map(ToString::to_string);
+
+        models.push(AiModelInfo { id: id.to_string(), display_name });
+    }
+
+    Ok(models)
+}
+
+async fn list_claude_models(client: &reqwest::Client, config: &AiConfig) -> Result<Vec<AiModelInfo>, String> {
+    let res = client
+        .get(resolve_model_list_endpoint(config)?)
+        .headers(claude_headers(config)?)
+        .send()
+        .await
+        .map_err(|e| format!("Claude model list request failed: {e}"))?;
+
+    let status = res.status();
+    let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(extract_error(&data).unwrap_or_else(|| format!("Claude model list API error: {status}")));
+    }
+
+    parse_model_list_response(&data)
+}
+
+async fn list_openai_compatible_models(
+    client: &reqwest::Client,
+    config: &AiConfig,
+) -> Result<Vec<AiModelInfo>, String> {
+    let res = client
+        .get(resolve_model_list_endpoint(config)?)
+        .headers(maybe_bearer_headers(config)?)
+        .send()
+        .await
+        .map_err(|e| format!("AI model list request failed: {e}"))?;
+
+    let status = res.status();
+    let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(extract_error(&data).unwrap_or_else(|| format!("Model list API error: {status}")));
+    }
+
+    parse_model_list_response(&data)
+}
+
+pub async fn list_models_core(config: &AiConfig) -> Result<Vec<AiModelInfo>, String> {
+    validate_model_list_config(config)?;
+
+    let client = build_ai_http_client(config, 30)?;
+
+    match config.provider {
+        AiProvider::Claude => list_claude_models(&client, config).await,
+        AiProvider::Openai
+        | AiProvider::Deepseek
+        | AiProvider::Qwen
+        | AiProvider::Ollama
+        | AiProvider::OpenaiCompatible
+        | AiProvider::Custom => list_openai_compatible_models(&client, config).await,
+        AiProvider::Gemini => {
+            Err("Model listing is only supported for OpenAI-compatible and Claude providers".to_string())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Non-streaming calls
 // ---------------------------------------------------------------------------
 
 pub async fn call_claude(client: &reqwest::Client, request: AiCompletionRequest) -> Result<String, String> {
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert("x-api-key", HeaderValue::from_str(&request.config.api_key).map_err(|e| e.to_string())?);
-    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-
     let body = json!({
         "model": request.config.model,
         "max_tokens": request.max_tokens.unwrap_or(2048),
@@ -305,7 +431,7 @@ pub async fn call_claude(client: &reqwest::Client, request: AiCompletionRequest)
 
     let res = client
         .post(&resolve_endpoint(&request.config))
-        .headers(headers)
+        .headers(claude_headers(&request.config)?)
         .json(&body)
         .send()
         .await
@@ -532,11 +658,6 @@ async fn stream_claude(
     cancelled: &Notify,
     on_chunk: &impl Fn(AiStreamChunk),
 ) -> Result<(), String> {
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert("x-api-key", HeaderValue::from_str(&request.config.api_key).map_err(|e| e.to_string())?);
-    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-
     let body = json!({
         "model": request.config.model,
         "max_tokens": request.max_tokens.unwrap_or(2048),
@@ -548,7 +669,7 @@ async fn stream_claude(
 
     let res = client
         .post(&resolve_endpoint(&request.config))
-        .headers(headers)
+        .headers(claude_headers(&request.config)?)
         .json(&body)
         .send()
         .await
@@ -920,7 +1041,8 @@ pub fn load_config(path: &Path) -> Result<Option<AiConfig>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ai_http_client, gemini_text, resolve_endpoint, validate_config, AiApiStyle, AiConfig, AiProvider,
+        build_ai_http_client, gemini_text, parse_model_list_response, resolve_endpoint, resolve_model_list_endpoint,
+        validate_config, AiApiStyle, AiConfig, AiModelInfo, AiProvider,
     };
 
     #[test]
@@ -988,6 +1110,56 @@ mod tests {
 
         assert_eq!(resolve_endpoint(&ollama), "http://localhost:11434/v1/chat/completions");
         assert!(validate_config(&ollama).is_ok());
+    }
+
+    #[test]
+    fn resolves_model_list_endpoints_from_base_and_completion_urls() {
+        let openai = AiConfig {
+            provider: AiProvider::Openai,
+            api_key: "key".to_string(),
+            endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
+            model: String::new(),
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            enable_thinking: true,
+        };
+        assert_eq!(resolve_model_list_endpoint(&openai).unwrap(), "https://api.openai.com/v1/models");
+
+        let claude = AiConfig {
+            provider: AiProvider::Claude,
+            api_key: "key".to_string(),
+            endpoint: "https://api.anthropic.com/v1/messages".to_string(),
+            model: String::new(),
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            enable_thinking: true,
+        };
+        assert_eq!(resolve_model_list_endpoint(&claude).unwrap(), "https://api.anthropic.com/v1/models");
+    }
+
+    #[test]
+    fn parses_openai_and_claude_model_list_items() {
+        let data = serde_json::json!({
+            "data": [
+                { "id": "gpt-4o-mini" },
+                { "id": "claude-sonnet-4-20250514", "display_name": "Claude Sonnet 4" },
+                { "id": "gpt-4o-mini" },
+                { "display_name": "Missing ID" }
+            ]
+        });
+
+        assert_eq!(
+            parse_model_list_response(&data).unwrap(),
+            vec![
+                AiModelInfo { id: "gpt-4o-mini".to_string(), display_name: None },
+                AiModelInfo {
+                    id: "claude-sonnet-4-20250514".to_string(),
+                    display_name: Some("Claude Sonnet 4".to_string())
+                },
+            ]
+        );
     }
 
     #[test]

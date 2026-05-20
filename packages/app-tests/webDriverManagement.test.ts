@@ -28,6 +28,9 @@ test("shared frontend API exposes agent driver management functions", () => {
     assert.match(httpSource, new RegExp(`export async function ${name}\\b`));
     assert.match(tauriSource, new RegExp(`export async function ${name}\\b`));
   }
+  assert.match(apiSource, /export const aiListModels = forward\("aiListModels"\)/);
+  assert.match(httpSource, /export async function aiListModels\b/);
+  assert.match(tauriSource, /export async function aiListModels\b/);
 });
 
 test("web backend exposes agent driver management routes", () => {
@@ -36,4 +39,5 @@ test("web backend exposes agent driver management routes", () => {
   assert.match(webMainSource, /\/agents\/install/);
   assert.match(webMainSource, /\/agents\/progress\/\{operationId\}/);
   assert.match(webMainSource, /\/agents\/java-runtime/);
+  assert.match(webMainSource, /\/ai\/models/);
 });

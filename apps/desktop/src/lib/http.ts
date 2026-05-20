@@ -24,6 +24,7 @@ import type {
   AiCompletionRequest,
   AiStreamChunk,
   AiConversation,
+  AiModelInfo,
   DriverInstallProgress,
   JavaRuntimeConfig,
   UpdateInfo,
@@ -439,6 +440,10 @@ export async function aiCancelStream(sessionId: string): Promise<boolean> {
 
 export async function aiTestConnection(config: AiConfig): Promise<string> {
   return post("/api/ai/test-connection", { config });
+}
+
+export async function aiListModels(config: AiConfig): Promise<AiModelInfo[]> {
+  return post("/api/ai/models", { config });
 }
 
 export async function saveAiConfig(config: AiConfig): Promise<void> {

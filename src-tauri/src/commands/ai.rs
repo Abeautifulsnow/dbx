@@ -10,6 +10,11 @@ pub async fn ai_test_connection(config: AiConfig) -> Result<String, String> {
 }
 
 #[tauri::command]
+pub async fn ai_list_models(config: AiConfig) -> Result<Vec<AiModelInfo>, String> {
+    dbx_core::ai::list_models_core(&config).await
+}
+
+#[tauri::command]
 pub async fn save_ai_config(state: State<'_, Arc<AppState>>, config: AiConfig) -> Result<(), String> {
     state.storage.save_ai_config(&config).await
 }

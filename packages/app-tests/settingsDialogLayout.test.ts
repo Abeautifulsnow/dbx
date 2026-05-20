@@ -43,3 +43,10 @@ test("settings dialog exposes sidebar activation in navigation settings", () => 
   assert.match(source, /activeSettingsTab === ['"]navigation['"]/);
   assert.match(source, /settings\.sidebarActivation/);
 });
+
+test("AI settings can browse provider model names while keeping manual input", () => {
+  assert.match(source, /aiListModels/);
+  assert.match(source, /<SearchableSelect[\s\S]*:options="aiModelOptionIds"/);
+  assert.match(source, /v-model="aiEditModel"/);
+  assert.match(source, /aiRefreshModels/);
+});

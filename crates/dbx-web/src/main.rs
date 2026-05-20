@@ -169,6 +169,7 @@ async fn main() {
         .route("/ai/stream", post(routes::ai::ai_stream))
         .route("/ai/cancel-stream", post(routes::ai::ai_cancel_stream))
         .route("/ai/test-connection", post(routes::ai::ai_test_connection))
+        .route("/ai/models", post(routes::ai::ai_list_models))
         // Transfer
         .route("/transfer/start", post(routes::transfer::start_transfer))
         .route("/transfer/progress/{transferId}", get(routes::transfer::transfer_progress))

@@ -6,7 +6,7 @@ use axum::Json;
 use futures::stream::Stream;
 use serde::Deserialize;
 
-use dbx_core::ai::{AiCompletionRequest, AiConfig, AiConversation, AiStreamChunk};
+use dbx_core::ai::{AiCompletionRequest, AiConfig, AiConversation, AiModelInfo, AiStreamChunk};
 
 use crate::error::AppError;
 use crate::state::WebState;
@@ -43,6 +43,12 @@ pub struct AiStreamRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiTestConnectionRequest {
+    pub config: AiConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiListModelsRequest {
     pub config: AiConfig,
 }
 
@@ -109,6 +115,11 @@ pub async fn ai_complete(Json(body): Json<AiCompleteRequest>) -> Result<Json<Str
 
 pub async fn ai_test_connection(Json(body): Json<AiTestConnectionRequest>) -> Result<Json<String>, AppError> {
     let result = dbx_core::ai::test_connection_core(&body.config).await.map_err(AppError)?;
+    Ok(Json(result))
+}
+
+pub async fn ai_list_models(Json(body): Json<AiListModelsRequest>) -> Result<Json<Vec<AiModelInfo>>, AppError> {
+    let result = dbx_core::ai::list_models_core(&body.config).await.map_err(AppError)?;
     Ok(Json(result))
 }
 
