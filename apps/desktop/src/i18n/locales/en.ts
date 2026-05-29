@@ -989,6 +989,7 @@ export default {
     editComment: "Edit comment",
     commentPlaceholder: "Enter column comment...",
     tableCommentPlaceholder: "Enter table comment...",
+    tableCommentUnsupported: "Table comments are not supported by this database",
     actions: "Actions",
     indexName: "Index",
     indexColumns: "Columns",

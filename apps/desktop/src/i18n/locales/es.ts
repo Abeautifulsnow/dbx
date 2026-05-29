@@ -883,6 +883,7 @@ export default {
     editComment: "Editar comentario",
     commentPlaceholder: "Ingresar comentario de columna...",
     tableCommentPlaceholder: "Ingresar comentario de tabla...",
+    tableCommentUnsupported: "La base de datos no admite comentarios de tabla",
     actions: "Acciones",
     indexName: "Índice",
     indexColumns: "Columnas",

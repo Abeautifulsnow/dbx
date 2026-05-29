@@ -12,6 +12,7 @@ import {
   ChevronDown,
   ChevronUp,
   Database,
+  Info,
   KeyRound,
   Loader2,
   Maximize2,
@@ -28,6 +29,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -134,6 +136,7 @@ function onIndexColResize(e: MouseEvent, col: number) {
 const connection = computed(() => (props.connectionId ? store.getConfig(props.connectionId) : undefined));
 const databaseType = computed(() => connection.value?.db_type);
 const structureCapabilities = computed(() => getTableStructureCapabilities(databaseType.value));
+const isTableCommentDisabled = computed(() => !structureCapabilities.value.comment);
 const dataTypeOptions = computed(() => DATA_TYPE_OPTIONS[databaseType.value ?? ""] ?? []);
 
 const indexTypesByDb: Record<string, string[]> = {
@@ -509,7 +512,14 @@ watch(
         v-model="tableComment"
         :placeholder="t('structureEditor.tableCommentPlaceholder')"
         class="h-6 max-w-[320px] text-[11px]"
+        :disabled="isTableCommentDisabled"
       />
+      <Tooltip v-if="isTableCommentDisabled">
+        <TooltipTrigger as-child>
+          <Info class="h-4 w-4 shrink-0 text-muted-foreground" />
+        </TooltipTrigger>
+        <TooltipContent>{{ t("structureEditor.tableCommentUnsupported") }}</TooltipContent>
+      </Tooltip>
     </div>
 
     <div v-if="loading" class="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
