@@ -80,3 +80,11 @@ test("new column input is focused after adding a field", () => {
   assert.match(source, /data-column-name-input/);
   assert.match(source, /input\?\.focus\(\)/);
 });
+
+test("table comment input is disabled and shows tooltip when database does not support comments", () => {
+  assert.match(source, /isTableCommentDisabled/);
+  assert.match(source, /:disabled="isTableCommentDisabled"/);
+  assert.match(source, /v-if="isTableCommentDisabled"/);
+  assert.match(source, /Tooltip/);
+  assert.match(source, /tableCommentUnsupported/);
+});

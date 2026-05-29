@@ -5,6 +5,14 @@ import {
   getTableStructureCapabilities,
 } from "../../apps/desktop/src/lib/tableStructureCapabilities.ts";
 
+test("sqlite and duckdb do not support table comments", () => {
+  for (const dbType of ["sqlite", "duckdb"] as const) {
+    const caps = getTableStructureCapabilities(dbType);
+    assert.equal(caps.comment, false, `${dbType} should not support comments`);
+    assert.equal(caps.createTable, true, `${dbType} should still support creating tables`);
+  }
+});
+
 test("postgres-like databases expose safe structure editing capabilities", () => {
   for (const dbType of ["postgres", "gaussdb", "opengauss", "highgo", "vastbase", "kingbase"] as const) {
     const caps = getTableStructureCapabilities(dbType);
