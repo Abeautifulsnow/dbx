@@ -1,8 +1,8 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, ref, watch, nextTick } from "vue";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { X, Pin, ChevronDown, Table2, Code2, TableProperties, PencilRuler, KeyRound, Pencil, Package, Check } from "@lucide/vue";
+import { X, Pin, ChevronDown, Table2, Code2, TableProperties, PencilRuler, KeyRound, Pencil, Package, Check, Lock } from "@lucide/vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
@@ -10,7 +10,7 @@ import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useTabScroll } from "@/composables/useTabScroll";
 import { useTabDrag } from "@/composables/useTabDrag";
-import { connectionColor, tabDisplayTitle, tabTooltipLines } from "@/lib/tabPresentation";
+import { connectionColor, isConnectionReadonly, tabDisplayTitle, tabTooltipLines } from "@/lib/tabPresentation";
 import { hexToRgba } from "@/lib/color";
 import type { QueryTab } from "@/types/database";
 
@@ -307,6 +307,12 @@ function activateTab(tabId: string) {
                     @blur="commitRenameTab(tab)"
                   />
                   <span v-else class="min-w-0 truncate flex-1">{{ tabDisplayTitle(tab, t) }}</span>
+                  <Tooltip v-if="isConnectionReadonly(tab.connectionId)">
+                    <TooltipTrigger as-child>
+                      <Lock class="h-3 w-3 text-muted-foreground shrink-0" />
+                    </TooltipTrigger>
+                    <TooltipContent>{{ t("connection.readOnlyBadge") }}</TooltipContent>
+                  </Tooltip>
                   <Tooltip>
                     <TooltipTrigger as-child>
                       <button class="inline-flex rounded p-0.5 text-muted-foreground hover:bg-muted-foreground/20 hover:text-foreground focus:opacity-100" :class="tab.pinned ? 'visible text-primary' : 'invisible group-hover:visible'" @click.stop="queryStore.togglePinnedTab(tab.id)">

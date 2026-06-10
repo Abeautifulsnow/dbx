@@ -1,4 +1,4 @@
-export default {
+﻿export default {
   app: {
     name: "DBX",
   },
@@ -282,6 +282,7 @@ export default {
     idleTimeout: "Tiempo de espera inactivo (segundos)",
     readOnly: "Solo lectura",
     readOnlyHint: "Bloquear todas las operaciones de escritura (INSERT, UPDATE, DELETE, etc.)",
+    readOnlyBadge: "Solo lectura",
     proxy: "Proxy",
     proxyEnable: "Conectar la base de datos mediante proxy",
     proxyType: "Tipo de proxy",

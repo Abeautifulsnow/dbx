@@ -1,4 +1,4 @@
-import { useConnectionStore } from "@/stores/connectionStore";
+﻿import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import type { QueryResult, QueryTab } from "@/types/database";
 
@@ -12,6 +12,11 @@ export function connectionDisplayName(connectionId: string): string {
 export function connectionColor(connectionId: string): string {
   const connectionStore = useConnectionStore();
   return connectionStore.getConfig(connectionId)?.color || "";
+}
+
+export function isConnectionReadonly(connectionId: string): boolean {
+  const connectionStore = useConnectionStore();
+  return connectionStore.getConfig(connectionId)?.read_only ?? false;
 }
 
 export function databaseDisplayNameForTab(connectionId: string, database: string, t: Translate): string {

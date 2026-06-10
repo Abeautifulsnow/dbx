@@ -1,4 +1,4 @@
-export default {
+﻿export default {
   app: {
     name: "DBX",
   },
@@ -301,6 +301,7 @@ export default {
     idleTimeout: "空闲超时（秒）",
     readOnly: "只读模式",
     readOnlyHint: "阻止所有写操作（INSERT、UPDATE、DELETE 等）",
+    readOnlyBadge: "只读",
     proxy: "代理",
     proxyEnable: "通过代理连接数据库",
     proxyType: "代理类型",
