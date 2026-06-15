@@ -870,6 +870,15 @@ function onAiRequestAutoExecuteSql(sql: string) {
   });
 }
 
+function onAiOpenExplainPlan(sql: string) {
+  const tabId = ensureQueryTab();
+  queryStore.updateSql(tabId, sql);
+  selectedSql.value = "";
+  nextTick(() => {
+    void tryExplain(sql);
+  });
+}
+
 function handleKeydown(e: KeyboardEvent) {
   if (e.defaultPrevented) return;
 
@@ -1275,7 +1284,7 @@ onUnmounted(() => {
           <div v-if="showAiPanel" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: aiPanelWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startAiPanelResize" />
             <div class="h-full min-h-0 overflow-hidden">
-              <AiAssistant v-if="aiPanelReady" ref="aiAssistantRef" :tab="activeTab" :connection="activeConnection" @replace-sql="onAiReplaceSql" @execute-sql="onAiExecuteSql" @request-auto-execute-sql="onAiRequestAutoExecuteSql" @close="toggleAiPanel" />
+              <AiAssistant v-if="aiPanelReady" ref="aiAssistantRef" :tab="activeTab" :connection="activeConnection" @replace-sql="onAiReplaceSql" @execute-sql="onAiExecuteSql" @request-auto-execute-sql="onAiRequestAutoExecuteSql" @open-explain-plan="onAiOpenExplainPlan" @close="toggleAiPanel" />
             </div>
           </div>
 

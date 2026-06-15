@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, type Component } from 
 import { uuid } from "@/lib/utils";
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
-import { ArrowUp, ArrowRightLeft, AlertTriangle, Bot, Check, ChevronRight, CircleSlash, Copy, Database, HelpCircle, History, Loader2, MessageSquarePlus, Replace, Server, ShieldCheck, Table2, Play, Square, Trash2, Terminal, Wand2, Wrench, X, Zap, TestTube } from "@lucide/vue";
+import { ArrowUp, ArrowRightLeft, AlertTriangle, Bot, Check, ChevronRight, CircleSlash, Copy, Database, GitBranch, HelpCircle, History, Loader2, MessageSquarePlus, Replace, Server, ShieldCheck, Table2, Play, Square, Trash2, Terminal, Wand2, Wrench, X, Zap, TestTube } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -29,6 +29,8 @@ import type { ConnectionConfig, QueryTab, TableInfo } from "@/types/database";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
 import { decodeSelectableDatabaseValue, encodeSelectableDatabaseValue, formatDatabaseLabel, resolveDefaultDatabase } from "@/lib/defaultDatabase";
 import { isSchemaAware } from "@/lib/databaseCapabilities";
+import ExplainPlanViewer from "@/components/explain/ExplainPlanViewer.vue";
+import { parseExplainResult, type ParsedExplainPlan } from "@/lib/explainPlan";
 import { copyToClipboard } from "@/lib/clipboard";
 import { formatAiTableMention, parseAiTableMentions, type AiTableMention } from "@/lib/aiTableMentions";
 import { isAiPromptImeCompositionEvent, shouldSubmitAiPromptOnKeydown } from "@/lib/aiPromptKeyboard";
@@ -57,6 +59,7 @@ const emit = defineEmits<{
   replaceSql: [sql: string];
   executeSql: [sql: string];
   requestAutoExecuteSql: [sql: string];
+  openExplainPlan: [sql: string];
   close: [];
 }>();
 
@@ -281,6 +284,25 @@ function extractToolResultContent(result: unknown): string | undefined {
     return typeof content === "string" ? content : JSON.stringify(content);
   }
   return JSON.stringify(result);
+}
+
+/** Extract structured explain plan data from the AgentEvent result value */
+function extractExplainData(result: unknown): unknown | undefined {
+  if (!result || typeof result !== "object") return undefined;
+  const obj = result as Record<string, unknown>;
+  return obj.explain_data;
+}
+
+/** Parse explain_data (a serialized QueryResult) into ParsedExplainPlan */
+function parseExplainFromData(explainData: unknown, dbType: string): ParsedExplainPlan | undefined {
+  if (!explainData || typeof explainData !== "object") return undefined;
+  const supportedTypes = ["mysql", "postgres", "dameng", "questdb"] as const;
+  if (!supportedTypes.includes(dbType as (typeof supportedTypes)[number])) return undefined;
+  try {
+    return parseExplainResult(dbType as (typeof supportedTypes)[number], explainData as import("@/types/database").QueryResult);
+  } catch {
+    return undefined;
+  }
 }
 
 function toggleReasoning(index: number) {
@@ -543,20 +565,19 @@ async function send() {
         if (event.type === "tool_call_start" || event.type === "tool_call_end") {
           const msg = messages.value[assistantIdx];
           if (msg) {
-            const steps = agentEvents
-              .filter((e) => e.type === "tool_call_start" || e.type === "tool_call_end")
-              .map((e) => ({
-                key: `${e.tool_call_id || ""}-${e.type}`,
-                labelKey: e.type === "tool_call_start" ? "ai.agentSteps.callingTool" : e.is_error ? "ai.agentSteps.toolError" : "ai.agentSteps.toolDone",
-                tone: (e.type === "tool_call_start" ? "active" : e.is_error ? "danger" : "success") as AiAgentStepTone,
-                titleKey: undefined,
-                titleParams: { tool: e.tool_name || "" },
-                toolName: e.tool_name,
-                toolArgs: e.type === "tool_call_start" ? (e.args as Record<string, unknown>) : undefined,
-                toolResult: e.type === "tool_call_end" && !e.is_error ? extractToolResultContent(e.result) : undefined,
-                isError: e.type === "tool_call_end" ? e.is_error : undefined,
-              }));
-            msg.agentSteps = steps;
+            if (!msg.agentSteps) msg.agentSteps = [];
+            msg.agentSteps.push({
+              key: `${event.tool_call_id || ""}-${event.type}`,
+              labelKey: event.type === "tool_call_start" ? "ai.agentSteps.callingTool" : event.is_error ? "ai.agentSteps.toolError" : "ai.agentSteps.toolDone",
+              tone: (event.type === "tool_call_start" ? "active" : event.is_error ? "danger" : "success") as AiAgentStepTone,
+              titleKey: undefined,
+              titleParams: { tool: event.tool_name || "" },
+              toolName: event.tool_name,
+              toolArgs: event.type === "tool_call_start" ? (event.args as Record<string, unknown>) : undefined,
+              toolResult: event.type === "tool_call_end" && !event.is_error ? extractToolResultContent(event.result) : undefined,
+              isError: event.type === "tool_call_end" ? event.is_error : undefined,
+              explainData: event.type === "tool_call_end" ? extractExplainData(event.result) : undefined,
+            });
           }
         }
         scrollToBottom();
@@ -571,7 +592,7 @@ async function send() {
     if (msg) msg.isThinking = false;
     isGenerating.value = false;
     // Render agent tool call steps from agent events
-    if (msg && agentEvents.length > 0) {
+    if (msg && agentEvents.length > 0 && !msg.agentSteps?.length) {
       msg.agentSteps = agentEvents
         .filter((e) => e.type === "tool_call_start" || e.type === "tool_call_end")
         .map((e) => ({
@@ -584,6 +605,7 @@ async function send() {
           toolArgs: e.type === "tool_call_start" ? (e.args as Record<string, unknown>) : undefined,
           toolResult: e.type === "tool_call_end" && !e.is_error ? extractToolResultContent(e.result) : undefined,
           isError: e.type === "tool_call_end" ? e.is_error : undefined,
+          explainData: e.type === "tool_call_end" ? extractExplainData(e.result) : undefined,
         }));
     }
     // Fallback: use aiAgentPlan for backward compatibility
@@ -869,7 +891,14 @@ const messageRenderer = computed(() => {
                   </button>
                   <div v-if="expandedSteps.has(step.key)" class="border-t border-current/10 px-2 pb-2 pt-1">
                     <div v-if="step.toolArgs?.sql" class="mb-1 rounded bg-background/50 px-2 py-1 font-mono text-[10px] text-foreground/80 whitespace-pre-wrap">{{ step.toolArgs.sql }}</div>
-                    <div v-if="step.isError && step.toolResult" class="text-[10px] text-red-600 dark:text-red-400">{{ step.toolResult }}</div>
+                    <Button v-if="step.toolName === 'explain_query' && step.toolArgs?.sql" size="sm" variant="outline" class="mb-1 h-6 gap-1 text-[10px]" @click="emit('openExplainPlan', step.toolArgs.sql as string)">
+                      <GitBranch class="h-3 w-3" />
+                      {{ t("explain.title") }}
+                    </Button>
+                    <div v-if="step.toolName === 'explain_query' && step.explainData && connection?.db_type" class="mb-1">
+                      <ExplainPlanViewer :plan="parseExplainFromData(step.explainData, connection.db_type)" class="max-h-64" />
+                    </div>
+                    <div v-else-if="step.isError && step.toolResult" class="text-[10px] text-red-600 dark:text-red-400">{{ step.toolResult }}</div>
                     <div v-else-if="step.toolResult" class="max-h-48 overflow-auto text-[10px] text-muted-foreground whitespace-pre-wrap">{{ step.toolResult }}</div>
                   </div>
                 </div>
