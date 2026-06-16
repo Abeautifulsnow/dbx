@@ -320,7 +320,12 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                         extension
                     })
                     .collect();
-                match db::sqlite::connect_path_with_extensions(&expand_tilde(&config.host), extensions).await {
+                match db::sqlite::connect_path_create_if_missing_with_extensions(
+                    &expand_tilde(&config.host),
+                    extensions,
+                )
+                .await
+                {
                     Ok(_) => Ok("Connection successful".to_string()),
                     Err(e) => Err(e),
                 }
@@ -539,7 +544,8 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 })
                 .collect();
             PoolKind::Sqlite(
-                db::sqlite::connect_path_with_extensions(&expand_tilde(&db_config.host), extensions).await?,
+                db::sqlite::connect_path_create_if_missing_with_extensions(&expand_tilde(&db_config.host), extensions)
+                    .await?,
             )
         }
         DatabaseType::Redis => {

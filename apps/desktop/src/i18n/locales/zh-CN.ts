@@ -145,6 +145,7 @@
     h2TcpMode: "TCP",
     h2FilePathRequired: "H2 文件路径不能为空",
     createDuckDbFile: "新建 DuckDB 文件",
+    createSqliteFile: "新建 SQLite 数据库",
     memoryDatabasePathHint: "输入 :memory: 可创建 SQLite 或 DuckDB 内存数据库。",
     sqliteExtensions: "SQLite 扩展库",
     sqliteExtensionsPlaceholder: "/path/to/regexp.dylib\n/path/to/text.dylib|sqlite3_text_init",

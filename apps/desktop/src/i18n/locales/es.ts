@@ -142,6 +142,7 @@
     h2TcpMode: "TCP",
     h2FilePathRequired: "La ruta del archivo H2 no puede estar vacía",
     createDuckDbFile: "Crear archivo DuckDB",
+    createSqliteFile: "Crear base de datos SQLite",
     user: "Usuario",
     password: "Contraseña",
     database: "Base de datos",

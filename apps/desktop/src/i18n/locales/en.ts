@@ -144,6 +144,7 @@
     h2TcpMode: "TCP",
     h2FilePathRequired: "H2 file path cannot be empty",
     createDuckDbFile: "Create DuckDB file",
+    createSqliteFile: "Create SQLite database",
     memoryDatabasePathHint: "Use :memory: to create an in-memory SQLite or DuckDB database.",
     sqliteExtensions: "SQLite Extensions",
     sqliteExtensionsPlaceholder: "/path/to/regexp.dylib\n/path/to/text.dylib|sqlite3_text_init",

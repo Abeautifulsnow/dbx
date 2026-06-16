@@ -980,9 +980,15 @@ impl ConnectionConfig {
             DatabaseType::Mysql => {
                 normalize_mysql_url_params(value, self.mysql_uses_tls(), self.ca_cert_path.trim().is_empty())
             }
-            DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch | DatabaseType::Databend => {
-                normalize_bare_mysql_url_params(value)
+            DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch => {
+                let params = normalize_bare_mysql_url_params(value);
+                if params.is_empty() {
+                    "enable_cleartext_plugin=true".to_string()
+                } else {
+                    format!("{params}&enable_cleartext_plugin=true")
+                }
             }
+            DatabaseType::Databend => normalize_bare_mysql_url_params(value),
             DatabaseType::Postgres | DatabaseType::Redshift => normalize_postgres_url_params(value, self.ssl),
             DatabaseType::MongoDb => normalize_mongo_url_params(value, self.ssl),
             _ => value.trim_start_matches('?').to_string(),

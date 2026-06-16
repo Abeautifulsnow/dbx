@@ -143,6 +143,7 @@ export default {
     h2TcpMode: "TCP",
     h2FilePathRequired: "H2ファイルパスを指定してください",
     createDuckDbFile: "DuckDBファイルを作成",
+    createSqliteFile: "SQLiteデータベースを作成",
     memoryDatabasePathHint: "インメモリのSQLiteまたはDuckDBデータベースを作成するには :memory: を使用してください。",
     sqliteExtensions: "SQLite拡張",
     sqliteExtensionsPlaceholder: "/path/to/regexp.dylib\n/path/to/text.dylib|sqlite3_text_init",

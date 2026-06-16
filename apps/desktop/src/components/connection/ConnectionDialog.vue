@@ -2000,6 +2000,24 @@ async function createDuckDbFilePath() {
   form.value.host = path;
 }
 
+function ensureSqliteFileExtension(path: string): string {
+  return /\.(db|sqlite|sqlite3)$/i.test(path) ? path : `${path}.db`;
+}
+
+async function createSqliteFilePath() {
+  if (!isTauriRuntime()) return;
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  const selected = await save({
+    title: t("connection.createSqliteFile"),
+    defaultPath: "database.db",
+    filters: [{ name: "SQLite", extensions: ["db", "sqlite", "sqlite3"] }],
+  });
+  if (!selected) return;
+
+  const path = ensureSqliteFileExtension(selected);
+  form.value.host = path;
+}
+
 async function browseJdbcDriverPaths() {
   if (!isTauriRuntime()) return;
   const { open } = await import("@tauri-apps/plugin-dialog");
@@ -2370,6 +2388,14 @@ function openExternalUrl(url: string) {
                             </Button>
                           </TooltipTrigger>
                           <TooltipContent>{{ t("connection.createDuckDbFile") }}</TooltipContent>
+                        </Tooltip>
+                        <Tooltip v-if="isDesktop && form.db_type === 'sqlite'">
+                          <TooltipTrigger as-child>
+                            <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="createSqliteFilePath">
+                              <FilePlus2 class="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.createSqliteFile") }}</TooltipContent>
                         </Tooltip>
                       </div>
                       <p v-if="supportsMemoryDatabasePath" class="text-xs text-muted-foreground">
