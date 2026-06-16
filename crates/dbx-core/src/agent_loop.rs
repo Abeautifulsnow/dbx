@@ -39,7 +39,7 @@ pub enum AutoStopMode {
 
 impl Default for AgentLoopConfig {
     fn default() -> Self {
-        Self { max_turns: DEFAULT_MAX_AGENT_TURNS, auto_stop: AutoStopMode::IdleTurns(2) }
+        Self { max_turns: DEFAULT_MAX_AGENT_TURNS, auto_stop: AutoStopMode::IdleTurns(1) }
     }
 }
 
@@ -295,6 +295,7 @@ pub async fn run_agent_loop(
             |tc: &ToolCall| ToolCall { id: tc.id.clone(), name: tc.name.clone(), arguments: tc.arguments.clone() };
 
         // Run parallel group
+        let tools_ref = tools.as_slice();
         let parallel_futures: Vec<_> = parallel_indices
             .iter()
             .map(|&i| {
@@ -303,7 +304,21 @@ pub async fn run_agent_loop(
                 let conn = conn2.clone();
                 let db = db2.clone();
                 let bh = before_hook_ref;
-                async move { agent_tools::execute_tool(&tc, &state, &conn, &db, &db_type, bh, None).await }
+                async move {
+                    agent_tools::execute_tool(
+                        &tc,
+                        agent_tools::ToolExecutionContext {
+                            state: &state,
+                            connection_id: &conn,
+                            database: &db,
+                            db_type: &db_type,
+                            tools: tools_ref,
+                            before_hook: bh,
+                            on_progress: None,
+                        },
+                    )
+                    .await
+                }
             })
             .collect();
         let parallel_results = join_all(parallel_futures).await;
@@ -312,8 +327,21 @@ pub async fn run_agent_loop(
         let mut sequential_results = Vec::with_capacity(sequential_indices.len());
         for &i in &sequential_indices {
             let tc = make_tc(&collected_tool_calls[i]);
-            sequential_results
-                .push(agent_tools::execute_tool(&tc, &state2, &conn2, &db2, &db_type, before_hook_ref, None).await);
+            sequential_results.push(
+                agent_tools::execute_tool(
+                    &tc,
+                    agent_tools::ToolExecutionContext {
+                        state: &state2,
+                        connection_id: &conn2,
+                        database: &db2,
+                        db_type: &db_type,
+                        tools: &tools,
+                        before_hook: before_hook_ref,
+                        on_progress: None,
+                    },
+                )
+                .await,
+            );
         }
 
         // Merge results back into original order
@@ -847,4 +875,20 @@ fn summarize_message_content(content: &str) -> String {
     let tail_chars = content.chars().rev().take(1500).collect::<Vec<_>>();
     let tail = tail_chars.into_iter().rev().collect::<String>();
     format!("{head}\n\n...[middle omitted for summary input]...\n\n{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentLoopConfig, AutoStopMode};
+
+    #[test]
+    fn default_auto_stop_should_stop_on_first_idle_turn() {
+        let config = AgentLoopConfig::default();
+
+        match config.auto_stop {
+            AutoStopMode::IdleTurns(1) => {}
+            AutoStopMode::IdleTurns(n) => panic!("expected IdleTurns(1), got IdleTurns({n})"),
+            AutoStopMode::Fixed => panic!("expected IdleTurns(1), got Fixed"),
+        }
+    }
 }

@@ -21,6 +21,17 @@ const SAMPLE_DATA_LIMIT: usize = 20;
 /// Absolute maximum rows any query tool may request.
 const MAX_ALLOWED_ROWS: usize = 100;
 
+/// Borrowed context shared by a single tool execution.
+pub struct ToolExecutionContext<'a> {
+    pub state: &'a Arc<AppState>,
+    pub connection_id: &'a str,
+    pub database: &'a str,
+    pub db_type: &'a DatabaseType,
+    pub tools: &'a [ToolDefinition],
+    pub before_hook: Option<&'a BeforeToolHook>,
+    pub on_progress: Option<&'a (dyn Fn(serde_json::Value) + Send + Sync)>,
+}
+
 /// Get read-only tool definitions (list_tables + get_columns).
 pub fn read_only_tools() -> Vec<ToolDefinition> {
     vec![list_tables_tool(), get_columns_tool()]
@@ -248,18 +259,9 @@ fn explain_query_tool() -> ToolDefinition {
 }
 
 /// Execute a tool call and return the result.
-pub async fn execute_tool(
-    tool_call: &ToolCall,
-    state: &Arc<AppState>,
-    connection_id: &str,
-    database: &str,
-    db_type: &DatabaseType,
-    before_hook: Option<&BeforeToolHook>,
-    on_progress: Option<&(dyn Fn(serde_json::Value) + Send + Sync)>,
-) -> ToolResult {
+pub async fn execute_tool(tool_call: &ToolCall, context: ToolExecutionContext<'_>) -> ToolResult {
     // 1. Find tool definition and run argument validator
-    let tools = all_tools(*db_type);
-    let tool_def = tools.iter().find(|t| t.name == tool_call.name);
+    let tool_def = context.tools.iter().find(|t| t.name == tool_call.name);
 
     let validated = if let Some(td) = tool_def {
         if let Some(validator) = td.validate_args {
@@ -283,7 +285,7 @@ pub async fn execute_tool(
     };
 
     // 2. Run before_hook if present
-    if let Some(hook) = before_hook {
+    if let Some(hook) = context.before_hook {
         if let Err(reason) = hook(tool_call, &validated) {
             return ToolResult {
                 tool_call_id: tool_call.id.clone(),
@@ -300,16 +302,58 @@ pub async fn execute_tool(
         ToolCall { id: tool_call.id.clone(), name: tool_call.name.clone(), arguments: validated.parsed.clone() };
 
     // on_progress is accepted for future use (P3: get_sample_data row-by-row progress)
-    let _ = on_progress;
+    let _ = context.on_progress;
 
     let result = match effective_call.name.as_str() {
-        "list_tables" => execute_list_tables(&effective_call, state, connection_id, database, db_type).await,
-        "get_columns" => execute_get_columns(&effective_call, state, connection_id, database, db_type).await,
-        "execute_query" => execute_execute_query(&effective_call, state, connection_id, database, db_type).await,
-        "get_sample_data" => execute_get_sample_data(&effective_call, state, connection_id, database, db_type).await,
+        "list_tables" => {
+            execute_list_tables(
+                &effective_call,
+                context.state,
+                context.connection_id,
+                context.database,
+                context.db_type,
+            )
+            .await
+        }
+        "get_columns" => {
+            execute_get_columns(
+                &effective_call,
+                context.state,
+                context.connection_id,
+                context.database,
+                context.db_type,
+            )
+            .await
+        }
+        "execute_query" => {
+            execute_execute_query(
+                &effective_call,
+                context.state,
+                context.connection_id,
+                context.database,
+                context.db_type,
+            )
+            .await
+        }
+        "get_sample_data" => {
+            execute_get_sample_data(
+                &effective_call,
+                context.state,
+                context.connection_id,
+                context.database,
+                context.db_type,
+            )
+            .await
+        }
         "explain_query" => {
-            let (text_result, explain_data) =
-                execute_explain_query(&effective_call, state, connection_id, database, db_type).await;
+            let (text_result, explain_data) = execute_explain_query(
+                &effective_call,
+                context.state,
+                context.connection_id,
+                context.database,
+                context.db_type,
+            )
+            .await;
             let warnings = &validated.warnings;
             let prefix =
                 if warnings.is_empty() { String::new() } else { format!("[WARNING] {}\n\n", warnings.join("; ")) };
