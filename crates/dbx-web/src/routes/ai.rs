@@ -217,7 +217,7 @@ pub async fn ai_agent_stream(
         connection_id: body.connection_id,
         database: body.database,
         db_type: parsed_db_type,
-        schema_cache: None, // schema_cache: set to Some(Arc) to enable TTL-based caching
+        schema_cache: None, // None = use AppState-managed TTL cache automatically; Some(arc) = inject a specific cache instance (e.g., for testing)
     };
 
     let sid = session_id.clone();

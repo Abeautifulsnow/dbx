@@ -998,19 +998,14 @@ fn build_index_sql(table: &str, schema: &str, database: &str, db_type: &Database
     }
 }
 
-/// Format raw query results into a readable text table for foreign keys.
-fn format_fk_result(result: &QueryResult, table: &str) -> String {
+/// Format a QueryResult as a padded text table with a title and empty-message fallback.
+fn format_query_result_table(result: &QueryResult, title: &str, empty_msg: &str) -> String {
     if result.rows.is_empty() {
-        return format!("No foreign keys found for \"{table}\".");
+        return empty_msg.to_string();
     }
-
-    let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("Foreign keys for \"{table}\":"));
-
+    let mut lines = vec![title.to_string()];
     let columns = &result.columns;
     let mut col_widths: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-
-    // Calculate column widths
     for row in &result.rows {
         for (i, col) in columns.iter().enumerate() {
             let val = row_value_as_str(&row[i]);
@@ -1018,71 +1013,28 @@ fn format_fk_result(result: &QueryResult, table: &str) -> String {
             *entry = (*entry).max(val.len());
         }
     }
-
-    // Build header
     let header: Vec<String> =
         columns.iter().map(|c| format!("{:width$}", c, width = col_widths[c.as_str()])).collect();
     let separator: Vec<String> = columns.iter().map(|c| "-".repeat(col_widths[c.as_str()])).collect();
-
     lines.push(format!("  {}", header.join(" | ")));
     lines.push(format!("  {}", separator.join(" | ")));
-
-    // Build rows
     for row in &result.rows {
         let cells: Vec<String> = row
             .iter()
             .enumerate()
-            .map(|(i, v)| {
-                let val = row_value_as_str(v);
-                format!("{:width$}", val, width = col_widths[columns[i].as_str()])
-            })
+            .map(|(i, v)| format!("{:width$}", row_value_as_str(v), width = col_widths[columns[i].as_str()]))
             .collect();
         lines.push(format!("  {}", cells.join(" | ")));
     }
-
     lines.join("\n")
 }
 
-/// Format raw query results into a readable text table for indexes.
+fn format_fk_result(result: &QueryResult, table: &str) -> String {
+    format_query_result_table(result, &format!("Foreign keys for \"{table}\":"), &format!("No foreign keys found for \"{table}\"."))
+}
+
 fn format_index_result(result: &QueryResult, table: &str) -> String {
-    if result.rows.is_empty() {
-        return format!("No indexes found for \"{table}\".");
-    }
-
-    let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("Indexes for \"{table}\":"));
-
-    let columns = &result.columns;
-    let mut col_widths: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-
-    for row in &result.rows {
-        for (i, col) in columns.iter().enumerate() {
-            let val = row_value_as_str(&row[i]);
-            let entry = col_widths.entry(col.as_str()).or_insert(col.len());
-            *entry = (*entry).max(val.len());
-        }
-    }
-
-    let header: Vec<String> =
-        columns.iter().map(|c| format!("{:width$}", c, width = col_widths[c.as_str()])).collect();
-    let separator: Vec<String> = columns.iter().map(|c| "-".repeat(col_widths[c.as_str()])).collect();
-
-    lines.push(format!("  {}", header.join(" | ")));
-    lines.push(format!("  {}", separator.join(" | ")));
-
-    for row in &result.rows {
-        let cells: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let val = row_value_as_str(v);
-                format!("{:width$}", val, width = col_widths[columns[i].as_str()])
-            })
-            .collect();
-        lines.push(format!("  {}", cells.join(" | ")));
-    }
-
-    lines.join("\n")
+    format_query_result_table(result, &format!("Indexes for \"{table}\":"), &format!("No indexes found for \"{table}\"."))
 }
 
 /// Convert a serde_json::Value row cell to a string for display.
@@ -1094,13 +1046,17 @@ fn row_value_as_str(value: &serde_json::Value) -> String {
     }
 }
 
-/// Get foreign keys for a table.
-async fn execute_get_foreign_keys(
+/// Execute a table introspection query (FK or index) with a given SQL builder and result formatter.
+#[allow(clippy::too_many_arguments)]
+async fn execute_introspection(
     tool_call: &ToolCall,
     state: &Arc<AppState>,
     connection_id: &str,
     database: &str,
     db_type: &DatabaseType,
+    build_sql: fn(&str, &str, &str, &DatabaseType) -> Option<String>,
+    format_result: fn(&QueryResult, &str) -> String,
+    kind: &str,
 ) -> Result<String, String> {
     let table = tool_call
         .arguments
@@ -1108,62 +1064,94 @@ async fn execute_get_foreign_keys(
         .and_then(|v| v.as_str())
         .ok_or("Missing required parameter: table")?
         .trim();
-
     if table.is_empty() {
         return Err("Table name cannot be empty".to_string());
     }
-
     let schema = tool_call.arguments.get("schema").and_then(|v| v.as_str()).unwrap_or("");
-
-    let sql = match build_fk_sql(table, schema, database, db_type) {
-        Some(sql) => sql,
-        None => {
-            return Err(format!("FK introspection not supported for {:?}", db_type));
-        }
-    };
-
+    let sql = build_sql(table, schema, database, db_type)
+        .ok_or_else(|| format!("{kind} introspection not supported for {:?}", db_type))?;
     let options = QueryExecutionOptions { max_rows: Some(200), timeout_secs: Some(30), ..Default::default() };
     let result = crate::query::execute_sql_statement_with_options(
         state, connection_id, database, &sql, None, None, options,
     )
     .await?;
-
-    Ok(format_fk_result(&result, table))
+    Ok(format_result(&result, table))
 }
 
-/// Get indexes for a table.
-async fn execute_get_indexes(
-    tool_call: &ToolCall,
+async fn execute_get_foreign_keys(
+    tc: &ToolCall,
     state: &Arc<AppState>,
-    connection_id: &str,
-    database: &str,
+    conn: &str,
+    db: &str,
     db_type: &DatabaseType,
 ) -> Result<String, String> {
-    let table = tool_call
-        .arguments
-        .get("table")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing required parameter: table")?
-        .trim();
+    execute_introspection(tc, state, conn, db, db_type, build_fk_sql, format_fk_result, "FK").await
+}
 
-    if table.is_empty() {
-        return Err("Table name cannot be empty".to_string());
+async fn execute_get_indexes(
+    tc: &ToolCall,
+    state: &Arc<AppState>,
+    conn: &str,
+    db: &str,
+    db_type: &DatabaseType,
+) -> Result<String, String> {
+    execute_introspection(tc, state, conn, db, db_type, build_index_sql, format_index_result, "Index").await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::QueryResult;
+
+    fn make_result(columns: &[&str], rows: &[&[&str]]) -> QueryResult {
+        QueryResult {
+            columns: columns.iter().map(|s| s.to_string()).collect(),
+            rows: rows
+                .iter()
+                .map(|row| row.iter().map(|v| serde_json::Value::String(v.to_string())).collect())
+                .collect(),
+            column_types: vec![],
+            column_sortables: vec![],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+        }
     }
 
-    let schema = tool_call.arguments.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+    #[test]
+    fn format_fk_result_empty_returns_no_fk_message() {
+        let result = make_result(&["a"], &[]);
+        assert_eq!(format_fk_result(&result, "orders"), "No foreign keys found for \"orders\".");
+    }
 
-    let sql = match build_index_sql(table, schema, database, db_type) {
-        Some(sql) => sql,
-        None => {
-            return Err(format!("Index introspection not supported for {:?}", db_type));
-        }
-    };
+    #[test]
+    fn format_fk_result_formats_rows() {
+        let result = make_result(
+            &["column_name", "referenced_table", "referenced_column"],
+            &[&["user_id", "users", "id"]],
+        );
+        let out = format_fk_result(&result, "orders");
+        assert!(out.contains("Foreign keys for \"orders\":"), "header missing: {out}");
+        assert!(out.contains("user_id"), "row data missing: {out}");
+        assert!(out.contains("users"), "ref table missing: {out}");
+    }
 
-    let options = QueryExecutionOptions { max_rows: Some(200), timeout_secs: Some(30), ..Default::default() };
-    let result = crate::query::execute_sql_statement_with_options(
-        state, connection_id, database, &sql, None, None, options,
-    )
-    .await?;
+    #[test]
+    fn format_index_result_empty_returns_no_index_message() {
+        let result = make_result(&["index_name"], &[]);
+        assert_eq!(format_index_result(&result, "users"), "No indexes found for \"users\".");
+    }
 
-    Ok(format_index_result(&result, table))
+    #[test]
+    fn format_index_result_formats_rows() {
+        let result = make_result(
+            &["index_name", "columns", "is_unique"],
+            &[&["PRIMARY", "id", "YES"]],
+        );
+        let out = format_index_result(&result, "users");
+        assert!(out.contains("Indexes for \"users\":"), "header missing: {out}");
+        assert!(out.contains("PRIMARY"), "index name missing: {out}");
+    }
 }

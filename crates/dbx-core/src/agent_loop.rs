@@ -139,12 +139,13 @@ pub async fn run_agent_loop(
                     Some(Arc::clone(&entry.value().0))
                 }
                 _ => {
-                    let new_cache = Arc::new(SchemaCache::default());
-                    agent_ctx
+                    // Use entry().or_insert_with() for atomic creation under concurrent requests.
+                    let entry = agent_ctx
                         .state
                         .schema_cache
-                        .insert(cache_key, (Arc::clone(&new_cache), Instant::now()));
-                    Some(new_cache)
+                        .entry(cache_key)
+                        .or_insert_with(|| (Arc::new(SchemaCache::default()), Instant::now()));
+                    Some(Arc::clone(&entry.value().0))
                 }
             }
         });
@@ -982,5 +983,17 @@ mod tests {
             AutoStopMode::IdleTurns(n) => panic!("expected IdleTurns(1), got IdleTurns({n})"),
             AutoStopMode::Fixed => panic!("expected IdleTurns(1), got Fixed"),
         }
+    }
+
+    #[test]
+    fn is_schema_error_matches_known_patterns() {
+        assert!(super::is_schema_error("table does not exist"));
+        assert!(super::is_schema_error("Unknown column 'foo'"));
+        assert!(super::is_schema_error("no such table: users"));
+        assert!(super::is_schema_error("invalid identifier: bar"));
+        assert!(super::is_schema_error("table not found in catalog"));
+        assert!(super::is_schema_error("column not found: baz"));
+        assert!(!super::is_schema_error("query returned 0 rows"));
+        assert!(!super::is_schema_error("connection timeout"));
     }
 }
