@@ -286,6 +286,7 @@
     connectTimeout: "Tiempo de espera de conexión (segundos)",
     queryTimeout: "Tiempo de espera de consulta (segundos)",
     idleTimeout: "Tiempo de espera inactivo (segundos)",
+    keepaliveInterval: "Intervalo de keepalive (segundos)",
     readOnly: "Solo lectura",
     readOnlyHint: "Bloquear todas las operaciones de escritura (INSERT, UPDATE, DELETE, etc.)",
     readOnlyBadge: "Solo lectura",

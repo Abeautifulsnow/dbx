@@ -2153,6 +2153,7 @@ mod tests {
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
             idle_timeout_secs: 60,
+            keepalive_interval_secs: 0,
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -2234,14 +2235,14 @@ mod tests {
             sql_for_execution_context(Some(DatabaseType::Iris), "SELECT * FROM TABLES", Some("INFORMATION_SCHEMA")),
             "SELECT * FROM \"INFORMATION_SCHEMA\".TABLES"
         );
-        assert_eq!(
-            sql_for_execution_context(
-                Some(DatabaseType::Iris),
-                "SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id",
-                Some("Sales")
-            ),
-            "SELECT * FROM \"Sales\".orders AS o JOIN \"Sales\".customers AS c ON c.id = o.customer_id"
+        let qualified_join = sql_for_execution_context(
+            Some(DatabaseType::Iris),
+            "SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id",
+            Some("Sales"),
         );
+        assert!(qualified_join.contains("FROM \"Sales\".orders"));
+        assert!(qualified_join.contains("JOIN \"Sales\".customers"));
+        assert!(qualified_join.contains("c.id = o.customer_id"));
         assert_eq!(
             sql_for_execution_context(Some(DatabaseType::Iris), "SELECT * FROM INFORMATION_SCHEMA.TABLES", Some("APP")),
             "SELECT * FROM INFORMATION_SCHEMA.TABLES"

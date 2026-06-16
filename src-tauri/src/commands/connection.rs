@@ -190,6 +190,7 @@ mod tests {
             connect_timeout_secs: dbx_core::models::connection::default_connect_timeout_secs(),
             query_timeout_secs: dbx_core::models::connection::default_query_timeout_secs(),
             idle_timeout_secs: dbx_core::models::connection::default_idle_timeout_secs(),
+            keepalive_interval_secs: dbx_core::models::connection::default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -590,7 +591,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                         {
                             Ok(()) => {
                                 state.configs.write().await.insert(id.clone(), config);
-                                state.connections.write().await.insert(id.clone(), PoolKind::MongoDb(client));
+                                state.insert_connection_pool(id.clone(), PoolKind::MongoDb(client), &db_config).await;
                                 return Ok(id);
                             }
                             Err(e) => e,
@@ -707,7 +708,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         db_type => return Err(format!("Unsupported database type: {db_type:?}")),
     };
 
-    state.connections.write().await.insert(id.clone(), pool);
+    state.insert_connection_pool(id.clone(), pool, &db_config).await;
     state.configs.write().await.insert(id.clone(), config);
 
     Ok(id)
@@ -733,15 +734,7 @@ pub async fn connection_final_proxy_port(
 
 #[tauri::command]
 pub async fn disconnect_db(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
-    let mut conns = state.connections.write().await;
-    let keys_to_remove: Vec<String> =
-        conns.keys().filter(|k| *k == &connection_id || k.starts_with(&format!("{connection_id}:"))).cloned().collect();
-    for key in keys_to_remove {
-        if let Some(pool) = conns.remove(&key) {
-            dbx_core::connection::close_pool_kind(pool).await;
-        }
-    }
-    drop(conns);
+    state.remove_connection_pools_detached(&connection_id).await;
     state.reset_connection_transport(&connection_id).await;
     if connection_id.starts_with("__visible_draft_") {
         state.configs.write().await.remove(&connection_id);

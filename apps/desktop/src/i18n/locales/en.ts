@@ -305,6 +305,7 @@
     connectTimeout: "Connection Timeout (seconds)",
     queryTimeout: "Query Timeout (seconds)",
     idleTimeout: "Idle Timeout (seconds)",
+    keepaliveInterval: "Keepalive Interval (seconds)",
     readOnly: "Read Only",
     readOnlyHint: "Block all write operations (INSERT, UPDATE, DELETE, etc.)",
     readOnlyBadge: "Read-only",

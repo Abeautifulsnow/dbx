@@ -28,6 +28,7 @@ fn postgres_test_config(id: &str, database: &str) -> ConnectionConfig {
         connect_timeout_secs: 5,
         query_timeout_secs: 30,
         idle_timeout_secs: 60,
+        keepalive_interval_secs: 0,
         ssl: false,
         ca_cert_path: String::new(),
         client_cert_path: String::new(),

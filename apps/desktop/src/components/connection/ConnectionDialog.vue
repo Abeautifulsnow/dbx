@@ -112,6 +112,7 @@ const defaultForm = (): ConnectionForm => ({
   connect_timeout_secs: 5,
   query_timeout_secs: 30,
   idle_timeout_secs: 60,
+  keepalive_interval_secs: 0,
   ssl: false,
   ca_cert_path: "",
   client_cert_path: "",
@@ -249,6 +250,17 @@ function sshLayersForConfig(config: LegacyConnectionConfig): SshTunnelConfig[] {
 }
 
 const form = ref(defaultForm());
+const keepaliveEnabled = computed({
+  get: () => Number(form.value.keepalive_interval_secs) > 0,
+  set: (enabled: boolean) => {
+    if (enabled) {
+      const current = Number(form.value.keepalive_interval_secs);
+      form.value.keepalive_interval_secs = Number.isFinite(current) && current > 0 ? current : 30;
+    } else {
+      form.value.keepalive_interval_secs = 0;
+    }
+  },
+});
 const selectedTransportLayerId = ref<string | null>(null);
 const draggedTransportLayerId = ref<string | null>(null);
 const selectedType = ref("mysql");
@@ -579,6 +591,7 @@ watch(
         connect_timeout_secs: config.connect_timeout_secs || 5,
         query_timeout_secs: config.query_timeout_secs ?? 30,
         idle_timeout_secs: config.idle_timeout_secs ?? 60,
+        keepalive_interval_secs: config.keepalive_interval_secs ?? 0,
         ssl: config.ssl || false,
         ca_cert_path: config.ca_cert_path || "",
         client_cert_path: config.client_cert_path || "",
@@ -1101,6 +1114,8 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   config.query_timeout_secs = Number.isFinite(queryTimeout) && queryTimeout >= 0 ? queryTimeout : 30;
   const idleTimeout = Number(config.idle_timeout_secs);
   config.idle_timeout_secs = Number.isFinite(idleTimeout) && idleTimeout >= 0 ? idleTimeout : 60;
+  const keepaliveInterval = Number(config.keepalive_interval_secs);
+  config.keepalive_interval_secs = Number.isFinite(keepaliveInterval) && keepaliveInterval >= 0 ? keepaliveInterval : 0;
   if (config.db_type === "manticoresearch") {
     config.url_params = "";
   }
@@ -2976,6 +2991,13 @@ function openExternalUrl(url: string) {
                 <div v-show="form.db_type === 'mongodb'" class="grid grid-cols-4 items-center gap-4">
                   <Label class="text-right text-xs">{{ t("connection.idleTimeout") }}</Label>
                   <Input v-model.number="form.idle_timeout_secs" type="number" min="0" max="600" step="1" class="col-span-3" />
+                </div>
+                <div class="grid grid-cols-4 items-center gap-4">
+                  <Label class="text-right text-xs">{{ t("connection.keepaliveInterval") }}</Label>
+                  <div class="col-span-3 flex items-center gap-2">
+                    <Switch v-model="keepaliveEnabled" />
+                    <Input v-model.number="form.keepalive_interval_secs" type="number" min="1" max="3600" step="1" class="flex-1" :disabled="!keepaliveEnabled" />
+                  </div>
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">
                   <Label class="text-right text-xs">{{ t("connection.readOnly") }}</Label>
