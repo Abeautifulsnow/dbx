@@ -910,6 +910,8 @@
       callingTool: "正在調用工具...",
       toolDone: "工具調用完成",
       toolError: "工具調用出錯",
+      executeSafe: "安全檢查通過 · 已執行",
+      executeBlocked: "安全檢查攔截",
       contextCompacted: "上下文已壓縮",
     },
     agentStepTitles: {

@@ -983,6 +983,8 @@
       callingTool: "正在调用工具...",
       toolDone: "工具调用完成",
       toolError: "工具调用出错",
+      executeSafe: "安全检查通过 · 已执行",
+      executeBlocked: "安全检查拦截",
       contextCompacted: "上下文已压缩",
     },
     agentStepTitles: {

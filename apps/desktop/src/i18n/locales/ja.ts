@@ -981,6 +981,8 @@ export default {
       callingTool: "ツールを呼び出し中...",
       toolDone: "ツール完了",
       toolError: "ツールエラー",
+      executeSafe: "安全チェック通過 · 実行済み",
+      executeBlocked: "安全チェックによりブロック",
       contextCompacted: "コンテキストを圧縮しました",
     },
     agentStepTitles: {

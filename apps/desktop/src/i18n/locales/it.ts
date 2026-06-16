@@ -931,6 +931,8 @@
       callingTool: "Chiamata strumento...",
       toolDone: "Strumento completato",
       toolError: "Errore strumento",
+      executeSafe: "Controllo di sicurezza superato · Eseguito",
+      executeBlocked: "Bloccato dal controllo di sicurezza",
       contextCompacted: "Contesto compresso",
     },
     agentStepTitles: {
