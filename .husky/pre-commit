@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 pnpm exec lint-staged
 
 # Only format and re-add Rust files that are already staged

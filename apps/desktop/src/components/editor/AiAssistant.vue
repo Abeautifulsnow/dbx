@@ -83,6 +83,9 @@ const agentTokens = ref<{ input: number; output: number } | null>(null);
 /** Deferred context compaction info; applied after stream ends to avoid shifting assistantIdx. */
 const pendingCompaction = ref<{ summary: string; compactedMessages: number } | null>(null);
 
+/** Flag to abort send() if user clicks cancel during buildAiContext. */
+const buildContextAborted = ref(false);
+
 // 新增：输入框拖拽调整相关常量
 const AI_TEXTAREA_MIN_ROWS = 3;
 const AI_TEXTAREA_MAX_ROWS = 8;
@@ -583,6 +586,7 @@ async function send() {
   const displayText = [selectedMentions.value.map((mention) => mention.raw).join(" "), text].filter(Boolean).join(" ");
 
   messages.value.push({ role: "user", content: displayText });
+  const userIdx = messages.value.length - 1;
   prompt.value = "";
   selectedMentions.value = [];
   scrollToBottom();
@@ -590,6 +594,7 @@ async function send() {
   const requestedAction = activeAction.value;
   const requestedMode = assistantMode.value;
   isGenerating.value = true;
+  buildContextAborted.value = false;
   messages.value.push({ role: "assistant", content: "" });
   const assistantIdx = messages.value.length - 1;
   const sessionId = uuid();
@@ -600,6 +605,13 @@ async function send() {
     const context = await buildAiContext(props.tab, props.connection, {
       mentionedTables,
     });
+    if (buildContextAborted.value) {
+      messages.value.splice(assistantIdx, 1);
+      messages.value.splice(userIdx, 1);
+      isGenerating.value = false;
+      currentSessionId.value = "";
+      return;
+    }
     const history: AiMessage[] = messagesForAgentHistory(messages.value.slice(0, -2));
     await runAgentStream(
       {
@@ -708,6 +720,7 @@ async function send() {
 
 async function cancelStream() {
   if (currentSessionId.value) {
+    buildContextAborted.value = true;
     await aiCancelStream(currentSessionId.value).catch(() => {});
   }
 }
