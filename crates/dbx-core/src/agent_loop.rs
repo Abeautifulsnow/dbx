@@ -139,13 +139,15 @@ pub async fn run_agent_loop(
                     Some(Arc::clone(&entry.value().0))
                 }
                 _ => {
-                    // Use entry().or_insert_with() for atomic creation under concurrent requests.
-                    let entry = agent_ctx
+                    // Use insert() to overwrite expired entries. DashMap::insert is thread-safe;
+                    // concurrent cold-starts may both insert (last-write-wins), which is acceptable
+                    // — only the cached data from the first request may be lost, not correctness.
+                    let new_cache = Arc::new(SchemaCache::default());
+                    agent_ctx
                         .state
                         .schema_cache
-                        .entry(cache_key)
-                        .or_insert_with(|| (Arc::new(SchemaCache::default()), Instant::now()));
-                    Some(Arc::clone(&entry.value().0))
+                        .insert(cache_key, (Arc::clone(&new_cache), Instant::now()));
+                    Some(new_cache)
                 }
             }
         });
