@@ -928,6 +928,10 @@
       autoExecute: "Pronto per l'esecuzione",
       notRequested: "Esecuzione non richiesta",
       skipped: "Non eseguito",
+      callingTool: "Chiamata strumento...",
+      toolDone: "Strumento completato",
+      toolError: "Errore strumento",
+      contextCompacted: "Contesto compresso",
     },
     agentStepTitles: {
       riskCheck: "Controllo rischi: {action} · {category} · {environment} · {reasons}",

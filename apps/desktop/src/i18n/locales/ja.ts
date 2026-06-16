@@ -981,6 +981,7 @@ export default {
       callingTool: "ツールを呼び出し中...",
       toolDone: "ツール完了",
       toolError: "ツールエラー",
+      contextCompacted: "コンテキストを圧縮しました",
     },
     agentStepTitles: {
       riskCheck: "リスクチェック: {action} · {category} · {environment} · {reasons}",

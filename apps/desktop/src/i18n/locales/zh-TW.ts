@@ -907,6 +907,10 @@
       autoExecute: "準備執行",
       notRequested: "未請求執行",
       skipped: "未執行",
+      callingTool: "正在調用工具...",
+      toolDone: "工具調用完成",
+      toolError: "工具調用出錯",
+      contextCompacted: "上下文已壓縮",
     },
     agentStepTitles: {
       riskCheck: "風險檢查：{action} · {category} · {environment} · {reasons}",
