@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 use mysql_async::prelude::Queryable;
 use mysql_async::Row as MysqlRow;
@@ -30,6 +32,7 @@ pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
     "JDBC plugin is not installed. Install the optional JDBC plugin to use this connection.";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
+const POOL_CLOSE_TIMEOUT_SECS: u64 = 5;
 
 #[cfg(feature = "duckdb-bundled")]
 mod duckdb_types {
@@ -72,6 +75,7 @@ pub enum PoolKind {
 
 pub struct AppState {
     pub connections: RwLock<HashMap<String, PoolKind>>,
+    keepalive_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     pub configs: RwLock<HashMap<String, ConnectionConfig>>,
     pub running_queries: RunningQueries,
     pub tunnels: TunnelManager,
@@ -248,6 +252,7 @@ impl AppState {
     ) -> Self {
         Self {
             connections: RwLock::new(HashMap::new()),
+            keepalive_tasks: RwLock::new(HashMap::new()),
             configs: RwLock::new(HashMap::new()),
             running_queries: RunningQueries::default(),
             tunnels: TunnelManager::new(),
@@ -305,6 +310,63 @@ impl AppState {
         }
         let java = self.agent_manager.resolve_java_runtime(&state, DEFAULT_JRE_KEY)?;
         Ok(PluginRuntimeEnv::default().with_var("DBX_JAVA_BIN", java.to_string_lossy().to_string()))
+    }
+
+    pub async fn insert_connection_pool(&self, pool_key: String, pool: PoolKind, config: &ConnectionConfig) {
+        self.stop_keepalive_task(&pool_key).await;
+        self.start_keepalive_task(&pool_key, &pool, config).await;
+        let previous = self.connections.write().await.insert(pool_key, pool);
+        if let Some(pool) = previous {
+            close_pool_kind(pool).await;
+        }
+    }
+
+    async fn start_keepalive_task(&self, pool_key: &str, pool: &PoolKind, config: &ConnectionConfig) {
+        let interval_secs = config.keepalive_interval_secs;
+        if interval_secs == 0 {
+            return;
+        }
+        let Some(mut target) = keepalive_target_from_pool(pool, config) else {
+            log::debug!(
+                "Connection keepalive requested for '{pool_key}', but this database driver does not keep a pingable client handle."
+            );
+            return;
+        };
+
+        let key = pool_key.to_string();
+        let interval = Duration::from_secs(interval_secs.max(1));
+        let timeout = Duration::from_secs(config.effective_connect_timeout_secs().max(1));
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let result = tokio::time::timeout(timeout, ping_keepalive_target(&mut target, timeout)).await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => log::warn!("Connection keepalive failed for '{key}': {err}"),
+                    Err(_) => log::warn!("Connection keepalive timed out for '{key}' after {}s", timeout.as_secs()),
+                }
+            }
+        });
+        let previous = self.keepalive_tasks.write().await.insert(pool_key.to_string(), handle);
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+    }
+
+    async fn stop_keepalive_task(&self, pool_key: &str) {
+        let task = self.keepalive_tasks.write().await.remove(pool_key);
+        if let Some(task) = task {
+            task.abort();
+        }
+    }
+
+    async fn stop_keepalive_tasks(&self, pool_keys: &[String]) {
+        let mut tasks = self.keepalive_tasks.write().await;
+        for pool_key in pool_keys {
+            if let Some(task) = tasks.remove(pool_key) {
+                task.abort();
+            }
+        }
     }
 
     pub async fn get_or_create_pool(&self, connection_id: &str, database: Option<&str>) -> Result<String, String> {
@@ -456,12 +518,12 @@ impl AppState {
                         .await
                         {
                             Ok(()) => {
-                                let mut conns = self.connections.write().await;
                                 // Re-check: another task may have created the pool while we were connecting.
-                                if conns.contains_key(&pool_key) {
+                                if self.connections.read().await.contains_key(&pool_key) {
                                     return Ok(pool_key);
                                 }
-                                conns.insert(pool_key.clone(), PoolKind::MongoDb(client));
+                                self.insert_connection_pool(pool_key.clone(), PoolKind::MongoDb(client), &db_config)
+                                    .await;
                                 return Ok(pool_key);
                             }
                             Err(e) => e,
@@ -679,7 +741,7 @@ impl AppState {
             }
         };
 
-        self.connections.write().await.insert(pool_key.clone(), pool);
+        self.insert_connection_pool(pool_key.clone(), pool, &db_config).await;
         Ok(pool_key)
     }
 
@@ -741,6 +803,7 @@ impl AppState {
             return false;
         }
 
+        self.stop_keepalive_task(pool_key).await;
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
             close_pool_kind(pool).await;
@@ -770,6 +833,7 @@ impl AppState {
             self.remove_connection_pools(connection_id).await;
             self.reset_connection_transport(connection_id).await;
         } else {
+            self.stop_keepalive_task(&pool_key).await;
             let removed = self.connections.write().await.remove(&pool_key);
             if let Some(pool) = removed {
                 close_pool_kind(pool).await;
@@ -797,6 +861,7 @@ impl AppState {
         if pool_key == base_pool_key {
             return Ok(false);
         }
+        self.stop_keepalive_task(&pool_key).await;
         let removed = self.connections.write().await.remove(&pool_key);
         if let Some(pool) = removed {
             close_pool_kind(pool).await;
@@ -816,9 +881,16 @@ impl AppState {
         }
         let base_pool_key = base_pool_key_for(db_type, connection_id, database, false);
         let session_prefix = format!("{base_pool_key}:session:");
+        let keys_to_remove: Vec<String> = self
+            .connections
+            .read()
+            .await
+            .keys()
+            .filter(|key| *key == &base_pool_key || key.starts_with(&session_prefix))
+            .cloned()
+            .collect();
+        self.stop_keepalive_tasks(&keys_to_remove).await;
         let mut conns = self.connections.write().await;
-        let keys_to_remove: Vec<String> =
-            conns.keys().filter(|key| *key == &base_pool_key || key.starts_with(&session_prefix)).cloned().collect();
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
             if let Some(pool) = conns.remove(&key) {
@@ -969,6 +1041,7 @@ impl AppState {
 
         // Remove dead pools
         if !dead_keys.is_empty() {
+            self.stop_keepalive_tasks(&dead_keys).await;
             let mut conns = self.connections.write().await;
             for key in &dead_keys {
                 if let Some(pool) = conns.remove(key) {
@@ -989,27 +1062,94 @@ impl AppState {
     }
 
     pub async fn remove_connection_pools(&self, connection_id: &str) {
-        let mut conns = self.connections.write().await;
-        let keys_to_remove: Vec<String> = conns
+        let removed = self.drain_connection_pools(connection_id).await;
+        close_removed_pools(removed).await;
+    }
+
+    pub async fn remove_connection_pools_detached(&self, connection_id: &str) {
+        let removed = self.drain_connection_pools(connection_id).await;
+        close_removed_pools_in_background(removed);
+    }
+
+    async fn drain_connection_pools(&self, connection_id: &str) -> Vec<(String, PoolKind)> {
+        let pool_prefix = format!("{connection_id}:");
+        let keys_to_remove: Vec<String> = self
+            .connections
+            .read()
+            .await
             .keys()
-            .filter(|k| *k == connection_id || k.starts_with(&format!("{connection_id}:")))
+            .filter(|k| *k == connection_id || k.starts_with(&pool_prefix))
             .cloned()
             .collect();
+        self.stop_keepalive_tasks(&keys_to_remove).await;
+        let mut conns = self.connections.write().await;
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
             if let Some(pool) = conns.remove(&key) {
-                removed.push(pool);
+                removed.push((key, pool));
             }
         }
-        drop(conns);
-        for pool in removed {
-            close_pool_kind(pool).await;
-        }
+        removed
     }
 
     async fn uses_forwarded_transport(&self, connection_id: &str) -> bool {
         let configs = self.configs.read().await;
         configs.get(connection_id).is_some_and(|config| config.has_effective_transport_layers())
+    }
+}
+
+enum KeepaliveTarget {
+    Mysql(db::mysql::MySqlPool),
+    Postgres(deadpool_postgres::Pool),
+    Rqlite(db::rqlite_driver::RqliteClient),
+    Turso(db::turso_driver::TursoClient),
+    MongoDb { client: mongodb::Client, database: Option<String> },
+    ClickHouse(db::clickhouse_driver::ChClient),
+    SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
+    Elasticsearch(db::elasticsearch_driver::EsClient),
+    InfluxDb(db::influxdb_driver::InfluxdbClient),
+}
+
+fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Option<KeepaliveTarget> {
+    match pool {
+        PoolKind::Mysql(pool, _) => Some(KeepaliveTarget::Mysql(pool.clone())),
+        PoolKind::Postgres(pool) => Some(KeepaliveTarget::Postgres(pool.clone())),
+        PoolKind::Rqlite(client) => Some(KeepaliveTarget::Rqlite(client.clone())),
+        PoolKind::Turso(client) => Some(KeepaliveTarget::Turso(client.clone())),
+        PoolKind::MongoDb(client) => Some(KeepaliveTarget::MongoDb {
+            client: client.clone(),
+            database: config.effective_database().map(str::to_string),
+        }),
+        PoolKind::ClickHouse(client) => Some(KeepaliveTarget::ClickHouse(client.clone())),
+        PoolKind::SqlServer(client) => Some(KeepaliveTarget::SqlServer(client.clone())),
+        PoolKind::Elasticsearch(client) => Some(KeepaliveTarget::Elasticsearch(client.clone())),
+        PoolKind::InfluxDb(client) => Some(KeepaliveTarget::InfluxDb(client.clone())),
+        _ => None,
+    }
+}
+
+async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) -> Result<(), String> {
+    match target {
+        KeepaliveTarget::Mysql(pool) => {
+            let mut conn = db::mysql::get_conn_with_health_check(pool).await?;
+            conn.ping().await.map_err(|e| e.to_string())
+        }
+        KeepaliveTarget::Postgres(pool) => {
+            let client = pool.get().await.map_err(|e| format!("PostgreSQL pool error: {e}"))?;
+            client.simple_query("SELECT 1").await.map(|_| ()).map_err(|e| e.to_string())
+        }
+        KeepaliveTarget::Rqlite(client) => db::rqlite_driver::test_connection(client, timeout).await,
+        KeepaliveTarget::Turso(client) => db::turso_driver::test_connection(client, timeout).await,
+        KeepaliveTarget::MongoDb { client, database } => {
+            db::mongo_driver::test_connection(client, timeout, database.as_deref()).await
+        }
+        KeepaliveTarget::ClickHouse(client) => db::clickhouse_driver::test_connection(client, timeout).await,
+        KeepaliveTarget::SqlServer(client) => {
+            let mut client = client.lock().await;
+            db::sqlserver::test_connection(&mut client).await
+        }
+        KeepaliveTarget::Elasticsearch(client) => db::elasticsearch_driver::test_connection(client, timeout).await,
+        KeepaliveTarget::InfluxDb(client) => db::influxdb_driver::test_connection(client, timeout).await,
     }
 }
 
@@ -1102,6 +1242,30 @@ pub async fn close_pool_kind(pool: PoolKind) {
         }
         PoolKind::ExternalTabular(_) => {}
         PoolKind::ExternalDriver { .. } => {}
+    }
+}
+
+async fn close_removed_pools(removed: Vec<(String, PoolKind)>) {
+    for (pool_key, pool) in removed {
+        close_pool_kind_with_timeout(pool_key, pool).await;
+    }
+}
+
+fn close_removed_pools_in_background(removed: Vec<(String, PoolKind)>) {
+    if removed.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        close_removed_pools(removed).await;
+    });
+}
+
+async fn close_pool_kind_with_timeout(pool_key: String, pool: PoolKind) {
+    match tokio::time::timeout(Duration::from_secs(POOL_CLOSE_TIMEOUT_SECS), close_pool_kind(pool)).await {
+        Ok(()) => {}
+        Err(_) => log::warn!(
+            "Timed out closing connection pool '{pool_key}' after {POOL_CLOSE_TIMEOUT_SECS}s; cleanup will continue by dropping the pool handle."
+        ),
     }
 }
 
@@ -1373,6 +1537,7 @@ mod tests {
             connect_timeout_secs: default_connect_timeout_secs(),
             query_timeout_secs: crate::models::connection::default_query_timeout_secs(),
             idle_timeout_secs: crate::models::connection::default_idle_timeout_secs(),
+            keepalive_interval_secs: crate::models::connection::default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),

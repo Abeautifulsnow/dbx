@@ -80,6 +80,7 @@ export interface ConnectionConfig {
   connect_timeout_secs?: number;
   query_timeout_secs?: number;
   idle_timeout_secs?: number;
+  keepalive_interval_secs?: number;
   ssl?: boolean;
   ca_cert_path?: string;
   client_cert_path?: string;

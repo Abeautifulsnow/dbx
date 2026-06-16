@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { uuid } from "@/lib/utils";
 import { ref, computed, watch } from "vue";
 import type { ColumnInfo, ConnectionConfig, ForeignKeyInfo, ObjectInfo, SidebarLayout, TreeNode } from "@/types/database";
-import { applyPinnedTreeNodeState, orderPinnedFirst } from "@/lib/pinnedItems";
+import { applyPinnedTreeNodeState, updatePinnedTreeNodeInPlace } from "@/lib/pinnedItems";
 import {
   reconcileLayout,
   buildTreeNodesFromLayout,
@@ -305,6 +305,7 @@ export const useConnectionStore = defineStore("connection", () => {
       connect_timeout_secs: config.connect_timeout_secs || 5,
       query_timeout_secs: config.query_timeout_secs ?? 30,
       idle_timeout_secs: config.idle_timeout_secs ?? 60,
+      keepalive_interval_secs: config.keepalive_interval_secs ?? 0,
     };
   }
 
@@ -560,18 +561,8 @@ export const useConnectionStore = defineStore("connection", () => {
     pinnedTreeNodeIds.value = next;
     persistPinnedTreeNodeIds();
 
-    const node = findNode(treeNodes.value, id);
-    if (node) node.pinned = next.has(id);
-
-    const isConnectionOrGroup = !!findNode(treeNodes.value, id);
-    if (isConnectionOrGroup) {
-      rebuildTreeNodes();
-    } else {
-      const parent = findParentNode(treeNodes.value, id);
-      if (parent?.children) {
-        parent.children = orderPinnedFirst(parent.children, (child) => !!child.pinned);
-      }
-    }
+    const scope = updatePinnedTreeNodeInPlace(treeNodes.value, id, next.has(id));
+    if (scope === "root") rebuildTreeNodes();
   }
 
   async function addConnection(config: ConnectionConfig) {

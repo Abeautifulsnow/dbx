@@ -306,6 +306,7 @@
     connectTimeout: "连接超时（秒）",
     queryTimeout: "查询超时（秒）",
     idleTimeout: "空闲超时（秒）",
+    keepaliveInterval: "保持连接间隔（秒）",
     readOnly: "只读模式",
     readOnlyHint: "阻止所有写操作（INSERT、UPDATE、DELETE 等）",
     readOnlyBadge: "只读",

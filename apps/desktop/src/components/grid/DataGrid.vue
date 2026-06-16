@@ -3956,12 +3956,6 @@ const canvasEditingCell = computed(() => {
   return { rowIndex, visibleColIdx, actualColIdx: editing.col, rect };
 });
 
-const canvasEditingCellIsNumeric = computed(() => {
-  const cell = canvasEditingCell.value;
-  if (!cell) return false;
-  return typeof displayItemAt(cell.rowIndex)?.data[cell.actualColIdx] === "number";
-});
-
 const canvasSingleSelectedCell = computed(() => {
   const range = selectedRange.value;
   if (!range || range.startRow !== range.endRow || range.startCol !== range.endCol) return null;
@@ -6929,7 +6923,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 <div class="relative" :style="{ width: `${totalWidth}px`, height: `${canvasContentHeight}px` }">
                   <canvas
                     ref="canvasRef"
-                    class="canvas-grid-surface dbx-editor-font-family sticky left-0 top-0 z-0 block text-xs font-normal"
+                    class="canvas-grid-surface dbx-data-grid-font-family sticky left-0 top-0 z-0 block text-[12.5px]/[1rem] font-normal"
                     :style="{ width: `${canvasSurfaceWidth}px`, height: `${canvasViewportHeight}px` }"
                     @mousemove="onCanvasMouseMove"
                     @mouseleave="onCanvasMouseLeave"
@@ -6937,8 +6931,8 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     @contextmenu="onCanvasContext"
                     @dblclick="onCanvasDblClick"
                   />
-                  <div ref="canvasOverlayRef" class="canvas-grid-overlay dbx-editor-font-family sticky left-0 top-0 z-10 overflow-hidden" :style="canvasOverlayStyle">
-                    <div v-if="canvasEditingCell" class="absolute pointer-events-auto z-20" :class="{ 'tabular-nums': canvasEditingCellIsNumeric }" :style="canvasEditingCellStyle" @mousedown.stop @click.stop>
+                  <div ref="canvasOverlayRef" class="canvas-grid-overlay dbx-data-grid-font-family sticky left-0 top-0 z-10 overflow-hidden" :style="canvasOverlayStyle">
+                    <div v-if="canvasEditingCell" class="absolute pointer-events-auto z-20 tabular-nums" :style="canvasEditingCellStyle" @mousedown.stop @click.stop>
                       <TemporalCellEditor v-if="temporalEditorKindForColumn(canvasEditingCell.actualColIdx)" v-model="editValue" :kind="temporalEditorKindForColumn(canvasEditingCell.actualColIdx)!" @cancel="cancelEdit" @commit="commitGridEdit" />
                       <EnumCellEditor
                         v-else-if="isEnumGridColumn(canvasEditingCell.actualColIdx)"
@@ -6954,7 +6948,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         autocapitalize="off"
                         autocorrect="off"
                         spellcheck="false"
-                        class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-xs leading-[22px] outline-none z-10"
+                        class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-[12.5px] leading-[22px] outline-none z-10"
                         @blur="commitEditFromBlur"
                         @click.stop
                         @keydown.stop="onEditKeydown"
@@ -7000,7 +6994,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               <RecycleScroller
                 v-else-if="hasVisibleRows"
                 ref="scrollerRef"
-                class="data-grid-scroller dbx-editor-font-family flex-1 overflow-x-auto overscroll-none"
+                class="data-grid-scroller dbx-data-grid-font-family flex-1 overflow-x-auto overscroll-none text-[12.5px]"
                 :class="{ 'is-scrolling': isScrolling }"
                 :items="displayItems"
                 :item-size="26"
@@ -7040,7 +7034,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     <div
                       v-for="col in renderedGridColumns"
                       :key="col.actualColIdx"
-                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none flex items-center"
+                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none flex items-center tabular-nums text-[12.5px]"
                       :style="renderedColumnStyle(col.visibleColIdx)"
                       :class="{
                         'text-muted-foreground italic': isNull(item.data[col.actualColIdx]),
@@ -7051,7 +7045,6 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         'row-cell-selected-dirty': rowCellsUseSelectionVisual(item.id) && !cellIsSelected(item.displayIndex, col.visibleColIdx) && item.isDirtyCol[col.actualColIdx],
                         'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(item.displayIndex, col.actualColIdx),
                         'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(item.displayIndex, col.actualColIdx),
-                        'tabular-nums': typeof item.data[col.actualColIdx] === 'number',
                         'cursor-text hover:bg-accent/50': !isScrolling && canEditCellItem(item, col.actualColIdx),
                         'line-through': item.isDeleted,
                       }"
@@ -7071,7 +7064,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                           autocapitalize="off"
                           autocorrect="off"
                           spellcheck="false"
-                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-xs leading-[22px] outline-none z-10"
+                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-[12.5px] leading-[22px] outline-none z-10"
                           @blur="commitEditFromBlur"
                           @click.stop
                           @keydown.stop="onEditKeydown"
@@ -8075,8 +8068,8 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 
 .canvas-grid-surface {
   cursor: cell;
-  font-family: var(--dbx-editor-font-family, var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace));
-  font-size: 0.75rem;
+  font-family: var(--dbx-data-grid-font-family);
+  font-size: 12.5px;
   font-weight: 400;
   line-height: 1rem;
   outline: none;

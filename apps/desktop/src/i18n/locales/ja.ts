@@ -304,6 +304,7 @@ export default {
     connectTimeout: "接続タイムアウト（秒）",
     queryTimeout: "クエリタイムアウト（秒）",
     idleTimeout: "アイドルタイムアウト（秒）",
+    keepaliveInterval: "Keepalive 間隔（秒）",
     readOnly: "読み取り専用",
     readOnlyHint: "すべての書き込み操作（INSERT, UPDATE, DELETEなど）をブロックします",
     readOnlyBadge: "読み取り専用",

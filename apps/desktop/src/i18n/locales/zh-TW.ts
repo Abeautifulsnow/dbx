@@ -291,6 +291,7 @@
     connectTimeout: "連線逾時（秒）",
     queryTimeout: "查詢逾時（秒）",
     idleTimeout: "閒置逾時（秒）",
+    keepaliveInterval: "保持連線間隔（秒）",
     readOnly: "唯讀模式",
     readOnlyHint: "阻止所有寫入操作（INSERT、UPDATE、DELETE 等）",
     readOnlyBadge: "唯讀",
