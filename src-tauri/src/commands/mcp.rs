@@ -1,4 +1,3 @@
-use std::env;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -114,7 +113,7 @@ fn installed_mcp_version() -> Option<String> {
 fn locate_mcp_bin() -> Option<String> {
     #[cfg(windows)]
     {
-        return locate_windows_command("dbx-mcp-server");
+        locate_windows_command("dbx-mcp-server")
     }
     #[cfg(not(windows))]
     {
@@ -161,7 +160,7 @@ fn command_output(command: &str, args: &[&str]) -> Result<CommandOutput, String>
 
     #[cfg(windows)]
     {
-        return run_windows_command_candidates(command, args).or(direct);
+        run_windows_command_candidates(command, args).or(direct)
     }
 
     #[cfg(not(windows))]
@@ -231,7 +230,7 @@ fn run_command_through_user_shell(command: &str, args: &[&str]) -> Result<Comman
 
 #[cfg(not(windows))]
 fn user_shell_invocation_args(script: &str) -> (String, Vec<String>) {
-    let shell = env::var("SHELL").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(default_user_shell);
+    let shell = std::env::var("SHELL").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(default_user_shell);
     let shell_name = Path::new(&shell).file_name().and_then(|value| value.to_str()).unwrap_or_default();
     let args = match shell_name {
         "fish" => vec!["-l".to_string(), "-i".to_string(), "-c".to_string(), script.to_string()],
@@ -267,6 +266,7 @@ fn default_user_shell() -> String {
     }
 }
 
+#[allow(dead_code)]
 fn shell_command_script(command: &str, args: &[&str]) -> String {
     let mut words = Vec::with_capacity(args.len() + 1);
     words.push(shell_quote(command));
@@ -274,6 +274,7 @@ fn shell_command_script(command: &str, args: &[&str]) -> String {
     format!("printf '%s\\n' {}; {}", shell_quote(SHELL_COMMAND_MARKER), words.join(" "))
 }
 
+#[allow(dead_code)]
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();

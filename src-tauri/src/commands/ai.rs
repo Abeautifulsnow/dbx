@@ -68,7 +68,7 @@ pub async fn ai_agent_stream(
     let parsed_db_type: DatabaseType =
         serde_json::from_str(&format!("\"{}\"", db_type)).map_err(|_| format!("Unknown database type: {db_type}"))?;
 
-    let agent_ctx = AgentLoopContext { state: state.inner().clone(), connection_id, database, db_type: parsed_db_type };
+    let agent_ctx = AgentLoopContext { state: state.inner().clone(), connection_id, database, db_type: parsed_db_type, schema_cache: None /* schema_cache: set to Some(Arc) to enable TTL-based caching */ };
     let is_agent_mode = mode.as_deref() == Some("agent");
 
     let result = run_agent_loop(

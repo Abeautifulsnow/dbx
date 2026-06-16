@@ -286,6 +286,7 @@ export type AgentEvent =
   | { type: "text_delta"; delta: string }
   | { type: "reasoning_delta"; delta: string }
   | { type: "tool_call_start"; tool_call_id: string; tool_name: string; args: Record<string, unknown> }
+  | { type: "tool_execution_update"; tool_call_id: string; tool_name: string; partial_result: unknown }
   | { type: "tool_call_end"; tool_call_id: string; tool_name: string; result: unknown; is_error: boolean }
   | { type: "turn_end"; turn: number }
   | { type: "agent_end"; input_tokens?: number; output_tokens?: number }

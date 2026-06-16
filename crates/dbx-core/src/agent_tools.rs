@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::agent_events::{BeforeToolHook, ToolCall, ToolDefinition, ToolResult, ValidatedArgs};
+use crate::agent_events::{BeforeToolHook, SchemaCache, ToolCall, ToolDefinition, ToolResult, ValidatedArgs};
 use crate::connection::AppState;
 use crate::models::connection::DatabaseType;
 use crate::query::QueryExecutionOptions;
-use crate::query_execution_sql::{build_explain_sql, supports_explain_plan, supports_sql_query, ExplainSqlOptions};
+use crate::query_execution_sql::{build_explain_sql, supports_explain_plan, supports_fk_introspection, supports_sql_query, ExplainSqlOptions};
 use crate::types::QueryResult;
 
 /// Maximum number of tables returned by list_tables tool.
@@ -29,6 +29,7 @@ pub struct ToolExecutionContext<'a> {
     pub db_type: &'a DatabaseType,
     pub tools: &'a [ToolDefinition],
     pub before_hook: Option<&'a BeforeToolHook>,
+    pub schema_cache: Option<&'a Arc<SchemaCache>>,
     pub on_progress: Option<&'a (dyn Fn(serde_json::Value) + Send + Sync)>,
 }
 
@@ -48,6 +49,10 @@ pub fn all_tools(db_type: DatabaseType) -> Vec<ToolDefinition> {
     }
     if supports_explain_plan(Some(db_type)) {
         tools.push(explain_query_tool());
+    }
+    if supports_fk_introspection(db_type) {
+        tools.push(get_foreign_keys_tool());
+        tools.push(get_indexes_tool());
     }
     tools
 }
@@ -258,6 +263,90 @@ fn explain_query_tool() -> ToolDefinition {
     }
 }
 
+/// get_foreign_keys tool definition.
+fn get_foreign_keys_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "get_foreign_keys",
+        description: "Get foreign key relationships for a table. Returns the columns, referenced tables/columns, and delete/update rules.",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Table name to get foreign keys for"
+                },
+                "schema": {
+                    "type": "string",
+                    "description": "Schema name (optional, defaults to current database)"
+                }
+            },
+            "required": ["table"]
+        }),
+        read_only: true,
+        parallel_ok: true,
+        validate_args: Some(|args| {
+            let table = args
+                .get("table")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing required parameter: 'table'".to_string())?
+                .trim();
+            if table.is_empty() {
+                return Err("Table name cannot be empty".to_string());
+            }
+            if table.len() > 256 {
+                return Err(format!("Table name too long: {} characters (max 256)", table.len()));
+            }
+            if table.contains(';') || table.contains('\'') || table.contains('"') || table.contains('\\') {
+                return Err(format!("Table name contains invalid characters: '{}'", table));
+            }
+            let schema = args.get("schema").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Ok(ValidatedArgs { parsed: json!({ "table": table, "schema": schema }), warnings: vec![] })
+        }),
+    }
+}
+
+/// get_indexes tool definition.
+fn get_indexes_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "get_indexes",
+        description: "Get indexes for a table. Returns index names, columns, uniqueness, primary key status, and index type.",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Table name to get indexes for"
+                },
+                "schema": {
+                    "type": "string",
+                    "description": "Schema name (optional, defaults to current database)"
+                }
+            },
+            "required": ["table"]
+        }),
+        read_only: true,
+        parallel_ok: true,
+        validate_args: Some(|args| {
+            let table = args
+                .get("table")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing required parameter: 'table'".to_string())?
+                .trim();
+            if table.is_empty() {
+                return Err("Table name cannot be empty".to_string());
+            }
+            if table.len() > 256 {
+                return Err(format!("Table name too long: {} characters (max 256)", table.len()));
+            }
+            if table.contains(';') || table.contains('\'') || table.contains('"') || table.contains('\\') {
+                return Err(format!("Table name contains invalid characters: '{}'", table));
+            }
+            let schema = args.get("schema").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Ok(ValidatedArgs { parsed: json!({ "table": table, "schema": schema }), warnings: vec![] })
+        }),
+    }
+}
+
 /// Execute a tool call and return the result.
 pub async fn execute_tool(tool_call: &ToolCall, context: ToolExecutionContext<'_>) -> ToolResult {
     // 1. Find tool definition and run argument validator
@@ -301,9 +390,6 @@ pub async fn execute_tool(tool_call: &ToolCall, context: ToolExecutionContext<'_
     let effective_call =
         ToolCall { id: tool_call.id.clone(), name: tool_call.name.clone(), arguments: validated.parsed.clone() };
 
-    // on_progress is accepted for future use (P3: get_sample_data row-by-row progress)
-    let _ = context.on_progress;
-
     let result = match effective_call.name.as_str() {
         "list_tables" => {
             execute_list_tables(
@@ -312,6 +398,7 @@ pub async fn execute_tool(tool_call: &ToolCall, context: ToolExecutionContext<'_
                 context.connection_id,
                 context.database,
                 context.db_type,
+                context.schema_cache,
             )
             .await
         }
@@ -322,6 +409,7 @@ pub async fn execute_tool(tool_call: &ToolCall, context: ToolExecutionContext<'_
                 context.connection_id,
                 context.database,
                 context.db_type,
+                context.schema_cache,
             )
             .await
         }
@@ -342,6 +430,7 @@ pub async fn execute_tool(tool_call: &ToolCall, context: ToolExecutionContext<'_
                 context.connection_id,
                 context.database,
                 context.db_type,
+                context.on_progress,
             )
             .await
         }
@@ -378,6 +467,26 @@ pub async fn execute_tool(tool_call: &ToolCall, context: ToolExecutionContext<'_
                 }
             }
         }
+        "get_foreign_keys" => {
+            execute_get_foreign_keys(
+                &effective_call,
+                context.state,
+                context.connection_id,
+                context.database,
+                context.db_type,
+            )
+            .await
+        }
+        "get_indexes" => {
+            execute_get_indexes(
+                &effective_call,
+                context.state,
+                context.connection_id,
+                context.database,
+                context.db_type,
+            )
+            .await
+        }
         _ => Err(format!("Unknown tool: {}", tool_call.name)),
     };
 
@@ -411,8 +520,18 @@ async fn execute_list_tables(
     connection_id: &str,
     database: &str,
     _db_type: &DatabaseType,
+    schema_cache: Option<&Arc<SchemaCache>>,
 ) -> Result<String, String> {
     let schema = tool_call.arguments.get("schema").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    // Check schema cache for tables
+    if let Some(cache) = schema_cache {
+        let tables_mutex = cache.tables.lock().await;
+        if let Some(ref cached) = *tables_mutex {
+            return Ok(cached.clone());
+        }
+        drop(tables_mutex);
+    }
 
     // Request one extra to detect whether more tables exist beyond the limit.
     let tables = crate::schema::list_tables_core(
@@ -447,11 +566,19 @@ async fn execute_list_tables(
         lines.push(format!("... (showing {LIST_TABLES_LIMIT} of {total} tables)"));
     }
 
-    if lines.is_empty() {
-        return Ok("No tables found in this database/schema.".to_string());
+    let result = if lines.is_empty() {
+        "No tables found in this database/schema.".to_string()
+    } else {
+        lines.join("\n")
+    };
+
+    // Cache result (including empty result)
+    if let Some(cache) = schema_cache {
+        let mut tables_mutex = cache.tables.lock().await;
+        *tables_mutex = Some(result.clone());
     }
 
-    Ok(lines.join("\n"))
+    Ok(result)
 }
 
 async fn execute_get_columns(
@@ -460,6 +587,7 @@ async fn execute_get_columns(
     connection_id: &str,
     database: &str,
     _db_type: &DatabaseType,
+    schema_cache: Option<&Arc<SchemaCache>>,
 ) -> Result<String, String> {
     let table = tool_call
         .arguments
@@ -482,50 +610,67 @@ async fn execute_get_columns(
 
     let schema = tool_call.arguments.get("schema").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
+    // Check schema cache for columns
+    let cache_key = format!("{}.{}", if schema.is_empty() { "" } else { &schema }, &table);
+    if let Some(cache) = schema_cache {
+        let columns_lock = cache.columns.lock().await;
+        if let Some(cached) = columns_lock.get(&cache_key) {
+            return Ok(cached.clone());
+        }
+        drop(columns_lock);
+    }
+
     let columns = crate::schema::get_columns_core(state, connection_id, database, &schema, &table)
         .await
         .map_err(|e| format!("Failed to get columns for {table}: {e}"))?;
 
-    if columns.is_empty() {
-        return Ok(format!("No columns found for table '{table}'."));
+    let result = if columns.is_empty() {
+        format!("No columns found for table '{table}'.")
+    } else {
+        let mut lines = Vec::new();
+        lines.push(format!("Columns of {table}:"));
+        for col in &columns {
+            let mut flags: Vec<String> = Vec::new();
+            if col.is_primary_key {
+                flags.push("PK".to_string());
+            }
+            if col.is_nullable {
+                flags.push("nullable".to_string());
+            } else {
+                flags.push("NOT NULL".to_string());
+            }
+            if let Some(default) = &col.column_default {
+                if !default.is_empty() {
+                    flags.push(format!("default {default}"));
+                }
+            }
+            if let Some(extra) = &col.extra {
+                if !extra.is_empty() {
+                    flags.push(extra.clone());
+                }
+            }
+
+            let flags_str = if flags.is_empty() { String::new() } else { format!(" ({})", flags.join(", ")) };
+
+            let comment_str = col
+                .comment
+                .as_ref()
+                .filter(|c| !c.trim().is_empty())
+                .map(|c| format!(" -- {}", c.trim()))
+                .unwrap_or_default();
+
+            lines.push(format!("  - {}: {}{}{}", col.name, col.data_type, flags_str, comment_str));
+        }
+        lines.join("\n")
+    };
+
+    // Cache result (including empty result)
+    if let Some(cache) = schema_cache {
+        let mut columns_lock = cache.columns.lock().await;
+        columns_lock.insert(cache_key, result.clone());
     }
 
-    let mut lines = Vec::new();
-    lines.push(format!("Columns of {table}:"));
-    for col in &columns {
-        let mut flags: Vec<String> = Vec::new();
-        if col.is_primary_key {
-            flags.push("PK".to_string());
-        }
-        if col.is_nullable {
-            flags.push("nullable".to_string());
-        } else {
-            flags.push("NOT NULL".to_string());
-        }
-        if let Some(default) = &col.column_default {
-            if !default.is_empty() {
-                flags.push(format!("default {default}"));
-            }
-        }
-        if let Some(extra) = &col.extra {
-            if !extra.is_empty() {
-                flags.push(extra.clone());
-            }
-        }
-
-        let flags_str = if flags.is_empty() { String::new() } else { format!(" ({})", flags.join(", ")) };
-
-        let comment_str = col
-            .comment
-            .as_ref()
-            .filter(|c| !c.trim().is_empty())
-            .map(|c| format!(" -- {}", c.trim()))
-            .unwrap_or_default();
-
-        lines.push(format!("  - {}: {}{}{}", col.name, col.data_type, flags_str, comment_str));
-    }
-
-    Ok(lines.join("\n"))
+    Ok(result)
 }
 
 /// Execute a read-only SQL query via the execute_query tool.
@@ -611,6 +756,7 @@ async fn execute_get_sample_data(
     connection_id: &str,
     database: &str,
     db_type: &DatabaseType,
+    on_progress: Option<&(dyn Fn(serde_json::Value) + Send + Sync)>,
 ) -> Result<String, String> {
     let table =
         tool_call.arguments.get("table").and_then(|v| v.as_str()).ok_or("Missing required parameter: table")?.trim();
@@ -630,6 +776,14 @@ async fn execute_get_sample_data(
         .map(|l| (l as usize).min(MAX_ALLOWED_ROWS))
         .unwrap_or(SAMPLE_DATA_LIMIT);
 
+    // Report sampling phase start
+    if let Some(progress) = on_progress {
+        progress(serde_json::json!({
+            "phase": "sampling",
+            "rows_collected": 0
+        }));
+    }
+
     // Build SELECT * FROM table LIMIT N
     let schema_prefix = schema.filter(|s| !s.is_empty()).map(|s| format!("\"{}\".", s)).unwrap_or_default();
     let sql = format!("SELECT * FROM {}\"{}\" LIMIT {}", schema_prefix, table, limit);
@@ -640,7 +794,24 @@ async fn execute_get_sample_data(
         name: "execute_query".to_string(),
         arguments: serde_json::json!({ "sql": sql, "limit": limit }),
     };
-    execute_execute_query(&synthetic_call, state, connection_id, database, db_type).await
+    let result = execute_execute_query(&synthetic_call, state, connection_id, database, db_type).await;
+
+    // Report completion progress
+    if let Some(progress) = on_progress {
+        let rows = match &result {
+            Ok(content) => {
+                // Count rows by counting lines that start with "|" (after header+separator)
+                content.lines().filter(|l| l.starts_with('|')).count().saturating_sub(1) // subtract header row
+            }
+            Err(_) => 0,
+        };
+        progress(serde_json::json!({
+            "phase": "sampling",
+            "rows_collected": rows
+        }));
+    }
+
+    result
 }
 
 /// Execute an EXPLAIN query via the explain_query tool.
@@ -698,4 +869,301 @@ async fn execute_explain_query(
     };
 
     (Ok(text), explain_data)
+}
+
+/// Build the SQL query to retrieve foreign keys for a given table and schema.
+fn build_fk_sql(table: &str, schema: &str, database: &str, db_type: &DatabaseType) -> Option<String> {
+    match db_type {
+        DatabaseType::Postgres
+        | DatabaseType::Redshift
+        | DatabaseType::OpenGauss
+        | DatabaseType::Gaussdb
+        | DatabaseType::Vastbase
+        | DatabaseType::Kingbase => {
+            let schema = if schema.is_empty() { "public" } else { schema };
+            Some(format!(
+                "SELECT kcu.column_name, ccu.table_schema AS referenced_schema, \
+                 ccu.table_name AS referenced_table, ccu.column_name AS referenced_column, \
+                 rc.delete_rule, rc.update_rule \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu \
+                 ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
+                 JOIN information_schema.referential_constraints rc \
+                 ON tc.constraint_name = rc.constraint_name \
+                 JOIN information_schema.constraint_column_usage ccu \
+                 ON rc.unique_constraint_name = ccu.constraint_name \
+                 WHERE tc.constraint_type = 'FOREIGN KEY' \
+                 AND tc.table_schema = '{schema}' AND tc.table_name = '{table}'"
+            ))
+        }
+        DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks => Some(format!(
+            "SELECT kcu.column_name, kcu.referenced_table_schema, kcu.referenced_table_name, \
+             kcu.referenced_column_name, rc.delete_rule, rc.update_rule \
+             FROM information_schema.key_column_usage kcu \
+             JOIN information_schema.referential_constraints rc \
+             ON kcu.constraint_name = rc.constraint_name \
+             AND kcu.constraint_schema = rc.constraint_schema \
+             WHERE kcu.table_schema = '{database}' AND kcu.table_name = '{table}' \
+             AND kcu.referenced_table_name IS NOT NULL"
+        )),
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => {
+            Some(format!("PRAGMA foreign_key_list('{table}')"))
+        }
+        DatabaseType::SqlServer => Some(format!(
+            "SELECT fkc.name AS column_name, rt.name AS referenced_table, \
+             rc.name AS referenced_column, \
+             fk.delete_referential_action_desc AS delete_rule, \
+             fk.update_referential_action_desc AS update_rule \
+             FROM sys.foreign_keys fk \
+             JOIN sys.foreign_key_columns fkcc ON fk.object_id = fkcc.constraint_object_id \
+             JOIN sys.columns fkc ON fkcc.parent_column_id = fkc.column_id AND fkcc.parent_object_id = fkc.object_id \
+             JOIN sys.tables rt ON fkcc.referenced_object_id = rt.object_id \
+             JOIN sys.columns rc ON fkcc.referenced_column_id = rc.column_id AND fkcc.referenced_object_id = rc.object_id \
+             WHERE OBJECT_NAME(fk.parent_object_id) = '{table}'"
+        )),
+        DatabaseType::Oracle => {
+            let schema_upper = if schema.is_empty() { database.to_uppercase() } else { schema.to_uppercase() };
+            Some(format!(
+                "SELECT acc.column_name, ac2.table_name AS referenced_table, \
+                 acc2.column_name AS referenced_column, ac.delete_rule \
+                 FROM all_constraints ac \
+                 JOIN all_cons_columns acc ON ac.constraint_name = acc.constraint_name AND ac.owner = acc.owner \
+                 JOIN all_constraints ac2 ON ac.r_constraint_name = ac2.constraint_name AND ac.r_owner = ac2.owner \
+                 JOIN all_cons_columns acc2 ON ac2.constraint_name = acc2.constraint_name AND ac2.owner = acc2.owner \
+                 WHERE ac.constraint_type = 'R' \
+                 AND ac.owner = '{schema_upper}' AND ac.table_name = UPPER('{table}')"
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Build the SQL query to retrieve indexes for a given table and schema.
+fn build_index_sql(table: &str, schema: &str, database: &str, db_type: &DatabaseType) -> Option<String> {
+    match db_type {
+        DatabaseType::Postgres
+        | DatabaseType::Redshift
+        | DatabaseType::OpenGauss
+        | DatabaseType::Gaussdb
+        | DatabaseType::Vastbase
+        | DatabaseType::Kingbase => {
+            let schema = if schema.is_empty() { "public" } else { schema };
+            Some(format!(
+                "SELECT pi.indexname, pi.indexdef, \
+                 CASE WHEN ix.indisunique THEN 'YES' ELSE 'NO' END AS is_unique, \
+                 CASE WHEN ix.indisprimary THEN 'YES' ELSE 'NO' END AS is_primary \
+                 FROM pg_indexes pi \
+                 JOIN pg_class c ON c.relname = pi.tablename \
+                 JOIN pg_index ix ON c.oid = ix.indrelid \
+                 JOIN pg_class ic ON ic.oid = ix.indexrelid AND ic.relname = pi.indexname \
+                 WHERE pi.schemaname = '{schema}' AND pi.tablename = '{table}'"
+            ))
+        }
+        DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks => Some(format!(
+            "SELECT index_name, GROUP_CONCAT(column_name ORDER BY seq_in_index) AS columns, \
+             IF(non_unique=0,'YES','NO') AS is_unique, index_type \
+             FROM information_schema.statistics \
+             WHERE table_schema = '{database}' AND table_name = '{table}' \
+             GROUP BY index_name, non_unique, index_type"
+        )),
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => {
+            Some(format!("PRAGMA index_list('{table}')"))
+        }
+        DatabaseType::SqlServer => Some(format!(
+            "SELECT i.name AS index_name, \
+             STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns, \
+             CASE WHEN i.is_unique = 1 THEN 'YES' ELSE 'NO' END AS is_unique, \
+             CASE WHEN i.is_primary_key = 1 THEN 'YES' ELSE 'NO' END AS is_primary, \
+             i.type_desc AS index_type \
+             FROM sys.indexes i \
+             JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+             JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id \
+             WHERE OBJECT_NAME(i.object_id) = '{table}' AND i.is_hypothetical = 0 \
+             GROUP BY i.name, i.is_unique, i.is_primary_key, i.type_desc"
+        )),
+        DatabaseType::Oracle => {
+            let schema_upper = if schema.is_empty() { database.to_uppercase() } else { schema.to_uppercase() };
+            Some(format!(
+                "SELECT ai.index_name, aic.column_name, ai.uniqueness, \
+                 CASE WHEN ac.constraint_type = 'P' THEN 'YES' ELSE 'NO' END AS is_primary, \
+                 ai.index_type \
+                 FROM all_indexes ai \
+                 JOIN all_ind_columns aic ON ai.index_name = aic.index_name AND ai.owner = aic.index_owner \
+                 LEFT JOIN all_constraints ac ON ai.index_name = ac.index_name AND ai.owner = ac.owner AND ac.constraint_type = 'P' \
+                 WHERE ai.owner = '{schema_upper}' AND ai.table_name = UPPER('{table}') \
+                 ORDER BY ai.index_name, aic.column_position"
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Format raw query results into a readable text table for foreign keys.
+fn format_fk_result(result: &QueryResult, table: &str) -> String {
+    if result.rows.is_empty() {
+        return format!("No foreign keys found for \"{table}\".");
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("Foreign keys for \"{table}\":"));
+
+    let columns = &result.columns;
+    let mut col_widths: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+
+    // Calculate column widths
+    for row in &result.rows {
+        for (i, col) in columns.iter().enumerate() {
+            let val = row_value_as_str(&row[i]);
+            let entry = col_widths.entry(col.as_str()).or_insert(col.len());
+            *entry = (*entry).max(val.len());
+        }
+    }
+
+    // Build header
+    let header: Vec<String> =
+        columns.iter().map(|c| format!("{:width$}", c, width = col_widths[c.as_str()])).collect();
+    let separator: Vec<String> = columns.iter().map(|c| "-".repeat(col_widths[c.as_str()])).collect();
+
+    lines.push(format!("  {}", header.join(" | ")));
+    lines.push(format!("  {}", separator.join(" | ")));
+
+    // Build rows
+    for row in &result.rows {
+        let cells: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let val = row_value_as_str(v);
+                format!("{:width$}", val, width = col_widths[columns[i].as_str()])
+            })
+            .collect();
+        lines.push(format!("  {}", cells.join(" | ")));
+    }
+
+    lines.join("\n")
+}
+
+/// Format raw query results into a readable text table for indexes.
+fn format_index_result(result: &QueryResult, table: &str) -> String {
+    if result.rows.is_empty() {
+        return format!("No indexes found for \"{table}\".");
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("Indexes for \"{table}\":"));
+
+    let columns = &result.columns;
+    let mut col_widths: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+
+    for row in &result.rows {
+        for (i, col) in columns.iter().enumerate() {
+            let val = row_value_as_str(&row[i]);
+            let entry = col_widths.entry(col.as_str()).or_insert(col.len());
+            *entry = (*entry).max(val.len());
+        }
+    }
+
+    let header: Vec<String> =
+        columns.iter().map(|c| format!("{:width$}", c, width = col_widths[c.as_str()])).collect();
+    let separator: Vec<String> = columns.iter().map(|c| "-".repeat(col_widths[c.as_str()])).collect();
+
+    lines.push(format!("  {}", header.join(" | ")));
+    lines.push(format!("  {}", separator.join(" | ")));
+
+    for row in &result.rows {
+        let cells: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let val = row_value_as_str(v);
+                format!("{:width$}", val, width = col_widths[columns[i].as_str()])
+            })
+            .collect();
+        lines.push(format!("  {}", cells.join(" | ")));
+    }
+
+    lines.join("\n")
+}
+
+/// Convert a serde_json::Value row cell to a string for display.
+fn row_value_as_str(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Get foreign keys for a table.
+async fn execute_get_foreign_keys(
+    tool_call: &ToolCall,
+    state: &Arc<AppState>,
+    connection_id: &str,
+    database: &str,
+    db_type: &DatabaseType,
+) -> Result<String, String> {
+    let table = tool_call
+        .arguments
+        .get("table")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing required parameter: table")?
+        .trim();
+
+    if table.is_empty() {
+        return Err("Table name cannot be empty".to_string());
+    }
+
+    let schema = tool_call.arguments.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+
+    let sql = match build_fk_sql(table, schema, database, db_type) {
+        Some(sql) => sql,
+        None => {
+            return Err(format!("FK introspection not supported for {:?}", db_type));
+        }
+    };
+
+    let options = QueryExecutionOptions { max_rows: Some(200), timeout_secs: Some(30), ..Default::default() };
+    let result = crate::query::execute_sql_statement_with_options(
+        state, connection_id, database, &sql, None, None, options,
+    )
+    .await?;
+
+    Ok(format_fk_result(&result, table))
+}
+
+/// Get indexes for a table.
+async fn execute_get_indexes(
+    tool_call: &ToolCall,
+    state: &Arc<AppState>,
+    connection_id: &str,
+    database: &str,
+    db_type: &DatabaseType,
+) -> Result<String, String> {
+    let table = tool_call
+        .arguments
+        .get("table")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing required parameter: table")?
+        .trim();
+
+    if table.is_empty() {
+        return Err("Table name cannot be empty".to_string());
+    }
+
+    let schema = tool_call.arguments.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+
+    let sql = match build_index_sql(table, schema, database, db_type) {
+        Some(sql) => sql,
+        None => {
+            return Err(format!("Index introspection not supported for {:?}", db_type));
+        }
+    };
+
+    let options = QueryExecutionOptions { max_rows: Some(200), timeout_secs: Some(30), ..Default::default() };
+    let result = crate::query::execute_sql_statement_with_options(
+        state, connection_id, database, &sql, None, None, options,
+    )
+    .await?;
+
+    Ok(format_index_result(&result, table))
 }

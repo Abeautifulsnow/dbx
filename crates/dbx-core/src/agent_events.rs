@@ -128,3 +128,10 @@ impl ToolDefinition {
 
 /// Hook called before a tool executes. Return Err(reason) to block execution.
 pub type BeforeToolHook = dyn Fn(&ToolCall, &ValidatedArgs) -> Result<(), String> + Send + Sync;
+
+/// In-session schema metadata cache. Stored per-connection in AppState with TTL.
+#[derive(Default)]
+pub struct SchemaCache {
+    pub tables: tokio::sync::Mutex<Option<String>>,
+    pub columns: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+}

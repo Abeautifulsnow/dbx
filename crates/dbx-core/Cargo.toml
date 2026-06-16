@@ -9,6 +9,7 @@ default = ["duckdb-bundled"]
 duckdb-bundled = ["duckdb/bundled"]
 
 [dependencies]
+dashmap = "6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 regex = "1"

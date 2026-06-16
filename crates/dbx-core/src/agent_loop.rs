@@ -1,12 +1,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::future::join_all;
 use futures::FutureExt;
 use serde_json::json;
 use tokio::sync::Notify;
 
-use crate::agent_events::{AgentEvent, BeforeToolHook, ToolCall, ToolDefinition, ToolResult};
+use crate::agent_events::{AgentEvent, BeforeToolHook, SchemaCache, ToolCall, ToolDefinition, ToolResult};
 use crate::agent_tools;
 use crate::ai::{self, AiCompletionRequest, AiConfig, AiMessage, AiProvider, AiStreamChunk};
 use crate::connection::AppState;
@@ -20,6 +21,24 @@ const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 12_000;
 const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
 const TOOL_RESULT_TAIL_CHARS: usize = 4_000;
 const TOOL_RESULT_SAMPLE_ITEMS: usize = 5;
+
+/// Patterns that indicate a tool failure caused by schema mismatch (wrong table/column name).
+const SCHEMA_ERROR_PATTERNS: &[&str] = &[
+    "does not exist",
+    "unknown column",
+    "no such table",
+    "invalid identifier",
+    "table not found",
+    "column not found",
+    "relation \"",
+    "doesn't exist",
+    "unrecognized",
+];
+
+fn is_schema_error(content: &str) -> bool {
+    let c = content.to_lowercase();
+    SCHEMA_ERROR_PATTERNS.iter().any(|p| c.contains(p))
+}
 
 /// Configuration for agent loop behavior.
 pub struct AgentLoopConfig {
@@ -49,6 +68,7 @@ pub struct AgentLoopContext {
     pub connection_id: String,
     pub database: String,
     pub db_type: DatabaseType,
+    pub schema_cache: Option<Arc<SchemaCache>>,
 }
 
 /// Check if the provider supports function calling / tool use.
@@ -105,6 +125,31 @@ pub async fn run_agent_loop(
     let mut conversation_messages: Vec<AiMessage> = messages.to_vec();
     let mut final_text = String::new();
     let mut total_usage = TokenUsage::default();
+
+    // Schema cache lookup with TTL (5 min)
+    let schema_cache: Option<Arc<SchemaCache>> = agent_ctx
+        .schema_cache
+        .as_ref()
+        .map(Arc::clone)
+        .or_else(|| {
+            let cache_key = (agent_ctx.connection_id.clone(), agent_ctx.database.clone());
+            let entry = agent_ctx.state.schema_cache.get(&cache_key);
+            match entry {
+                Some(entry) if Instant::now().duration_since(entry.value().1).as_secs() < 300 => {
+                    Some(Arc::clone(&entry.value().0))
+                }
+                _ => {
+                    let new_cache = Arc::new(SchemaCache::default());
+                    agent_ctx
+                        .state
+                        .schema_cache
+                        .insert(cache_key, (Arc::clone(&new_cache), Instant::now()));
+                    Some(new_cache)
+                }
+            }
+        });
+
+    let mut schema_retry_hinted = false;
 
     // Build before_hook for SQL safety (only in agent mode)
     let db_type = agent_ctx.db_type;
@@ -294,8 +339,26 @@ pub async fn run_agent_loop(
         let make_tc =
             |tc: &ToolCall| ToolCall { id: tc.id.clone(), name: tc.name.clone(), arguments: tc.arguments.clone() };
 
+        // Build progress callbacks for long-running tools (get_sample_data)
+        let progress_callbacks: Vec<Box<dyn Fn(serde_json::Value) + Send + Sync>> = collected_tool_calls
+            .iter()
+            .map(|tc| {
+                let on_ev = on_event.clone();
+                let id = tc.id.clone();
+                let name = tc.name.clone();
+                Box::new(move |partial: serde_json::Value| {
+                    on_ev(AgentEvent::ToolExecutionUpdate {
+                        tool_call_id: id.clone(),
+                        tool_name: name.clone(),
+                        partial_result: partial,
+                    });
+                }) as Box<dyn Fn(serde_json::Value) + Send + Sync>
+            })
+            .collect();
+
         // Run parallel group
         let tools_ref = tools.as_slice();
+        let sc = schema_cache.clone();
         let parallel_futures: Vec<_> = parallel_indices
             .iter()
             .map(|&i| {
@@ -304,6 +367,9 @@ pub async fn run_agent_loop(
                 let conn = conn2.clone();
                 let db = db2.clone();
                 let bh = before_hook_ref;
+                let sc2 = sc.clone();
+                let on_progress: Option<&(dyn Fn(serde_json::Value) + Send + Sync)> =
+                    Some(progress_callbacks[i].as_ref());
                 async move {
                     agent_tools::execute_tool(
                         &tc,
@@ -314,7 +380,8 @@ pub async fn run_agent_loop(
                             db_type: &db_type,
                             tools: tools_ref,
                             before_hook: bh,
-                            on_progress: None,
+                            schema_cache: sc2.as_ref(),
+                            on_progress,
                         },
                     )
                     .await
@@ -327,6 +394,8 @@ pub async fn run_agent_loop(
         let mut sequential_results = Vec::with_capacity(sequential_indices.len());
         for &i in &sequential_indices {
             let tc = make_tc(&collected_tool_calls[i]);
+            let on_progress: Option<&(dyn Fn(serde_json::Value) + Send + Sync)> =
+                Some(progress_callbacks[i].as_ref());
             sequential_results.push(
                 agent_tools::execute_tool(
                     &tc,
@@ -337,7 +406,8 @@ pub async fn run_agent_loop(
                         db_type: &db_type,
                         tools: &tools,
                         before_hook: before_hook_ref,
-                        on_progress: None,
+                        schema_cache: schema_cache.as_ref(),
+                        on_progress,
                     },
                 )
                 .await,
@@ -354,6 +424,18 @@ pub async fn run_agent_loop(
         }
         let results: Vec<ToolResult> = results.into_iter().map(|r| r.unwrap()).collect();
 
+        // Check for schema mismatch errors before processing results
+        let mut has_schema_error = false;
+        if !schema_retry_hinted {
+            for result in &results {
+                if result.is_error && is_schema_error(&result.content) {
+                    schema_retry_hinted = true;
+                    has_schema_error = true;
+                    break;
+                }
+            }
+        }
+
         // Process results in order, emitting ToolCallEnd events
         for (tc, result) in collected_tool_calls.iter().zip(results) {
             on_event(AgentEvent::ToolCallEnd {
@@ -369,6 +451,16 @@ pub async fn run_agent_loop(
                 role: "tool".to_string(),
                 content: compact_tool_result_for_context(&tc.name, &result.content),
                 tool_call_id: Some(tc.id.clone()),
+                tool_calls: Vec::new(),
+            });
+        }
+
+        // Inject retry hint after tool messages if a schema error was detected
+        if has_schema_error {
+            conversation_messages.push(AiMessage {
+                role: "user".to_string(),
+                content: "[SYSTEM HINT] A tool call failed due to a schema mismatch (wrong table or column name). Please call list_tables or get_columns to verify the correct names before retrying the query.".to_string(),
+                tool_call_id: None,
                 tool_calls: Vec::new(),
             });
         }

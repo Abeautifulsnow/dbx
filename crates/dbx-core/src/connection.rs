@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
@@ -48,6 +49,9 @@ mod duckdb_types {
 
 use duckdb_types::{DuckDbHandle, ExternalTabularHandle};
 
+/// Schema cache map type alias (key: (connection_id, database), value: (cache, write_time))
+pub type SchemaCacheMap = dashmap::DashMap<(String, String), (Arc<crate::agent_events::SchemaCache>, Instant)>;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MysqlMode {
     Normal,
@@ -83,6 +87,7 @@ pub struct AppState {
     pub storage: Storage,
     pub plugins: PluginRegistry,
     pub agent_manager: crate::agent_manager::AgentManager,
+    pub schema_cache: Arc<SchemaCacheMap>,
 }
 
 pub fn metadata_connection_config(config: &ConnectionConfig) -> ConnectionConfig {
@@ -263,6 +268,7 @@ impl AppState {
                 agent_dir,
                 app_version,
             ),
+            schema_cache: Arc::new(dashmap::DashMap::new()),
         }
     }
 

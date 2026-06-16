@@ -79,6 +79,27 @@ pub fn supports_explain_plan(database_type: Option<DatabaseType>) -> bool {
     )
 }
 
+/// Returns true for databases that support foreign key and index introspection.
+pub fn supports_fk_introspection(db_type: DatabaseType) -> bool {
+    matches!(
+        db_type,
+        DatabaseType::Postgres
+            | DatabaseType::Redshift
+            | DatabaseType::OpenGauss
+            | DatabaseType::Gaussdb
+            | DatabaseType::Vastbase
+            | DatabaseType::Kingbase
+            | DatabaseType::Mysql
+            | DatabaseType::Doris
+            | DatabaseType::StarRocks
+            | DatabaseType::Sqlite
+            | DatabaseType::Rqlite
+            | DatabaseType::Turso
+            | DatabaseType::SqlServer
+            | DatabaseType::Oracle
+    )
+}
+
 /// Returns true for databases that support SQL query execution (execute_query / get_sample_data).
 /// Non-SQL databases (Redis, MongoDB, Elasticsearch, InfluxDB, Neo4j, etcd) are excluded.
 pub fn supports_sql_query(database_type: DatabaseType) -> bool {

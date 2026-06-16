@@ -641,6 +641,23 @@ async function send() {
             if (step) msg.agentSteps.push(step);
           }
         }
+        // Progress updates for long-running tools (e.g., get_sample_data)
+        if (event.type === "tool_execution_update") {
+          const msg = messages.value[assistantIdx];
+          if (msg?.agentSteps) {
+            const partial = event.partial_result as { phase?: string; rows_collected?: number } | undefined;
+            if (partial && partial.phase === "sampling") {
+              const progressText = `Sampling rows... (${partial.rows_collected ?? 0} rows fetched)`;
+              for (const step of msg.agentSteps) {
+                if (step.key.startsWith(event.tool_call_id)) {
+                  step.toolResult = progressText;
+                  step.tone = "active";
+                  break;
+                }
+              }
+            }
+          }
+        }
         scrollToBottom();
       },
       sessionId,

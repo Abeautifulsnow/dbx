@@ -217,6 +217,7 @@ pub async fn ai_agent_stream(
         connection_id: body.connection_id,
         database: body.database,
         db_type: parsed_db_type,
+        schema_cache: None, // schema_cache: set to Some(Arc) to enable TTL-based caching
     };
 
     let sid = session_id.clone();
