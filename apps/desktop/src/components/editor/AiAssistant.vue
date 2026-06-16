@@ -750,6 +750,9 @@ async function copyCode(code: string, key: string) {
 }
 
 function clearMessages() {
+  cancelStream();
+  isGenerating.value = false;
+  currentSessionId.value = "";
   messages.value = [];
   conversationId.value = "";
 }
@@ -780,6 +783,9 @@ async function setConversationListOpen(open: boolean) {
 }
 
 function selectConversation(conv: AiConversation) {
+  cancelStream();
+  isGenerating.value = false;
+  currentSessionId.value = "";
   conversationId.value = conv.id;
   messages.value = conv.messages.map((m) => ({
     role: m.role as "user" | "assistant",
