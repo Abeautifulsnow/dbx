@@ -889,7 +889,7 @@ fn build_fk_sql(table: &str, schema: &str, database: &str, db_type: &DatabaseTyp
                  JOIN information_schema.key_column_usage kcu \
                  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
                  JOIN information_schema.referential_constraints rc \
-                 ON tc.constraint_name = rc.constraint_name \
+                 ON tc.constraint_name = rc.constraint_name AND tc.constraint_schema = rc.constraint_schema \
                  JOIN information_schema.constraint_column_usage ccu \
                  ON rc.unique_constraint_name = ccu.constraint_name \
                  WHERE tc.constraint_type = 'FOREIGN KEY' \
@@ -909,18 +909,22 @@ fn build_fk_sql(table: &str, schema: &str, database: &str, db_type: &DatabaseTyp
         DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => {
             Some(format!("PRAGMA foreign_key_list('{table}')"))
         }
-        DatabaseType::SqlServer => Some(format!(
-            "SELECT fkc.name AS column_name, rt.name AS referenced_table, \
-             rc.name AS referenced_column, \
-             fk.delete_referential_action_desc AS delete_rule, \
-             fk.update_referential_action_desc AS update_rule \
-             FROM sys.foreign_keys fk \
-             JOIN sys.foreign_key_columns fkcc ON fk.object_id = fkcc.constraint_object_id \
-             JOIN sys.columns fkc ON fkcc.parent_column_id = fkc.column_id AND fkcc.parent_object_id = fkc.object_id \
-             JOIN sys.tables rt ON fkcc.referenced_object_id = rt.object_id \
-             JOIN sys.columns rc ON fkcc.referenced_column_id = rc.column_id AND fkcc.referenced_object_id = rc.object_id \
-             WHERE OBJECT_NAME(fk.parent_object_id) = '{table}'"
-        )),
+        DatabaseType::SqlServer => {
+            let schema = if schema.is_empty() { "dbo" } else { schema };
+            Some(format!(
+                "SELECT fkc.name AS column_name, rt.name AS referenced_table, \
+                 rc.name AS referenced_column, \
+                 fk.delete_referential_action_desc AS delete_rule, \
+                 fk.update_referential_action_desc AS update_rule \
+                 FROM sys.foreign_keys fk \
+                 JOIN sys.foreign_key_columns fkcc ON fk.object_id = fkcc.constraint_object_id \
+                 JOIN sys.columns fkc ON fkcc.parent_column_id = fkc.column_id AND fkcc.parent_object_id = fkc.object_id \
+                 JOIN sys.tables rt ON fkcc.referenced_object_id = rt.object_id \
+                 JOIN sys.columns rc ON fkcc.referenced_column_id = rc.column_id AND fkcc.referenced_object_id = rc.object_id \
+                 WHERE OBJECT_NAME(fk.parent_object_id) = '{table}' \
+                 AND OBJECT_SCHEMA_NAME(fk.parent_object_id) = '{schema}'"
+            ))
+        }
         DatabaseType::Oracle => {
             let schema_upper = if schema.is_empty() { database.to_uppercase() } else { schema.to_uppercase() };
             Some(format!(
@@ -954,6 +958,7 @@ fn build_index_sql(table: &str, schema: &str, database: &str, db_type: &Database
                  CASE WHEN ix.indisprimary THEN 'YES' ELSE 'NO' END AS is_primary \
                  FROM pg_indexes pi \
                  JOIN pg_class c ON c.relname = pi.tablename \
+                   AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = pi.schemaname) \
                  JOIN pg_index ix ON c.oid = ix.indrelid \
                  JOIN pg_class ic ON ic.oid = ix.indexrelid AND ic.relname = pi.indexname \
                  WHERE pi.schemaname = '{schema}' AND pi.tablename = '{table}'"
@@ -969,18 +974,22 @@ fn build_index_sql(table: &str, schema: &str, database: &str, db_type: &Database
         DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => {
             Some(format!("PRAGMA index_list('{table}')"))
         }
-        DatabaseType::SqlServer => Some(format!(
-            "SELECT i.name AS index_name, \
-             STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns, \
-             CASE WHEN i.is_unique = 1 THEN 'YES' ELSE 'NO' END AS is_unique, \
-             CASE WHEN i.is_primary_key = 1 THEN 'YES' ELSE 'NO' END AS is_primary, \
-             i.type_desc AS index_type \
-             FROM sys.indexes i \
-             JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
-             JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id \
-             WHERE OBJECT_NAME(i.object_id) = '{table}' AND i.is_hypothetical = 0 \
-             GROUP BY i.name, i.is_unique, i.is_primary_key, i.type_desc"
-        )),
+        DatabaseType::SqlServer => {
+            let schema = if schema.is_empty() { "dbo" } else { schema };
+            Some(format!(
+                "SELECT i.name AS index_name, \
+                 STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns, \
+                 CASE WHEN i.is_unique = 1 THEN 'YES' ELSE 'NO' END AS is_unique, \
+                 CASE WHEN i.is_primary_key = 1 THEN 'YES' ELSE 'NO' END AS is_primary, \
+                 i.type_desc AS index_type \
+                 FROM sys.indexes i \
+                 JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+                 JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id \
+                 WHERE OBJECT_NAME(i.object_id) = '{table}' AND OBJECT_SCHEMA_NAME(i.object_id) = '{schema}' \
+                 AND i.is_hypothetical = 0 \
+                 GROUP BY i.name, i.is_unique, i.is_primary_key, i.type_desc"
+            ))
+        }
         DatabaseType::Oracle => {
             let schema_upper = if schema.is_empty() { database.to_uppercase() } else { schema.to_uppercase() };
             Some(format!(
