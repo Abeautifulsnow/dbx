@@ -355,6 +355,7 @@ function agentEventToStep(event: AgentEvent, index: number): AiAgentStepItem | u
     toolName: event.tool_name,
     toolArgs: event.type === "tool_call_start" ? (event.args as Record<string, unknown>) : undefined,
     toolResult: event.type === "tool_call_end" && !event.is_error ? extractToolResultContent(event.result) : undefined,
+    explainData: event.type === "tool_call_end" ? extractExplainData(event.result) : undefined,
     isError: event.type === "tool_call_end" ? event.is_error : undefined,
   };
 }
