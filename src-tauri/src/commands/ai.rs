@@ -86,6 +86,8 @@ pub async fn ai_agent_stream(
         request.max_tokens,
         request.temperature,
         is_agent_mode,
+        None,
+        None,
     )
     .await;
 

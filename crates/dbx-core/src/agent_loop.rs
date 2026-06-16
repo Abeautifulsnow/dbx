@@ -6,7 +6,7 @@ use futures::FutureExt;
 use serde_json::json;
 use tokio::sync::Notify;
 
-use crate::agent_events::{AgentEvent, ToolCall, ToolDefinition, ToolResult};
+use crate::agent_events::{AgentEvent, BeforeToolHook, ToolCall, ToolDefinition, ToolResult};
 use crate::agent_tools;
 use crate::ai::{self, AiCompletionRequest, AiConfig, AiMessage, AiProvider, AiStreamChunk};
 use crate::connection::AppState;
@@ -14,12 +14,34 @@ use crate::models::connection::DatabaseType;
 use crate::token_usage::TokenUsage;
 use tokio::sync::Mutex;
 
-/// Maximum number of agent loop turns to prevent infinite loops.
-const MAX_AGENT_TURNS: u32 = 10;
+/// Maximum number of agent loop turns to prevent infinite loops (default, overridable via AgentLoopConfig).
+const DEFAULT_MAX_AGENT_TURNS: u32 = 10;
 const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 12_000;
 const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
 const TOOL_RESULT_TAIL_CHARS: usize = 4_000;
 const TOOL_RESULT_SAMPLE_ITEMS: usize = 5;
+
+/// Configuration for agent loop behavior.
+pub struct AgentLoopConfig {
+    /// Maximum number of agent turns before forced termination.
+    pub max_turns: u32,
+    /// Auto-stop mode controls early termination.
+    pub auto_stop: AutoStopMode,
+}
+
+/// Controls when the agent loop terminates before reaching max_turns.
+pub enum AutoStopMode {
+    /// Run until max_turns is reached (current behavior).
+    Fixed,
+    /// Stop after N consecutive turns with no tool calls.
+    IdleTurns(u32),
+}
+
+impl Default for AgentLoopConfig {
+    fn default() -> Self {
+        Self { max_turns: DEFAULT_MAX_AGENT_TURNS, auto_stop: AutoStopMode::IdleTurns(2) }
+    }
+}
 
 /// Context for an agent loop run.
 pub struct AgentLoopContext {
@@ -58,6 +80,8 @@ pub async fn run_agent_loop(
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     is_agent_mode: bool,
+    loop_config: Option<AgentLoopConfig>,
+    steering_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 ) -> Result<String, String> {
     // Auto-degrade: providers without function calling fall back to text-only completion.
     if !provider_supports_function_calling(config) {
@@ -73,16 +97,66 @@ pub async fn run_agent_loop(
         )
         .await;
     }
+
+    let loop_config = loop_config.unwrap_or_default();
+    let max_turns = loop_config.max_turns;
+
     let tools = if is_agent_mode { agent_tools::all_tools(agent_ctx.db_type) } else { agent_tools::read_only_tools() };
     let mut conversation_messages: Vec<AiMessage> = messages.to_vec();
     let mut final_text = String::new();
     let mut total_usage = TokenUsage::default();
 
-    for turn in 0..MAX_AGENT_TURNS {
+    // Build before_hook for SQL safety (only in agent mode)
+    let db_type = agent_ctx.db_type;
+    let before_hook: Option<Box<BeforeToolHook>> = if is_agent_mode {
+        Some(Box::new(move |tc, args| {
+            if tc.name == "execute_query" || tc.name == "explain_query" {
+                let sql = args.parsed.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+                if !sql.is_empty() {
+                    let db_type_str = format!("{:?}", db_type).to_lowercase();
+                    let risk = crate::sql_risk::classify_sql_risk(sql, &db_type_str)?;
+                    match risk {
+                        crate::sql_risk::SqlRisk::ReadOnly => Ok(()),
+                        _ => Err(format!("{} statement detected. Only read-only queries are allowed.", risk)),
+                    }
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            }
+        }))
+    } else {
+        None
+    };
+    let before_hook_ref: Option<&BeforeToolHook> = before_hook.as_deref();
+
+    // Steering channel
+    let mut steering_rx = steering_rx;
+
+    let mut consecutive_idle_turns: u32 = 0;
+
+    for turn in 0..max_turns {
         // Check for cancellation before each turn
         if cancelled.notified().now_or_never().is_some() {
             on_event(AgentEvent::Error { message: "Agent loop cancelled".to_string() });
             break;
+        }
+
+        // Drain steering channel and inject any pending user steering messages
+        if let Some(ref mut rx) = steering_rx {
+            while let Ok(msg) = rx.try_recv() {
+                let trimmed = msg.trim();
+                if !trimmed.is_empty() {
+                    on_event(AgentEvent::SteeringApplied { content: trimmed.to_string() });
+                    conversation_messages.push(AiMessage {
+                        role: "user".to_string(),
+                        content: format!("[USER STEERING] {}", trimmed),
+                        tool_call_id: None,
+                        tool_calls: Vec::new(),
+                    });
+                }
+            }
         }
 
         // Check and maybe compact context
@@ -175,10 +249,25 @@ pub async fn run_agent_loop(
         });
 
         if collected_tool_calls.is_empty() {
-            // No tool calls -- we're done
-            final_text = accumulated_text;
-            break;
+            // No tool calls this turn
+            match loop_config.auto_stop {
+                AutoStopMode::Fixed => {
+                    // Current behavior: stop immediately on first idle turn
+                    final_text = accumulated_text;
+                    break;
+                }
+                AutoStopMode::IdleTurns(n) => {
+                    consecutive_idle_turns += 1;
+                    final_text = accumulated_text;
+                    if consecutive_idle_turns >= n {
+                        break;
+                    }
+                    // Otherwise, continue to next turn (LLM may respond to the assistant message)
+                    continue;
+                }
+            }
         }
+        consecutive_idle_turns = 0;
 
         // Execute each tool call
         // Emit all ToolCallStart events first
@@ -213,7 +302,8 @@ pub async fn run_agent_loop(
                 let state = Arc::clone(&state2);
                 let conn = conn2.clone();
                 let db = db2.clone();
-                async move { agent_tools::execute_tool(&tc, &state, &conn, &db, &db_type).await }
+                let bh = before_hook_ref;
+                async move { agent_tools::execute_tool(&tc, &state, &conn, &db, &db_type, bh, None).await }
             })
             .collect();
         let parallel_results = join_all(parallel_futures).await;
@@ -222,7 +312,8 @@ pub async fn run_agent_loop(
         let mut sequential_results = Vec::with_capacity(sequential_indices.len());
         for &i in &sequential_indices {
             let tc = make_tc(&collected_tool_calls[i]);
-            sequential_results.push(agent_tools::execute_tool(&tc, &state2, &conn2, &db2, &db_type).await);
+            sequential_results
+                .push(agent_tools::execute_tool(&tc, &state2, &conn2, &db2, &db_type, before_hook_ref, None).await);
         }
 
         // Merge results back into original order

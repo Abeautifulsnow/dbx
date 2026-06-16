@@ -590,12 +590,10 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
                     } else {
                         "1".to_string()
                     }
+                } else if column_type.is_some_and(is_mysql_bit_type) {
+                    "b'0'".to_string()
                 } else {
-                    if column_type.is_some_and(is_mysql_bit_type) {
-                        "b'0'".to_string()
-                    } else {
-                        "0".to_string()
-                    }
+                    "0".to_string()
                 }
             }
             _ => {

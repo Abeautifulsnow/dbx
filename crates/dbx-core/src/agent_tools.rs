@@ -2,12 +2,11 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::agent_events::{ToolCall, ToolDefinition, ToolResult};
+use crate::agent_events::{BeforeToolHook, ToolCall, ToolDefinition, ToolResult, ValidatedArgs};
 use crate::connection::AppState;
 use crate::models::connection::DatabaseType;
 use crate::query::QueryExecutionOptions;
 use crate::query_execution_sql::{build_explain_sql, supports_explain_plan, supports_sql_query, ExplainSqlOptions};
-use crate::sql_risk::SqlRisk;
 use crate::types::QueryResult;
 
 /// Maximum number of tables returned by list_tables tool.
@@ -59,6 +58,10 @@ fn list_tables_tool() -> ToolDefinition {
         }),
         read_only: true,
         parallel_ok: true,
+        validate_args: Some(|args| {
+            let schema = args.get("schema").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Ok(ValidatedArgs { parsed: json!({ "schema": schema }), warnings: vec![] })
+        }),
     }
 }
 
@@ -86,6 +89,24 @@ fn get_columns_tool() -> ToolDefinition {
         }),
         read_only: true,
         parallel_ok: true,
+        validate_args: Some(|args| {
+            let table = args
+                .get("table")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing required parameter: 'table'".to_string())?
+                .trim();
+            if table.is_empty() {
+                return Err("Table name cannot be empty".to_string());
+            }
+            if table.len() > 256 {
+                return Err(format!("Table name too long: {} characters (max 256)", table.len()));
+            }
+            if table.contains(';') || table.contains('\'') || table.contains('"') || table.contains('\\') {
+                return Err(format!("Table name contains invalid characters: '{}'", table));
+            }
+            let schema = args.get("schema").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Ok(ValidatedArgs { parsed: json!({ "table": table, "schema": schema }), warnings: vec![] })
+        }),
     }
 }
 /// execute_query tool definition.
@@ -111,6 +132,30 @@ fn execute_query_tool() -> ToolDefinition {
         }),
         read_only: true,
         parallel_ok: false,
+        validate_args: Some(|args| {
+            let sql =
+                args.get("sql").and_then(|v| v.as_str()).ok_or("Missing required parameter: 'sql'".to_string())?.trim();
+            if sql.is_empty() {
+                return Err("SQL query cannot be empty".to_string());
+            }
+            let mut warnings = Vec::new();
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|l| {
+                    let l = l as usize;
+                    if l < 1 {
+                        EXECUTE_QUERY_LIMIT
+                    } else if l > MAX_ALLOWED_ROWS {
+                        warnings.push(format!("limit capped from {} to {}", l, MAX_ALLOWED_ROWS));
+                        MAX_ALLOWED_ROWS
+                    } else {
+                        l
+                    }
+                })
+                .unwrap_or(EXECUTE_QUERY_LIMIT);
+            Ok(ValidatedArgs { parsed: json!({ "sql": sql, "limit": limit }), warnings })
+        }),
     }
 }
 
@@ -139,6 +184,35 @@ fn get_sample_data_tool() -> ToolDefinition {
         }),
         read_only: true,
         parallel_ok: true,
+        validate_args: Some(|args| {
+            let table = args
+                .get("table")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing required parameter: 'table'".to_string())?
+                .trim();
+            if table.is_empty() {
+                return Err("Table name cannot be empty".to_string());
+            }
+            if table.contains(';') || table.contains('\'') || table.contains('"') || table.contains('\\') {
+                return Err(format!("Table name contains invalid characters: '{}'", table));
+            }
+            let schema = args.get("schema").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let mut warnings = Vec::new();
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|l| {
+                    let l = l as usize;
+                    if l > MAX_ALLOWED_ROWS {
+                        warnings.push(format!("limit capped from {} to {}", l, MAX_ALLOWED_ROWS));
+                        MAX_ALLOWED_ROWS
+                    } else {
+                        l
+                    }
+                })
+                .unwrap_or(SAMPLE_DATA_LIMIT);
+            Ok(ValidatedArgs { parsed: json!({ "table": table, "schema": schema, "limit": limit }), warnings })
+        }),
     }
 }
 
@@ -162,6 +236,14 @@ fn explain_query_tool() -> ToolDefinition {
         }),
         read_only: true,
         parallel_ok: true,
+        validate_args: Some(|args| {
+            let sql =
+                args.get("sql").and_then(|v| v.as_str()).ok_or("Missing required parameter: 'sql'".to_string())?.trim();
+            if sql.is_empty() {
+                return Err("SQL query cannot be empty".to_string());
+            }
+            Ok(ValidatedArgs { parsed: json!({ "sql": sql }), warnings: vec![] })
+        }),
     }
 }
 
@@ -172,25 +254,17 @@ pub async fn execute_tool(
     connection_id: &str,
     database: &str,
     db_type: &DatabaseType,
+    before_hook: Option<&BeforeToolHook>,
+    on_progress: Option<&(dyn Fn(serde_json::Value) + Send + Sync)>,
 ) -> ToolResult {
-    let result = match tool_call.name.as_str() {
-        "list_tables" => execute_list_tables(tool_call, state, connection_id, database, db_type).await,
-        "get_columns" => execute_get_columns(tool_call, state, connection_id, database, db_type).await,
-        "execute_query" => execute_execute_query(tool_call, state, connection_id, database, db_type).await,
-        "get_sample_data" => execute_get_sample_data(tool_call, state, connection_id, database, db_type).await,
-        "explain_query" => {
-            let (text_result, explain_data) =
-                execute_explain_query(tool_call, state, connection_id, database, db_type).await;
-            match text_result {
-                Ok(content) => {
-                    return ToolResult {
-                        tool_call_id: tool_call.id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        content,
-                        is_error: false,
-                        explain_data,
-                    };
-                }
+    // 1. Find tool definition and run argument validator
+    let tools = all_tools(*db_type);
+    let tool_def = tools.iter().find(|t| t.name == tool_call.name);
+
+    let validated = if let Some(td) = tool_def {
+        if let Some(validator) = td.validate_args {
+            match validator(&tool_call.arguments) {
+                Ok(v) => v,
                 Err(err) => {
                     return ToolResult {
                         tool_call_id: tool_call.id.clone(),
@@ -201,22 +275,86 @@ pub async fn execute_tool(
                     };
                 }
             }
+        } else {
+            ValidatedArgs { parsed: tool_call.arguments.clone(), warnings: Vec::new() }
+        }
+    } else {
+        ValidatedArgs { parsed: tool_call.arguments.clone(), warnings: Vec::new() }
+    };
+
+    // 2. Run before_hook if present
+    if let Some(hook) = before_hook {
+        if let Err(reason) = hook(tool_call, &validated) {
+            return ToolResult {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                content: format!("Blocked: {reason}"),
+                is_error: true,
+                explain_data: None,
+            };
+        }
+    }
+
+    // 3. Create effective ToolCall with validated/normalized args
+    let effective_call =
+        ToolCall { id: tool_call.id.clone(), name: tool_call.name.clone(), arguments: validated.parsed.clone() };
+
+    // on_progress is accepted for future use (P3: get_sample_data row-by-row progress)
+    let _ = on_progress;
+
+    let result = match effective_call.name.as_str() {
+        "list_tables" => execute_list_tables(&effective_call, state, connection_id, database, db_type).await,
+        "get_columns" => execute_get_columns(&effective_call, state, connection_id, database, db_type).await,
+        "execute_query" => execute_execute_query(&effective_call, state, connection_id, database, db_type).await,
+        "get_sample_data" => execute_get_sample_data(&effective_call, state, connection_id, database, db_type).await,
+        "explain_query" => {
+            let (text_result, explain_data) =
+                execute_explain_query(&effective_call, state, connection_id, database, db_type).await;
+            let warnings = &validated.warnings;
+            let prefix =
+                if warnings.is_empty() { String::new() } else { format!("[WARNING] {}\n\n", warnings.join("; ")) };
+            match text_result {
+                Ok(content) => {
+                    return ToolResult {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        content: format!("{prefix}{content}"),
+                        is_error: false,
+                        explain_data,
+                    };
+                }
+                Err(err) => {
+                    return ToolResult {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        content: format!("{prefix}Error: {err}"),
+                        is_error: true,
+                        explain_data: None,
+                    };
+                }
+            }
         }
         _ => Err(format!("Unknown tool: {}", tool_call.name)),
+    };
+
+    let prefix = if validated.warnings.is_empty() {
+        String::new()
+    } else {
+        format!("[WARNING] {}\n\n", validated.warnings.join("; "))
     };
 
     match result {
         Ok(content) => ToolResult {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            content,
+            content: format!("{prefix}{content}"),
             is_error: false,
             explain_data: None,
         },
         Err(err) => ToolResult {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            content: format!("Error: {err}"),
+            content: format!("{prefix}Error: {err}"),
             is_error: true,
             explain_data: None,
         },
@@ -352,7 +490,7 @@ async fn execute_execute_query(
     state: &Arc<AppState>,
     connection_id: &str,
     database: &str,
-    db_type: &DatabaseType,
+    _db_type: &DatabaseType,
 ) -> Result<String, String> {
     let sql = tool_call.arguments.get("sql").and_then(|v| v.as_str()).ok_or("Missing required parameter: sql")?.trim();
 
@@ -366,19 +504,6 @@ async fn execute_execute_query(
         .and_then(|v| v.as_u64())
         .map(|l| (l as usize).min(MAX_ALLOWED_ROWS))
         .unwrap_or(EXECUTE_QUERY_LIMIT);
-
-    // Classify SQL risk using sqlparser AST
-    let db_type_str = format!("{:?}", db_type).to_lowercase();
-    let risk = crate::sql_risk::classify_sql_risk(sql, &db_type_str)?;
-    match risk {
-        SqlRisk::ReadOnly => { /* proceed */ }
-        _ => {
-            return Err(format!(
-                "Blocked: {} statement detected. Only read-only queries (SELECT, SHOW, DESCRIBE, EXPLAIN) are allowed.",
-                risk
-            ));
-        }
-    }
 
     // Execute query using existing infrastructure
     let options = QueryExecutionOptions { max_rows: Some(limit), timeout_secs: Some(30), ..Default::default() };
@@ -490,25 +615,6 @@ async fn execute_explain_query(
 
     if sql.is_empty() {
         return (Err("SQL query cannot be empty".to_string()), None);
-    }
-
-    // Classify SQL risk – only ReadOnly queries can be explained
-    let db_type_str = format!("{:?}", db_type).to_lowercase();
-    let risk = match crate::sql_risk::classify_sql_risk(sql, &db_type_str) {
-        Ok(r) => r,
-        Err(e) => return (Err(e), None),
-    };
-    match risk {
-        SqlRisk::ReadOnly => { /* proceed */ }
-        _ => {
-            return (
-                Err(format!(
-                    "Blocked: {} statement detected. Only read-only queries (SELECT, SHOW, DESCRIBE, EXPLAIN) can be analyzed.",
-                    risk
-                )),
-                None,
-            );
-        }
     }
 
     // Build the database-specific EXPLAIN SQL

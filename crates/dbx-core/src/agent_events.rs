@@ -14,6 +14,8 @@ pub enum AgentEvent {
     ToolCallStart { tool_call_id: String, tool_name: String, args: serde_json::Value },
     /// A tool execution has completed.
     ToolCallEnd { tool_call_id: String, tool_name: String, result: serde_json::Value, is_error: bool },
+    /// Partial progress update during a long-running tool execution.
+    ToolExecutionUpdate { tool_call_id: String, tool_name: String, partial_result: serde_json::Value },
     /// A turn in the agent loop has ended.
     TurnEnd { turn: u32 },
     /// The agent loop has finished.
@@ -26,6 +28,8 @@ pub enum AgentEvent {
         estimated_before: u32,
         estimated_after: u32,
     },
+    /// A steering message was injected into the conversation.
+    SteeringApplied { content: String },
     /// An error occurred during the agent loop.
     Error { message: String },
 }
@@ -52,7 +56,7 @@ pub struct ToolResult {
 }
 
 /// Definition of a tool available to the agent.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolDefinition {
     pub name: &'static str,
     pub description: &'static str,
@@ -61,7 +65,36 @@ pub struct ToolDefinition {
     /// Whether this tool can be executed in parallel with other tools.
     /// false = must run sequentially (e.g. execute_query).
     pub parallel_ok: bool,
+    /// Optional argument validator. Receives the raw arguments JSON and returns
+    /// either validated/normalized arguments with optional warnings, or an error message.
+    /// When None, arguments are passed through as-is (backward compatible).
+    pub validate_args: Option<ValidateArgsFn>,
 }
+
+impl std::fmt::Debug for ToolDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolDefinition")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("parameters", &self.parameters)
+            .field("read_only", &self.read_only)
+            .field("parallel_ok", &self.parallel_ok)
+            .field("validate_args", &self.validate_args.map(|_| "<fn>"))
+            .finish()
+    }
+}
+
+/// Result of tool argument validation.
+#[derive(Debug, Clone)]
+pub struct ValidatedArgs {
+    /// Normalized/coerced arguments to pass to the tool executor.
+    pub parsed: serde_json::Value,
+    /// Non-fatal warnings (e.g. "limit capped from 200 to 100").
+    pub warnings: Vec<String>,
+}
+
+/// Function pointer type for tool argument validators.
+pub type ValidateArgsFn = fn(&serde_json::Value) -> Result<ValidatedArgs, String>;
 
 impl ToolDefinition {
     /// Convert to OpenAI-compatible tool JSON for the API request.
@@ -92,3 +125,6 @@ impl ToolDefinition {
         })
     }
 }
+
+/// Hook called before a tool executes. Return Err(reason) to block execution.
+pub type BeforeToolHook = dyn Fn(&ToolCall, &ValidatedArgs) -> Result<(), String> + Send + Sync;
