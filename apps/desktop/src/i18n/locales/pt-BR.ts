@@ -1,4 +1,4 @@
-﻿export default {
+export default {
   app: {
     name: "DBX",
   },
@@ -754,7 +754,9 @@
     loading: "Carregando...",
     stopping: "Parando...",
     close: "Fechar",
+    retry: "Tentar novamente",
     more: "Mais",
+    done: "Concluído",
   },
   explain: {
     title: "Plano de Execução",
@@ -1058,6 +1060,8 @@
     editView: "Editar Visão",
     viewSource: "Ver Código-fonte",
     viewDdl: "Ver DDL",
+    viewDdlLoading: "Carregando DDL...",
+    ddlCopied: "DDL copiado",
     dropObject: "Remover Objeto",
     dropView: "Remover Visão",
     dropColumn: "Remover Coluna",
@@ -1503,6 +1507,7 @@
     title: "Operação perigosa",
     message: "Esta instrução SQL pode modificar ou excluir dados de forma irreversível. Tem certeza de que deseja executá-la?",
     suppressFuturePrompts: "Não perguntar novamente para SQL perigoso",
+    wrapLines: "Alternar quebra de linha",
     deleteMessage: "Esta operação de exclusão pode ser irreversível. Continuar?",
     deleteConfirm: "Confirmar exclusão",
     deleteRowMessage: "Esta linha será marcada para exclusão e removida do banco de dados após salvar. Continuar?",
@@ -1693,6 +1698,21 @@
       file_extension: "File Extension",
       url: "URL",
       hostname: "Hostname",
+      id_number: "Número de documento",
+    },
+    idTypes: {
+      title: "Tipo de documento",
+      customPattern: "Padrão personalizado",
+      customPatternPlaceholder: "ex.: ([A-Z]{2})-([0-9]{8})",
+      customPatternHint: "Suporta padrões simples como [A-Z] letras, [0-9] dígitos, {n} repetições, hífens",
+      id_card: "CPF chinês",
+      passport: "Passaporte",
+      hk_macau_pass: "Permissão HK/Macau",
+      taiwan_pass: "Permissão Taiwan",
+      uscc: "Código social unificado",
+      bank_card: "Cartão bancário",
+      drivers_license: "Carteira de motorista",
+      custom: "Personalizado",
     },
   },
   tableToolbox: {
@@ -1976,6 +1996,8 @@
     sidebarHiddenTablePrefixes: "Prefixos de nome de tabela ocultos",
     sidebarHiddenTablePrefixesDescription: "Um prefixo por linha. Apenas os rótulos de tabela, view e coleção da barra lateral são encurtados; tooltips e ações ainda usam o nome completo.",
     sidebarHiddenTablePrefixesPlaceholder: "Exemplo:\nODS_\nT8Y2_LONG_",
+    sidebarTablePageSize: "Tamanho da página da barra lateral",
+    sidebarTablePageSizeDescription: "Número máximo de tabelas/objetos carregados por página na árvore lateral. Aumente se tiver muitas tabelas para reduzir páginas.",
     sidebarHideTableComments: "Ocultar comentários de tabela na barra lateral",
     sidebarHideTableCommentsDescription: "Ocultar os comentários inline de tabela/view exibidos ao lado dos nomes na árvore da barra lateral para economizar espaço horizontal.",
     sidebarAllowHorizontalScroll: "Permitir rolagem horizontal da barra lateral",
