@@ -127,30 +127,23 @@ pub async fn run_agent_loop(
     let mut total_usage = TokenUsage::default();
 
     // Schema cache lookup with TTL (5 min)
-    let schema_cache: Option<Arc<SchemaCache>> = agent_ctx
-        .schema_cache
-        .as_ref()
-        .map(Arc::clone)
-        .or_else(|| {
-            let cache_key = (agent_ctx.connection_id.clone(), agent_ctx.database.clone());
-            let entry = agent_ctx.state.schema_cache.get(&cache_key);
-            match entry {
-                Some(entry) if Instant::now().duration_since(entry.value().1).as_secs() < 300 => {
-                    Some(Arc::clone(&entry.value().0))
-                }
-                _ => {
-                    // Use insert() to overwrite expired entries. DashMap::insert is thread-safe;
-                    // concurrent cold-starts may both insert (last-write-wins), which is acceptable
-                    // — only the cached data from the first request may be lost, not correctness.
-                    let new_cache = Arc::new(SchemaCache::default());
-                    agent_ctx
-                        .state
-                        .schema_cache
-                        .insert(cache_key, (Arc::clone(&new_cache), Instant::now()));
-                    Some(new_cache)
-                }
+    let schema_cache: Option<Arc<SchemaCache>> = agent_ctx.schema_cache.as_ref().map(Arc::clone).or_else(|| {
+        let cache_key = (agent_ctx.connection_id.clone(), agent_ctx.database.clone());
+        let entry = agent_ctx.state.schema_cache.get(&cache_key);
+        match entry {
+            Some(entry) if Instant::now().duration_since(entry.value().1).as_secs() < 300 => {
+                Some(Arc::clone(&entry.value().0))
             }
-        });
+            _ => {
+                // Use insert() to overwrite expired entries. DashMap::insert is thread-safe;
+                // concurrent cold-starts may both insert (last-write-wins), which is acceptable
+                // — only the cached data from the first request may be lost, not correctness.
+                let new_cache = Arc::new(SchemaCache::default());
+                agent_ctx.state.schema_cache.insert(cache_key, (Arc::clone(&new_cache), Instant::now()));
+                Some(new_cache)
+            }
+        }
+    });
 
     let mut schema_retry_hinted = false;
 
@@ -397,8 +390,7 @@ pub async fn run_agent_loop(
         let mut sequential_results = Vec::with_capacity(sequential_indices.len());
         for &i in &sequential_indices {
             let tc = make_tc(&collected_tool_calls[i]);
-            let on_progress: Option<&(dyn Fn(serde_json::Value) + Send + Sync)> =
-                Some(progress_callbacks[i].as_ref());
+            let on_progress: Option<&(dyn Fn(serde_json::Value) + Send + Sync)> = Some(progress_callbacks[i].as_ref());
             sequential_results.push(
                 agent_tools::execute_tool(
                     &tc,
