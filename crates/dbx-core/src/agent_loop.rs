@@ -135,7 +135,6 @@ pub async fn run_agent_loop(
     let mut final_text = String::new();
     let mut loop_exit = LoopExit::Exhausted;
     let mut total_usage = TokenUsage::default();
-    let mut executed_tool_names: Vec<String> = Vec::new();
     let mut contract_repair_attempts = 0;
 
     for turn in 0..MAX_AGENT_TURNS {
@@ -280,8 +279,7 @@ pub async fn run_agent_loop(
         });
 
         if collected_tool_calls.is_empty() {
-            match validate_final_answer(task_contract.as_ref(), is_agent_mode, &accumulated_text, &executed_tool_names)
-            {
+            match validate_final_answer(task_contract.as_ref(), &accumulated_text) {
                 FinalAnswerCheck::Satisfied => {
                     if !accumulated_text.is_empty() {
                         on_event(AgentEvent::TextDelta { delta: accumulated_text.clone() });
@@ -367,7 +365,6 @@ pub async fn run_agent_loop(
 
         // Process results in order, emitting ToolCallEnd events
         for (tc, result) in collected_tool_calls.iter().zip(results) {
-            executed_tool_names.push(tc.name.clone());
             on_event(AgentEvent::ToolCallEnd {
                 tool_call_id: tc.id.clone(),
                 tool_name: tc.name.clone(),
@@ -460,7 +457,9 @@ fn augment_system_prompt_with_task_contract(
     let action = contract.action.as_deref().unwrap_or("unknown");
     let mode = contract.mode.as_deref().unwrap_or(if is_agent_mode { "agent" } else { "ask" });
     let user_request = contract.user_request.as_deref().unwrap_or("(not provided)");
-    let mode_rule = if is_agent_mode {
+    let mode_rule = if action_requires_sql_deliverable(action) {
+        "This is a SQL-producing action: produce the final SQL in a fenced ```sql code block. Use tools only as intermediate evidence for schema/dialect; do not stop at a tool-result summary. In Agent mode, execute a query only when the original request explicitly asks for real data/results, not when it merely asks to generate SQL."
+    } else if is_agent_mode {
         "For data-query intents, obtain real results with execute_query when safe; otherwise state the blocker."
     } else {
         "In Ask mode, produce SQL/explanation only and do not claim execution."
@@ -483,46 +482,18 @@ enum FinalAnswerCheck {
     NeedsRepair(String),
 }
 
-fn validate_final_answer(
-    task_contract: Option<&AiTaskContract>,
-    is_agent_mode: bool,
-    text: &str,
-    executed_tool_names: &[String],
-) -> FinalAnswerCheck {
+fn validate_final_answer(task_contract: Option<&AiTaskContract>, text: &str) -> FinalAnswerCheck {
     let Some(contract) = task_contract else {
         return FinalAnswerCheck::Satisfied;
     };
 
-    let action = contract.action.as_deref().unwrap_or_default().to_ascii_lowercase();
-    let user_request = contract.user_request.as_deref().unwrap_or_default();
-
-    if is_agent_mode
-        && is_data_query_intent(user_request)
-        && !tool_was_executed(executed_tool_names, "execute_query")
-        && !looks_like_blocker_or_clarification(text)
-    {
-        return FinalAnswerCheck::NeedsRepair(
-            "Agent-mode data query intent must run execute_query or explain the exact blocker.".to_string(),
-        );
-    }
-
-    if matches!(action.as_str(), "generate" | "optimize" | "fix" | "convert")
+    let action = contract.action.as_deref().unwrap_or_default();
+    if action_requires_sql_deliverable(action)
         && !contains_sql_deliverable(text)
         && !looks_like_blocker_or_clarification(text)
     {
         return FinalAnswerCheck::NeedsRepair(
             "SQL-producing actions require a final SQL code block, or a concise blocker/clarification when SQL cannot be produced safely.".to_string(),
-        );
-    }
-
-    if matches!(action.as_str(), "generate" | "optimize" | "fix" | "convert")
-        && !executed_tool_names.is_empty()
-        && looks_like_tool_result_summary(text)
-        && !contains_sql_deliverable(text)
-        && !looks_like_blocker_or_clarification(text)
-    {
-        return FinalAnswerCheck::NeedsRepair(
-            "The response summarizes intermediate tool results instead of completing the original task.".to_string(),
         );
     }
 
@@ -533,7 +504,9 @@ fn build_contract_repair_prompt(task_contract: Option<&AiTaskContract>, is_agent
     let action = task_contract.and_then(|c| c.action.as_deref()).unwrap_or("unknown");
     let mode = task_contract.and_then(|c| c.mode.as_deref()).unwrap_or(if is_agent_mode { "agent" } else { "ask" });
     let user_request = task_contract.and_then(|c| c.user_request.as_deref()).unwrap_or("(not provided)");
-    let mode_rule = if is_agent_mode {
+    let mode_rule = if action_requires_sql_deliverable(action) {
+        "For this SQL-producing action, produce SQL in a fenced ```sql code block. Tool results are evidence only; do not answer by summarizing schema/tool output. Execute a query only when the original request explicitly asks for real data/results."
+    } else if is_agent_mode {
         "If the original request asks for real data and it can be answered safely, call execute_query before the final answer."
     } else {
         "In Ask mode, generate SQL and concise explanation only; do not claim the SQL was executed."
@@ -552,6 +525,10 @@ Produce a final answer that satisfies the action contract now. If required table
     )
 }
 
+fn action_requires_sql_deliverable(action: &str) -> bool {
+    matches!(action.to_ascii_lowercase().as_str(), "generate" | "optimize" | "fix" | "convert" | "sampledata")
+}
+
 fn append_contract_failure_note(text: String, reason: &str) -> String {
     if text.trim().is_empty() {
         return format!("Unable to produce a contract-compliant final answer: {reason}");
@@ -560,13 +537,30 @@ fn append_contract_failure_note(text: String, reason: &str) -> String {
     format!("{text}\n\nTask contract warning: {reason}")
 }
 
-fn tool_was_executed(executed_tool_names: &[String], tool_name: &str) -> bool {
-    executed_tool_names.iter().any(|name| name == tool_name)
-}
-
 fn contains_sql_deliverable(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("```sql") || (lower.contains("```") && contains_sql_keyword(&lower))
+    let mut rest = lower.as_str();
+
+    while let Some(fence_start) = rest.find("```") {
+        let after_open = &rest[fence_start + 3..];
+        let Some(info_end) = after_open.find('\n') else {
+            return false;
+        };
+        let info = after_open[..info_end].trim();
+        let after_info = &after_open[info_end + 1..];
+        let Some(fence_end) = after_info.find("```") else {
+            return false;
+        };
+        let body = &after_info[..fence_end];
+
+        if (info.is_empty() || info.starts_with("sql")) && contains_sql_keyword(body) {
+            return true;
+        }
+
+        rest = &after_info[fence_end + 3..];
+    }
+
+    false
 }
 
 fn contains_sql_keyword(lower_text: &str) -> bool {
@@ -599,51 +593,6 @@ fn looks_like_blocker_or_clarification(text: &str) -> bool {
         "请提供",
         "需要明确",
         "哪个字段",
-    ];
-    markers.iter().any(|marker| lower.contains(marker))
-}
-
-fn is_data_query_intent(user_request: &str) -> bool {
-    let lower = user_request.to_ascii_lowercase();
-    let markers = [
-        "count",
-        "sum",
-        "average",
-        "avg",
-        "query",
-        "find",
-        "show",
-        "list",
-        "how many",
-        "statistics",
-        "statistic",
-        "统计",
-        "查询",
-        "数量",
-        "多少",
-        "求和",
-        "平均",
-        "查看",
-        "列出",
-        "筛选",
-    ];
-    markers.iter().any(|marker| lower.contains(marker))
-}
-
-fn looks_like_tool_result_summary(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let markers = [
-        "table contains",
-        "key columns",
-        "core identity",
-        "contact information",
-        "demographics",
-        "字段包括",
-        "表结构",
-        "核心字段",
-        "联系方式",
-        "字段信息",
-        "列信息",
     ];
     markers.iter().any(|marker| lower.contains(marker))
 }
@@ -718,7 +667,7 @@ async fn run_agent_loop_text_only(
     for attempt in 0..=MAX_CONTRACT_REPAIR_ATTEMPTS {
         // Use non-streaming completions so contract repair can suppress incomplete drafts.
         let result = ai::complete(&request).await?;
-        match validate_final_answer(task_contract, false, &result, &[]) {
+        match validate_final_answer(task_contract, &result) {
             FinalAnswerCheck::Satisfied => {
                 on_event(AgentEvent::TextDelta { delta: result.clone() });
                 on_event(AgentEvent::AgentEnd { input_tokens: None, output_tokens: None });
@@ -1188,7 +1137,7 @@ mod tests {
         let contract = generate_contract("帮我生成统计 2026年1月2日新注册会员数量的 sql", "ask");
         let answer = "The tb_customer table contains comprehensive customer information with key columns:\n\nCore Identity\n- c_no: customer id\nContact Information\n- c_tele: mobile";
 
-        let check = validate_final_answer(Some(&contract), false, answer, &["get_columns".to_string()]);
+        let check = validate_final_answer(Some(&contract), answer);
 
         assert!(matches!(check, FinalAnswerCheck::NeedsRepair(_)));
     }
@@ -1198,9 +1147,19 @@ mod tests {
         let contract = generate_contract("帮我生成统计新注册会员数量的 sql", "ask");
         let answer = "```sql\nSELECT COUNT(*) AS member_count FROM tb_customer WHERE created_at >= '2026-01-02' AND created_at < '2026-01-03';\n```";
 
-        let check = validate_final_answer(Some(&contract), false, answer, &["get_columns".to_string()]);
+        let check = validate_final_answer(Some(&contract), answer);
 
         assert_eq!(check, FinalAnswerCheck::Satisfied);
+    }
+
+    #[test]
+    fn generate_contract_rejects_unfenced_sql_mention() {
+        let contract = generate_contract("帮我生成统计新注册会员数量的 sql", "ask");
+        let answer = "You can use SQL to query the table, for example SELECT COUNT(*) FROM tb_customer.";
+
+        let check = validate_final_answer(Some(&contract), answer);
+
+        assert!(matches!(check, FinalAnswerCheck::NeedsRepair(_)));
     }
 
     #[test]
@@ -1208,19 +1167,29 @@ mod tests {
         let contract = generate_contract("帮我生成统计新注册会员数量的 sql", "ask");
         let answer = "没有找到明确表示会员注册时间的字段，请确认应该使用哪个字段作为注册时间。";
 
-        let check = validate_final_answer(Some(&contract), false, answer, &["get_columns".to_string()]);
+        let check = validate_final_answer(Some(&contract), answer);
 
         assert_eq!(check, FinalAnswerCheck::Satisfied);
     }
 
     #[test]
-    fn agent_data_query_requires_execute_query_or_blocker() {
+    fn agent_generate_sql_accepts_sql_without_execute_query() {
         let contract = generate_contract("统计 2026年1月2日新注册会员数量", "agent");
         let answer = "```sql\nSELECT COUNT(*) FROM tb_customer;\n```";
 
-        let check = validate_final_answer(Some(&contract), true, answer, &["get_columns".to_string()]);
+        let check = validate_final_answer(Some(&contract), answer);
 
-        assert!(matches!(check, FinalAnswerCheck::NeedsRepair(_)));
+        assert_eq!(check, FinalAnswerCheck::Satisfied);
+    }
+
+    #[test]
+    fn agent_generate_sql_prompt_does_not_force_execution() {
+        let contract = generate_contract("帮我生成统计 2026年1月2日新注册会员数量的 sql", "agent");
+
+        let prompt = augment_system_prompt_with_task_contract("base", Some(&contract), true);
+
+        assert!(prompt.contains("SQL-producing action"));
+        assert!(prompt.contains("execute a query only when the original request explicitly asks for real data/results"));
     }
 
     #[test]
