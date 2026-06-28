@@ -585,8 +585,8 @@ mod tests {
     #[cfg(not(windows))]
     use super::shell_quote;
     use super::{
-        build_codex_exec_command, codex_cli_env, codex_enabled_tools, is_path_like_program, parse_codex_jsonl_event,
-        parse_codex_models, validate_codex_program, CodexRunOptions, DEFAULT_CODEX_MODELS,
+        build_codex_exec_command, classify_codex_spawn_error, codex_cli_env, codex_enabled_tools, is_path_like_program,
+        parse_codex_jsonl_event, parse_codex_models, validate_codex_program, CodexRunOptions, DEFAULT_CODEX_MODELS,
     };
     #[cfg(not(windows))]
     use super::{codex_process_env, common_executable_dirs, merged_path_with_dir};
