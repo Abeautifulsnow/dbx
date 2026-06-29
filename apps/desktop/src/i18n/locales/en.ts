@@ -36,6 +36,8 @@ export default {
     keywordCaseUpper: "Use upper-case SQL keywords",
     autoCommit: "Auto Commit",
     manualTransaction: "Manual Transaction",
+    autoCommitAgent: "Auto Commit (depends on Agent backend)",
+    manualTransactionAgent: "Manual Transaction (depends on Agent backend)",
     previewSql: "Preview SQL",
     hidePreviewSql: "Hide SQL Preview",
     saveSql: "Save to SQL Library",

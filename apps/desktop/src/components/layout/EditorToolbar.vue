@@ -14,7 +14,7 @@ import { useSchemaOptions } from "@/composables/useSchemaOptions";
 import { connectionIconType } from "@/lib/connectionPresentation";
 import { formatDatabaseLabel, isDefaultDatabase } from "@/lib/defaultDatabase";
 import { connectionDisplayName } from "@/lib/tabPresentation";
-import { isSingleDatabase } from "@/lib/databaseCapabilities";
+import { isSingleDatabase, supportsTransaction as supportsTransactionFeature } from "@/lib/databaseCapabilities";
 import { hexToRgba } from "@/lib/color";
 import type { QueryTab, ConnectionConfig } from "@/types/database";
 
@@ -66,19 +66,21 @@ const supportsExplain = computed(() => {
   const dbType = props.activeConnection?.db_type;
   return dbType !== "redis" && dbType !== "mongodb" && dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "weaviate" && dbType !== "chromadb" && dbType !== "etcd" && dbType !== "zookeeper" && dbType !== "mq" && dbType !== "nacos";
 });
-const supportsTransaction = computed(() => {
-  const dbType = props.activeConnection?.db_type;
-  if (!dbType) return false;
-  const supported = ["postgres", "mysql", "sqlite", "clickhouse", "sqlserver", "agent", "rqlite", "dameng", "oracle"] as readonly string[];
-  return supported.includes(dbType);
-});
 const isSingleDb = computed(() => isSingleDatabase(props.activeConnection?.db_type));
+const supportsTransaction = computed(() => supportsTransactionFeature(props.activeConnection?.db_type));
 const hasDefaultDatabaseOption = computed(() => activeDatabaseOptions.value.includes(""));
 const schemaDatabaseKey = computed(() => props.activeTab.database || (isSingleDb.value ? "_" : ""));
 const saveTooltip = computed(() => (props.activeTab.objectSource ? t("objects.saveSource") : t("toolbar.saveSql")));
 const canSaveSql = computed(() => !!props.activeTab.externalSqlPath || !!props.activeTab.sql.trim());
 const keywordCaseIsLower = computed(() => props.sqlKeywordCase === "lower");
 const keywordCaseToggleTooltip = computed(() => (keywordCaseIsLower.value ? t("toolbar.keywordCaseUpper") : t("toolbar.keywordCaseLower")));
+const transactionTooltip = computed(() => {
+  const isAgent = (props.activeConnection?.db_type as string) === "agent";
+  const isManual = props.autoCommit === false;
+  if (isAgent && isManual) return t("toolbar.manualTransactionAgent");
+  if (isAgent) return t("toolbar.autoCommitAgent");
+  return isManual ? t("toolbar.manualTransaction") : t("toolbar.autoCommit");
+});
 
 const showSchemaSelector = computed(() => {
   const connection = props.activeConnection;
@@ -191,7 +193,7 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
             <span class="font-bold" style="font-size: 9px">Tx</span>
           </Button>
         </TooltipTrigger>
-        <TooltipContent>{{ autoCommit === false ? t("toolbar.manualTransaction") : t("toolbar.autoCommit") }}</TooltipContent>
+        <TooltipContent>{{ transactionTooltip }}</TooltipContent>
       </Tooltip>
       <Tooltip>
         <TooltipTrigger as-child>

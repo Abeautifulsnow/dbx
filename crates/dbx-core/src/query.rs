@@ -3084,4 +3084,22 @@ mod tests {
         assert_eq!(normalized.rows[0][0], serde_json::json!("2041797190226354178"));
         assert_eq!(normalized.rows[0][1], serde_json::json!([1, "2041797190226354178"]));
     }
+
+    #[test]
+    fn query_execution_options_default_use_transaction_is_none() {
+        let opts = QueryExecutionOptions::default();
+        assert_eq!(opts.use_transaction, None);
+    }
+
+    #[test]
+    fn query_execution_options_use_transaction_some_true_is_preserved() {
+        let opts = QueryExecutionOptions { use_transaction: Some(true), ..Default::default() };
+        assert_eq!(opts.use_transaction, Some(true));
+    }
+
+    #[test]
+    fn query_execution_options_use_transaction_some_false_is_preserved() {
+        let opts = QueryExecutionOptions { use_transaction: Some(false), ..Default::default() };
+        assert_eq!(opts.use_transaction, Some(false));
+    }
 }

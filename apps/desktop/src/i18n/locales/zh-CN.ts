@@ -38,6 +38,8 @@ export default withEnglishFallback({
     keywordCaseUpper: "使用大写 SQL 关键字",
     autoCommit: "自动提交",
     manualTransaction: "手动事务",
+    autoCommitAgent: "自动提交（取决于 Agent 后端数据库）",
+    manualTransactionAgent: "手动事务（取决于 Agent 后端数据库）",
     previewSql: "预览 SQL",
     hidePreviewSql: "隐藏 SQL 预览",
     saveSql: "保存到 SQL 库",
