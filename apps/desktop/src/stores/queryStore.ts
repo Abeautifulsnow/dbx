@@ -994,7 +994,15 @@ export const useQueryStore = defineStore("query", () => {
   function setAutoCommit(id: string, autoCommit: boolean) {
     const tab = tabs.value.find((t) => t.id === id);
     if (tab) {
+      const wasManual = tab.autoCommit === false;
       tab.autoCommit = autoCommit;
+      if (autoCommit && wasManual) {
+        if (tab.txnSessionId) {
+          void rollbackTransaction(id);
+        } else {
+          tab.txnAutoRolledBack = false;
+        }
+      }
     }
   }
 
