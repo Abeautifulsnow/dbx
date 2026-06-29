@@ -259,6 +259,10 @@ pub struct QueryExecutionOptions {
     /// `Some(0)` disables the timeout entirely.
     pub timeout_secs: Option<u64>,
     pub execution_id: Option<String>,
+    /// When `Some(true)`, multiple statements are executed within a single transaction
+    /// (BEGIN … COMMIT) instead of auto-commit mode. `None` and `Some(false)` behave
+    /// identically — auto-commit for each statement.
+    pub use_transaction: Option<bool>,
 }
 
 fn query_result_row_limit(max_rows: Option<usize>) -> usize {
@@ -1565,6 +1569,13 @@ pub async fn execute_multi_core_with_options(
     );
     if statements.is_empty() {
         return Ok(vec![empty_query_result(0)]);
+    }
+
+    // When use_transaction is explicitly true and we have multiple statements,
+    // route through the transaction wrapper instead of the sequential auto-commit loop.
+    if options.use_transaction == Some(true) && statements.len() > 1 {
+        let result = execute_statements_in_transaction(state, connection_id, database, &statements, schema).await?;
+        return Ok(vec![result]);
     }
 
     let mysql_pool = {

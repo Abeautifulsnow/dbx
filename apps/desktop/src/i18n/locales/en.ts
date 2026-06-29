@@ -34,6 +34,8 @@ export default {
     formatSqlFailed: "Failed to format SQL",
     keywordCaseLower: "Use lower-case SQL keywords",
     keywordCaseUpper: "Use upper-case SQL keywords",
+    autoCommit: "Auto Commit",
+    manualTransaction: "Manual Transaction",
     previewSql: "Preview SQL",
     hidePreviewSql: "Hide SQL Preview",
     saveSql: "Save to SQL Library",

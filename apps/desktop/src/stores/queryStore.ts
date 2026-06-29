@@ -987,6 +987,13 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
+  function setAutoCommit(id: string, autoCommit: boolean) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (tab) {
+      tab.autoCommit = autoCommit;
+    }
+  }
+
   function updateEditorViewport(id: string, viewport: { scrollTop: number; scrollLeft: number }) {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab) return;
@@ -1820,6 +1827,7 @@ export const useQueryStore = defineStore("query", () => {
           : {}),
         ...(clientSessionId ? { clientSessionId } : {}),
         timeoutSecs: queryTimeoutSecs,
+        ...(tab.autoCommit === false ? { useTransaction: true } : {}),
       };
       const executionSchema = connectionUsesSchemaExecutionContext(conn) ? tab.schema || tab.database : tab.mode === "data" || connectionUsesDatabaseObjectTreeMode(conn) ? undefined : tab.schema;
       console.info("[DBX][executeTabSql:execute-multi:invoke]", {
@@ -2459,6 +2467,7 @@ export const useQueryStore = defineStore("query", () => {
     updateSql,
     updateEditorViewport,
     updateEditorSelection,
+    setAutoCommit,
     renameTab,
     openObjectBrowser,
     openUserAdmin,

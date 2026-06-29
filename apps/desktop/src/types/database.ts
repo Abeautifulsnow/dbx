@@ -673,6 +673,9 @@ export interface QueryTab {
   resultEvicted?: boolean;
   whereInput?: string;
   previewSql?: string;
+  /** Whether to use auto-commit mode (default true). When false, multiple statements are
+   *  wrapped in a single transaction. */
+  autoCommit?: boolean;
 }
 
 export interface SavedSqlFolder {

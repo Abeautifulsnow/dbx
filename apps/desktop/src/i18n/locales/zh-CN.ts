@@ -36,6 +36,8 @@ export default withEnglishFallback({
     formatSqlFailed: "SQL 格式化失败",
     keywordCaseLower: "使用小写 SQL 关键字",
     keywordCaseUpper: "使用大写 SQL 关键字",
+    autoCommit: "自动提交",
+    manualTransaction: "手动事务",
     previewSql: "预览 SQL",
     hidePreviewSql: "隐藏 SQL 预览",
     saveSql: "保存到 SQL 库",

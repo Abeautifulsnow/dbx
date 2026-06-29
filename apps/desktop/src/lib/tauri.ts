@@ -614,6 +614,7 @@ export async function executeMulti(
     resultSessionId?: string;
     clientSessionId?: string;
     timeoutSecs?: number;
+    useTransaction?: boolean;
   },
 ): Promise<QueryResult[]> {
   return invoke("execute_multi", { connectionId, database, sql, schema, executionId, ...options });

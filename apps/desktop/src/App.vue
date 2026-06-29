@@ -1513,8 +1513,14 @@ onUnmounted(() => {
                   :block-dangerous-redis-commands="blockDangerousRedisCommands"
                   :sql-keyword-case="settingsStore.editorSettings.sqlFormatter.keywordCase"
                   :database-required-signal="databaseRequiredTabId === activeTab.id ? databaseRequiredSignal : 0"
+                  :auto-commit="activeTab.autoCommit ?? true"
                   @update:explain-mode="(m: 'explain' | 'autotrace') => (explainMode = m)"
                   @update:block-dangerous-redis-commands="(v: boolean) => (blockDangerousRedisCommands = v)"
+                  @update:auto-commit="
+                    (v: boolean) => {
+                      if (activeTab) queryStore.setAutoCommit(activeTab.id, v);
+                    }
+                  "
                   @execute="requestActiveEditorExecute()"
                   @cancel="cancelActiveExecution()"
                   @explain="tryExplain()"

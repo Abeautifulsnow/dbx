@@ -26,6 +26,7 @@ const props = defineProps<{
   blockDangerousRedisCommands?: boolean;
   sqlKeywordCase: "preserve" | "upper" | "lower";
   databaseRequiredSignal?: number;
+  autoCommit?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -44,6 +45,7 @@ const emit = defineEmits<{
   setDefaultDatabase: [];
   clearDefaultDatabase: [];
   "update:blockDangerousRedisCommands": [value: boolean];
+  "update:autoCommit": [value: boolean];
 }>();
 
 const { t } = useI18n();
@@ -63,6 +65,12 @@ const activeSchemaValue = computed(() => props.activeTab.schema || "");
 const supportsExplain = computed(() => {
   const dbType = props.activeConnection?.db_type;
   return dbType !== "redis" && dbType !== "mongodb" && dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "weaviate" && dbType !== "chromadb" && dbType !== "etcd" && dbType !== "zookeeper" && dbType !== "mq" && dbType !== "nacos";
+});
+const supportsTransaction = computed(() => {
+  const dbType = props.activeConnection?.db_type;
+  if (!dbType) return false;
+  const supported = ["postgres", "mysql", "sqlite", "clickhouse", "sqlserver", "agent", "rqlite", "dameng", "oracle"] as readonly string[];
+  return supported.includes(dbType);
 });
 const isSingleDb = computed(() => isSingleDatabase(props.activeConnection?.db_type));
 const hasDefaultDatabaseOption = computed(() => activeDatabaseOptions.value.includes(""));
@@ -176,6 +184,15 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
       >
         <span class="font-bold" style="font-size: 9px">A</span>
       </Button>
+      <!-- Transaction toggle -->
+      <Tooltip v-if="supportsTransaction">
+        <TooltipTrigger as-child>
+          <Button variant="ghost" size="icon" class="h-6 w-6" :class="autoCommit === false ? 'text-orange-600 bg-orange-100 dark:text-orange-300 dark:bg-orange-900/30' : 'text-muted-foreground/50'" :disabled="activeTab.isExecuting" @click="emit('update:autoCommit', autoCommit === false)">
+            <span class="font-bold" style="font-size: 9px">Tx</span>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ autoCommit === false ? t("toolbar.manualTransaction") : t("toolbar.autoCommit") }}</TooltipContent>
+      </Tooltip>
       <Tooltip>
         <TooltipTrigger as-child>
           <Button variant="ghost" size="icon" class="h-6 w-6 text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-300 dark:hover:text-amber-200" :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @click="emit('formatSql')">

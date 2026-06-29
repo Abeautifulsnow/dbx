@@ -48,6 +48,7 @@ pub async fn execute_query(
             client_session_id,
             timeout_secs,
             execution_id,
+            ..Default::default()
         },
     )
     .await
@@ -68,6 +69,7 @@ pub async fn execute_multi(
     result_session_id: Option<String>,
     client_session_id: Option<String>,
     timeout_secs: Option<u64>,
+    use_transaction: Option<bool>,
 ) -> Result<Vec<db::QueryResult>, String> {
     let execution_id = execution_id.filter(|id| !id.trim().is_empty());
     let registered_query = execution_id.as_ref().map(|id| {
@@ -103,6 +105,7 @@ pub async fn execute_multi(
             client_session_id,
             timeout_secs,
             execution_id,
+            use_transaction,
         },
     )
     .await;
