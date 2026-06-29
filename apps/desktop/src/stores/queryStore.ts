@@ -795,6 +795,7 @@ export const useQueryStore = defineStore("query", () => {
     const idx = tabs.value.findIndex((t) => t.id === id);
     if (idx < 0) return;
     clearDataGridPendingSnapshotsForTab(id);
+    if (tabs.value[idx].txnSessionId) void rollbackTransaction(id);
     if (tabs.value[idx].isExecuting) void cancelTabExecution(id);
     if (tabs.value[idx].isExplaining) void cancelTabExplain(id);
     void closeResultSession(tabs.value[idx]);
@@ -832,6 +833,7 @@ export const useQueryStore = defineStore("query", () => {
       .filter((tab) => tab.id !== id)
       .forEach((tab) => {
         clearDataGridPendingSnapshotsForTab(tab.id);
+        if (tab.txnSessionId) void rollbackTransaction(tab.id);
         if (tab.isExecuting) void cancelTabExecution(tab.id);
         if (tab.isExplaining) void cancelTabExplain(tab.id);
         void closeResultSession(tab);
@@ -847,6 +849,7 @@ export const useQueryStore = defineStore("query", () => {
   function closeAllTabs() {
     tabs.value.forEach((tab) => {
       clearDataGridPendingSnapshotsForTab(tab.id);
+      if (tab.txnSessionId) void rollbackTransaction(tab.id);
       if (tab.isExecuting) void cancelTabExecution(tab.id);
       if (tab.isExplaining) void cancelTabExplain(tab.id);
       void closeResultSession(tab);
@@ -936,6 +939,7 @@ export const useQueryStore = defineStore("query", () => {
       .filter((tab) => closingIds.has(tab.id))
       .forEach((tab) => {
         clearDataGridPendingSnapshotsForTab(tab.id);
+        if (tab.txnSessionId) void rollbackTransaction(tab.id);
         if (tab.isExecuting) void cancelTabExecution(tab.id);
         if (tab.isExplaining) void cancelTabExplain(tab.id);
         void closeResultSession(tab);
@@ -991,6 +995,28 @@ export const useQueryStore = defineStore("query", () => {
     const tab = tabs.value.find((t) => t.id === id);
     if (tab) {
       tab.autoCommit = autoCommit;
+    }
+  }
+
+  async function commitTransaction(id: string) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab?.txnSessionId) return;
+    try {
+      await api.commitManualTransaction(tab.txnSessionId);
+    } finally {
+      tab.txnSessionId = undefined;
+      tab.txnAutoRolledBack = false;
+    }
+  }
+
+  async function rollbackTransaction(id: string) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab?.txnSessionId) return;
+    try {
+      await api.rollbackManualTransaction(tab.txnSessionId);
+    } finally {
+      tab.txnSessionId = undefined;
+      tab.txnAutoRolledBack = false;
     }
   }
 
@@ -1813,33 +1839,44 @@ export const useQueryStore = defineStore("query", () => {
         return;
       }
 
-      console.info("[DBX][executeTabSql:execute-multi:start]", { traceId, elapsed: elapsed() });
-      const clientSessionId = tab.mode === "query" ? tabClientSessionId(tab) : undefined;
-      const executionOptions = {
-        ...(typeof pageLimit === "number"
-          ? useAgentResultSession
-            ? {
-                fetchSize: pageLimit,
-                pageSize: pageLimit,
-                resultSessionId: options?.pagination?.sessionId,
-              }
-            : { maxRows: pageLimit, fetchSize: pageLimit }
-          : {}),
-        ...(clientSessionId ? { clientSessionId } : {}),
-        timeoutSecs: queryTimeoutSecs,
-        ...(tab.autoCommit === false ? { useTransaction: true } : {}),
-      };
       const executionSchema = connectionUsesSchemaExecutionContext(conn) ? tab.schema || tab.database : tab.mode === "data" || connectionUsesDatabaseObjectTreeMode(conn) ? undefined : tab.schema;
-      console.info("[DBX][executeTabSql:execute-multi:invoke]", {
-        traceId,
-        elapsed: elapsed(),
-        executionSchema,
-        optionKeys: Object.keys(executionOptions),
-        clientSession: Boolean(clientSessionId),
-      });
-      const executionPromise = api.executeMulti(tab.connectionId, tab.database, sqlToExecute, executionSchema, executionId, executionOptions);
       const frontendTimeoutSecs = Math.max(queryTimeoutSecs * 2, 60);
       const sourceLabelDatabase = tab.database || conn?.database;
+
+      let executionPromise: Promise<QueryResult[]>;
+      if (tab.autoCommit === false) {
+        if (!tab.txnSessionId) {
+          console.info("[DBX][executeTabSql:begin-manual-txn:start]", { traceId, elapsed: elapsed() });
+          tab.txnSessionId = await api.beginManualTransaction(tab.connectionId, tab.database, executionSchema);
+          console.info("[DBX][executeTabSql:begin-manual-txn:done]", { traceId, txnSessionId: tab.txnSessionId, elapsed: elapsed() });
+        }
+        console.info("[DBX][executeTabSql:execute-in-txn:invoke]", { traceId, txnSessionId: tab.txnSessionId, elapsed: elapsed() });
+        executionPromise = api.executeInManualTransaction(tab.txnSessionId, sqlToExecute, tab.database, executionSchema, pageLimit);
+      } else {
+        console.info("[DBX][executeTabSql:execute-multi:start]", { traceId, elapsed: elapsed() });
+        const clientSessionId = tab.mode === "query" ? tabClientSessionId(tab) : undefined;
+        const executionOptions = {
+          ...(typeof pageLimit === "number"
+            ? useAgentResultSession
+              ? {
+                  fetchSize: pageLimit,
+                  pageSize: pageLimit,
+                  resultSessionId: options?.pagination?.sessionId,
+                }
+              : { maxRows: pageLimit, fetchSize: pageLimit }
+            : {}),
+          ...(clientSessionId ? { clientSessionId } : {}),
+          timeoutSecs: queryTimeoutSecs,
+        };
+        console.info("[DBX][executeTabSql:execute-multi:invoke]", {
+          traceId,
+          elapsed: elapsed(),
+          executionSchema,
+          optionKeys: Object.keys(executionOptions),
+          clientSession: Boolean(clientSessionId),
+        });
+        executionPromise = api.executeMulti(tab.connectionId, tab.database, sqlToExecute, executionSchema, executionId, executionOptions);
+      }
       const results = annotateQueryResultSources(markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, queryTimeoutSecs === 0 ? 0 : frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }))), queryBaseSql, sourceLabelDatabase, effectiveDbType);
       console.info("[DBX][executeTabSql:execute-multi:done]", {
         traceId,
@@ -1918,6 +1955,14 @@ export const useQueryStore = defineStore("query", () => {
       console.error("[DBX][executeTabSql:error]", { traceId, elapsed: elapsed(), error: e });
       // Sync connection state if the error indicates a lost connection
       useConnectionStore().recordConnectionLostError(tab.connectionId, e);
+      // Handle manual transaction auto-rollback (e.g. deadlock detected by server)
+      if (tab.autoCommit === false) {
+        const errMsg: string = e?.message ?? String(e);
+        if (/auto.?rolled.?back/i.test(errMsg) || errMsg.includes("已自动回滚")) {
+          tab.txnSessionId = undefined;
+          tab.txnAutoRolledBack = true;
+        }
+      }
       const current = tabs.value.find((t) => t.id === id);
       if (current?.executionId === executionId) {
         current.result = toErrorResult(e);
@@ -2468,6 +2513,8 @@ export const useQueryStore = defineStore("query", () => {
     updateEditorViewport,
     updateEditorSelection,
     setAutoCommit,
+    commitTransaction,
+    rollbackTransaction,
     renameTab,
     openObjectBrowser,
     openUserAdmin,

@@ -83,6 +83,21 @@ pub enum PoolKind {
     Nacos,
 }
 
+/// Held connection for a manual transaction session
+pub enum TxnConnection {
+    Postgres(deadpool_postgres::Object),
+    Mysql(mysql_async::Conn),
+    Sqlite(Arc<std::sync::Mutex<rusqlite::Connection>>),
+}
+
+pub struct TransactionSession {
+    pub connection: TxnConnection,
+    pub last_activity: std::time::Instant,
+    pub connection_id: String,
+    pub database: String,
+    pub schema: Option<String>,
+}
+
 macro_rules! agent_connection_pool_database_type {
     () => {
         DatabaseType::Dameng
@@ -138,6 +153,7 @@ pub struct AppState {
     /// PostgreSQL TLS cancel context, keyed by pool_key.
     /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
     postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
+    pub transaction_sessions: Arc<RwLock<HashMap<String, TransactionSession>>>,
     #[cfg(feature = "mq-admin")]
     pub mq_registry: crate::mq::MqAdminRegistry,
 }
@@ -371,6 +387,7 @@ impl AppState {
             ),
             nacos_registry: crate::nacos::NacosAdminRegistry::new(),
             postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
+            transaction_sessions: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "mq-admin")]
             mq_registry: crate::mq::MqAdminRegistry::new(),
         }

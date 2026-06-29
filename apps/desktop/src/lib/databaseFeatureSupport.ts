@@ -89,13 +89,11 @@ export function usesPostgresLikeStructureCopy(dbType?: DatabaseType): boolean {
   return !!dbType && PG_LIKE_STRUCTURE_TYPES.has(dbType);
 }
 
-const TRANSACTION_SUPPORTED_TYPES: readonly string[] = ["postgres", "mysql", "sqlite", "clickhouse", "sqlserver", "agent", "rqlite", "dameng", "oracle"];
+const TRANSACTION_SUPPORTED_TYPES: readonly string[] = ["postgres", "mysql", "sqlite"];
 
 /**
  * Returns true if the given database type supports explicit transaction control
  * (i.e. toggling between auto-commit and manual transaction mode via BEGIN/COMMIT).
- * "agent" is included because agent-based connections delegate to a backend database
- * that may support transactions.
  */
 export function supportsTransaction(dbType?: string): boolean {
   return !!dbType && TRANSACTION_SUPPORTED_TYPES.includes(dbType);

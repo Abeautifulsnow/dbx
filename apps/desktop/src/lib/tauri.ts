@@ -648,6 +648,22 @@ export async function executeInTransaction(connectionId: string, database: strin
   return invoke("execute_in_transaction", { connectionId, database, statements, schema });
 }
 
+export async function beginManualTransaction(connectionId: string, database: string, schema?: string): Promise<string> {
+  return invoke("begin_manual_transaction", { connectionId, database, schema });
+}
+
+export async function executeInManualTransaction(txnSessionId: string, sql: string, database: string, schema?: string, maxRows?: number): Promise<QueryResult[]> {
+  return invoke("execute_in_manual_transaction", { txnSessionId, sql, database, schema, maxRows });
+}
+
+export async function commitManualTransaction(txnSessionId: string): Promise<QueryResult> {
+  return invoke("commit_manual_transaction", { txnSessionId });
+}
+
+export async function rollbackManualTransaction(txnSessionId: string): Promise<QueryResult> {
+  return invoke("rollback_manual_transaction", { txnSessionId });
+}
+
 export async function analyzeSqlReferences(sql: string, dialect?: string): Promise<SqlReferenceAnalysis> {
   return invoke("analyze_sql_references", { sql, dialect });
 }

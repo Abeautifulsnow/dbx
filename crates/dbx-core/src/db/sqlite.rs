@@ -37,6 +37,11 @@ impl SqliteHandle {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         f(&mut conn)
     }
+
+    /// Return the inner connection arc for manual transaction sessions.
+    pub fn inner_connection(&self) -> Arc<Mutex<Connection>> {
+        Arc::clone(&self.conn)
+    }
 }
 
 pub async fn connect_path(path: &str) -> Result<SqliteHandle, String> {

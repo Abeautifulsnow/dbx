@@ -676,6 +676,10 @@ export interface QueryTab {
   /** Whether to use auto-commit mode (default true). When false, multiple statements are
    *  wrapped in a single transaction. */
   autoCommit?: boolean;
+  /** Session ID for an active manual transaction, set after beginManualTransaction */
+  txnSessionId?: string;
+  /** Set to true when a manual transaction was auto-rolled back due to inactivity */
+  txnAutoRolledBack?: boolean;
 }
 
 export interface SavedSqlFolder {

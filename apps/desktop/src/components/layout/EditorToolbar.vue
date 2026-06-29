@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
-import { Play, Loader2, Square, Database, Check, Table2, AlignLeft, GitBranch, Save, FolderOpen, Layers, X, Shield, Upload } from "@lucide/vue";
+import { Play, Loader2, Square, Database, Check, Table2, AlignLeft, GitBranch, Save, FolderOpen, Layers, X, Shield, Upload, RotateCcw, AlertTriangle } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { SearchableSelect } from "@/components/ui/searchable-select";
@@ -27,6 +27,8 @@ const props = defineProps<{
   sqlKeywordCase: "preserve" | "upper" | "lower";
   databaseRequiredSignal?: number;
   autoCommit?: boolean;
+  txnSessionId?: string;
+  txnAutoRolledBack?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -46,6 +48,9 @@ const emit = defineEmits<{
   clearDefaultDatabase: [];
   "update:blockDangerousRedisCommands": [value: boolean];
   "update:autoCommit": [value: boolean];
+  commit: [];
+  rollback: [];
+  dismissTxnRolledBack: [];
 }>();
 
 const { t } = useI18n();
@@ -81,6 +86,8 @@ const transactionTooltip = computed(() => {
   if (isAgent) return t("toolbar.autoCommitAgent");
   return isManual ? t("toolbar.manualTransaction") : t("toolbar.autoCommit");
 });
+
+const isTransactionActive = computed(() => !!props.txnSessionId);
 
 const showSchemaSelector = computed(() => {
   const connection = props.activeConnection;
@@ -189,11 +196,37 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
       <!-- Transaction toggle -->
       <Tooltip v-if="supportsTransaction">
         <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6" :class="autoCommit === false ? 'text-orange-600 bg-orange-100 dark:text-orange-300 dark:bg-orange-900/30' : 'text-muted-foreground/50'" :disabled="activeTab.isExecuting" @click="emit('update:autoCommit', autoCommit === false)">
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-6 w-6"
+            :class="isTransactionActive || autoCommit === false ? 'text-orange-600 bg-orange-100 dark:text-orange-300 dark:bg-orange-900/30' : 'text-muted-foreground/50'"
+            :disabled="activeTab.isExecuting"
+            @click="emit('update:autoCommit', autoCommit === false)"
+          >
             <span class="font-bold" style="font-size: 9px">Tx</span>
           </Button>
         </TooltipTrigger>
         <TooltipContent>{{ transactionTooltip }}</TooltipContent>
+      </Tooltip>
+      <!-- Commit button (only when transaction is active) -->
+      <Tooltip v-if="isTransactionActive">
+        <TooltipTrigger as-child>
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-green-600 hover:bg-green-500/10 hover:text-green-700 dark:text-green-300 dark:hover:text-green-200" @click="emit('commit')">
+            <Check class="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("toolbar.commit") }}</TooltipContent>
+      </Tooltip>
+
+      <!-- Rollback button (only when transaction is active) -->
+      <Tooltip v-if="isTransactionActive">
+        <TooltipTrigger as-child>
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-300 dark:hover:text-red-200" @click="emit('rollback')">
+            <RotateCcw class="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("toolbar.rollback") }}</TooltipContent>
       </Tooltip>
       <Tooltip>
         <TooltipTrigger as-child>
@@ -358,6 +391,13 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
       <Table2 class="h-3.5 w-3.5 shrink-0" />
       <span class="truncate">{{ activeTab.tableMeta.columns.length }} {{ t("tree.columns") }}</span>
     </div>
+  </div>
+  <div v-if="txnAutoRolledBack" class="flex items-center gap-2 px-3 py-1 text-xs bg-amber-500/10 text-amber-700 dark:text-amber-300 border-b border-amber-500/20">
+    <AlertTriangle class="h-3.5 w-3.5 shrink-0" />
+    <span>{{ t("toolbar.txnAutoRolledBack") }}</span>
+    <Button variant="ghost" size="icon" class="h-5 w-5 ml-auto" @click="emit('dismissTxnRolledBack')">
+      <X class="h-3 w-3" />
+    </Button>
   </div>
 </template>
 

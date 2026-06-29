@@ -215,6 +215,52 @@ pub async fn execute_in_transaction(
 }
 
 #[tauri::command]
+pub async fn begin_manual_transaction(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: Option<String>,
+) -> Result<String, String> {
+    dbx_core::query::begin_manual_transaction(&state, &connection_id, &database, schema.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn execute_in_manual_transaction(
+    state: State<'_, Arc<AppState>>,
+    txn_session_id: String,
+    sql: String,
+    database: String,
+    schema: Option<String>,
+    max_rows: Option<usize>,
+) -> Result<Vec<db::QueryResult>, String> {
+    dbx_core::query::execute_in_manual_transaction(
+        &state,
+        &txn_session_id,
+        &sql,
+        &database,
+        schema.as_deref(),
+        max_rows,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn commit_manual_transaction(
+    state: State<'_, Arc<AppState>>,
+    txn_session_id: String,
+) -> Result<db::QueryResult, String> {
+    dbx_core::query::commit_manual_transaction(&state, &txn_session_id).await
+}
+
+#[tauri::command]
+pub async fn rollback_manual_transaction(
+    state: State<'_, Arc<AppState>>,
+    txn_session_id: String,
+) -> Result<db::QueryResult, String> {
+    dbx_core::query::rollback_manual_transaction(&state, &txn_session_id).await
+}
+
+#[tauri::command]
 pub async fn analyze_sql_references(
     sql: String,
     dialect: Option<String>,
