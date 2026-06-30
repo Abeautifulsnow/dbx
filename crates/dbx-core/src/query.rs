@@ -2382,17 +2382,17 @@ pub async fn begin_manual_transaction(
         PoolKind::Postgres(pg_pool) => {
             let conn = pg_pool.get().await.map_err(|e| format!("Failed to get Postgres connection: {e}"))?;
             conn.execute("BEGIN", &[]).await.map_err(|e| format!("BEGIN failed: {e}"))?;
+            if let Some(schema) = schema {
+                conn.execute(&format!("SET LOCAL search_path TO {}", db::postgres::pg_quote_ident(schema)), &[])
+                    .await
+                    .map_err(|e| format!("SET search_path failed: {e}"))?;
+            }
             TxnConnection::Postgres(conn)
         }
         PoolKind::Mysql(mysql_pool, _) => {
             let mut conn = mysql_pool.get_conn().await.map_err(|e| format!("Failed to get MySQL connection: {e}"))?;
             conn.query_drop("START TRANSACTION").await.map_err(|e| format!("START TRANSACTION failed: {e}"))?;
             TxnConnection::Mysql(conn)
-        }
-        PoolKind::Sqlite(sqlite_handle) => {
-            sqlite_handle
-                .with_connection(|conn| conn.execute_batch("BEGIN").map_err(|e| format!("BEGIN failed: {e}")))?;
-            TxnConnection::Sqlite(sqlite_handle.inner_connection())
         }
         _ => return Err("Manual transaction is not supported for this database type".to_string()),
     };
@@ -2401,6 +2401,7 @@ pub async fn begin_manual_transaction(
     let txn_session_id = uuid::Uuid::new_v4().to_string();
     let session = TransactionSession {
         connection: txn_conn,
+        pool_key: pool_key.clone(),
         last_activity: std::time::Instant::now(),
         connection_id: connection_id.to_string(),
         database: database.to_string(),
@@ -2430,207 +2431,142 @@ pub async fn execute_in_manual_transaction(
 
     // Check idle timeout — auto-rollback if expired
     if session.last_activity.elapsed() > TXN_IDLE_TIMEOUT {
-        let _ = match &mut session.connection {
+        match &mut session.connection {
             TxnConnection::Postgres(conn) => {
                 let _ = conn.execute("ROLLBACK", &[]).await;
             }
             TxnConnection::Mysql(conn) => {
                 let _ = conn.query_drop("ROLLBACK").await;
             }
-            TxnConnection::Sqlite(handle) => {
-                if let Ok(guard) = handle.lock() {
-                    let _ = guard.execute_batch("ROLLBACK");
-                }
-            }
-        };
+        }
         sessions.remove(txn_session_id);
         return Err("Transaction was auto-rolled back due to 5 minutes of inactivity".to_string());
     }
 
+    let db_type = connection_database_type(state, &session.connection_id).await;
+    let statements = db_type.map_or_else(
+        || split_sql_statements(sql),
+        |db_type| crate::sql::split_sql_statements_for_database(sql, db_type),
+    );
+    if statements.is_empty() {
+        return Ok(vec![empty_query_result(0)]);
+    }
+
+    check_read_only_for_connection_multi(state, &session.pool_key, &statements).await?;
+
     session.last_activity = std::time::Instant::now();
     let row_limit = max_rows.unwrap_or(MAX_ROWS).max(1);
+    let mut results = Vec::with_capacity(statements.len());
 
-    let result = match &mut session.connection {
-        TxnConnection::Postgres(conn) => {
-            if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "WITH", "TABLE"]) {
-                let rows = conn.query(sql, &[]).await.map_err(|e| format!("Query failed: {e}"))?;
-                let columns: Vec<String> = if rows.is_empty() {
-                    vec![]
-                } else {
-                    rows[0].columns().iter().map(|c| c.name().to_string()).collect()
-                };
-                let column_types: Vec<String> = if rows.is_empty() {
-                    Vec::new()
-                } else {
-                    rows[0].columns().iter().map(|c| c.type_().name().to_string()).collect()
-                };
-                let mut data: Vec<Vec<serde_json::Value>> = Vec::with_capacity(rows.len().min(row_limit));
-                let mut truncated = false;
-                for (idx, row) in rows.iter().enumerate() {
-                    if idx >= row_limit {
-                        truncated = true;
-                        break;
-                    }
-                    let values: Vec<serde_json::Value> = (0..row.columns().len())
-                        .map(|i| row.try_get::<_, serde_json::Value>(i).unwrap_or(serde_json::Value::Null))
-                        .collect();
-                    data.push(values);
-                }
-                db::QueryResult {
-                    columns,
-                    column_types,
-                    column_sortables: vec![],
-                    rows: data,
-                    affected_rows: 0,
-                    execution_time_ms: 0,
-                    truncated,
-                    session_id: None,
-                    has_more: false,
-                }
-            } else {
-                let affected = conn.execute(sql, &[]).await.map_err(|e| format!("Query failed: {e}"))?;
-                db::QueryResult {
-                    columns: vec![],
-                    column_types: Vec::new(),
-                    column_sortables: vec![],
-                    rows: vec![],
-                    affected_rows: affected,
-                    execution_time_ms: 0,
-                    truncated: false,
-                    session_id: None,
-                    has_more: false,
-                }
-            }
-        }
-        TxnConnection::Mysql(conn) => {
-            if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"]) {
-                let result = conn.query_iter(sql).await.map_err(|e| format!("Query failed: {e}"))?;
-                let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
-                let column_types: Vec<String> =
-                    result.columns_ref().iter().map(|c| format!("{:?}", c.column_type())).collect();
-                let rows: Vec<mysql_async::Row> =
-                    result.collect_and_drop().await.map_err(|e| format!("Failed to collect rows: {e}"))?;
-                let truncated = rows.len() > row_limit;
-                let data: Vec<Vec<serde_json::Value>> = rows
-                    .iter()
-                    .take(row_limit)
-                    .map(|row| (0..row.len()).map(|i| mysql_value_fallback(row, i)).collect())
-                    .collect();
-                db::QueryResult {
-                    columns,
-                    column_types,
-                    column_sortables: vec![],
-                    rows: data,
-                    affected_rows: 0,
-                    execution_time_ms: 0,
-                    truncated,
-                    session_id: None,
-                    has_more: false,
-                }
-            } else {
-                let result = conn.query_iter(sql).await.map_err(|e| format!("Query failed: {e}"))?;
-                let affected_rows = result.affected_rows();
-                result.drop_result().await.map_err(|e| format!("Query failed: {e}"))?;
-                db::QueryResult {
-                    columns: vec![],
-                    column_types: Vec::new(),
-                    column_sortables: vec![],
-                    rows: vec![],
-                    affected_rows,
-                    execution_time_ms: 0,
-                    truncated: false,
-                    session_id: None,
-                    has_more: false,
-                }
-            }
-        }
-        TxnConnection::Sqlite(handle) => {
-            let guard = handle.lock().map_err(|e| e.to_string())?;
-            if starts_with_executable_sql_keyword(sql, &["SELECT", "PRAGMA", "EXPLAIN", "WITH"]) {
-                let mut stmt = guard.prepare(sql).map_err(|e| format!("SQLite prepare failed: {e}"))?;
-                let columns: Vec<String> = stmt.column_names().iter().map(|name| name.to_string()).collect();
-                let mut rows = stmt.query([]).map_err(|e| format!("SQLite query failed: {e}"))?;
-                let mut data: Vec<Vec<serde_json::Value>> = Vec::new();
-                let mut truncated = false;
-                while let Some(row) = rows.next().map_err(|e| format!("Row read error: {e}"))? {
-                    if data.len() >= row_limit {
-                        truncated = true;
-                        break;
-                    }
-                    let values: Vec<serde_json::Value> = (0..columns.len())
-                        .map(|i| {
-                            let ref_val = row.get_ref(i).unwrap_or(rusqlite::types::ValueRef::Null);
-                            sqlite_value_ref_to_json(ref_val)
-                        })
-                        .collect();
-                    data.push(values);
-                }
-                db::QueryResult {
-                    columns,
-                    column_types: Vec::new(),
-                    column_sortables: vec![],
-                    rows: data,
-                    affected_rows: 0,
-                    execution_time_ms: 0,
-                    truncated,
-                    session_id: None,
-                    has_more: false,
-                }
-            } else {
-                guard.execute_batch(sql).map_err(|e| format!("SQLite execute failed: {e}"))?;
-                let affected_rows = guard.changes() as u64;
-                db::QueryResult {
-                    columns: vec![],
-                    column_types: Vec::new(),
-                    column_sortables: vec![],
-                    rows: vec![],
-                    affected_rows,
-                    execution_time_ms: 0,
-                    truncated: false,
-                    session_id: None,
-                    has_more: false,
-                }
-            }
-        }
-    };
+    for statement in statements {
+        let result = match &mut session.connection {
+            TxnConnection::Postgres(conn) => execute_manual_txn_postgres_statement(conn, &statement, row_limit).await?,
+            TxnConnection::Mysql(conn) => execute_manual_txn_mysql_statement(conn, &statement, row_limit).await?,
+        };
+        results.push(result);
+    }
+
     drop(sessions);
 
-    Ok(vec![result])
+    Ok(results)
 }
 
-/// Convert a MySQL row value to JSON using a simple fallback conversion.
-fn mysql_value_fallback(row: &mysql_async::Row, idx: usize) -> serde_json::Value {
-    match row.as_ref(idx) {
-        Some(mysql_async::Value::NULL) | None => serde_json::Value::Null,
-        Some(mysql_async::Value::Int(v)) => db::safe_i64_to_json(*v),
-        Some(mysql_async::Value::UInt(v)) => db::safe_u64_to_json(*v),
-        Some(mysql_async::Value::Float(v)) => {
-            serde_json::Number::from_f64(*v as f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
-        }
-        Some(mysql_async::Value::Double(v)) => {
-            serde_json::Number::from_f64(*v).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
-        }
-        Some(mysql_async::Value::Bytes(bytes)) => {
-            if let Ok(s) = String::from_utf8(bytes.clone()) {
-                serde_json::Value::String(s)
-            } else {
-                db::binary_value_to_json(bytes)
+async fn execute_manual_txn_postgres_statement(
+    conn: &deadpool_postgres::Object,
+    sql: &str,
+    row_limit: usize,
+) -> Result<db::QueryResult, String> {
+    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "WITH", "TABLE"]) {
+        let rows = conn.query(sql, &[]).await.map_err(|e| format!("Query failed: {e}"))?;
+        let columns: Vec<String> =
+            if rows.is_empty() { vec![] } else { rows[0].columns().iter().map(|c| c.name().to_string()).collect() };
+        let column_types: Vec<String> = if rows.is_empty() {
+            Vec::new()
+        } else {
+            rows[0].columns().iter().map(|c| c.type_().name().to_string()).collect()
+        };
+        let mut data: Vec<Vec<serde_json::Value>> = Vec::with_capacity(rows.len().min(row_limit));
+        let mut truncated = false;
+        for (idx, row) in rows.iter().enumerate() {
+            if idx >= row_limit {
+                truncated = true;
+                break;
             }
+            let values: Vec<serde_json::Value> = (0..row.columns().len())
+                .map(|i| row.try_get::<_, serde_json::Value>(i).unwrap_or(serde_json::Value::Null))
+                .collect();
+            data.push(values);
         }
-        _ => serde_json::Value::Null,
+        Ok(db::QueryResult {
+            columns,
+            column_types,
+            column_sortables: vec![],
+            rows: data,
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated,
+            session_id: None,
+            has_more: false,
+        })
+    } else {
+        let affected = conn.execute(sql, &[]).await.map_err(|e| format!("Query failed: {e}"))?;
+        Ok(db::QueryResult {
+            columns: vec![],
+            column_types: Vec::new(),
+            column_sortables: vec![],
+            rows: vec![],
+            affected_rows: affected,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+        })
     }
 }
 
-/// Convert a rusqlite ValueRef to a serde_json::Value.
-fn sqlite_value_ref_to_json(value: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
-    match value {
-        rusqlite::types::ValueRef::Null => serde_json::Value::Null,
-        rusqlite::types::ValueRef::Integer(v) => db::safe_i64_to_json(v),
-        rusqlite::types::ValueRef::Real(v) => {
-            serde_json::Number::from_f64(v).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
-        }
-        rusqlite::types::ValueRef::Text(v) => serde_json::Value::String(String::from_utf8_lossy(v).to_string()),
-        rusqlite::types::ValueRef::Blob(v) => db::binary_value_to_json(v),
+async fn execute_manual_txn_mysql_statement(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    row_limit: usize,
+) -> Result<db::QueryResult, String> {
+    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"]) {
+        let result = conn.query_iter(sql).await.map_err(|e| format!("Query failed: {e}"))?;
+        let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
+        let column_types: Vec<String> = result.columns_ref().iter().map(|c| format!("{:?}", c.column_type())).collect();
+        let rows: Vec<mysql_async::Row> =
+            result.collect_and_drop().await.map_err(|e| format!("Failed to collect rows: {e}"))?;
+        let truncated = rows.len() > row_limit;
+        let data: Vec<Vec<serde_json::Value>> = rows
+            .iter()
+            .take(row_limit)
+            .map(|row| (0..row.len()).map(|i| db::mysql::mysql_value_to_json(row, i)).collect())
+            .collect();
+        Ok(db::QueryResult {
+            columns,
+            column_types,
+            column_sortables: vec![],
+            rows: data,
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated,
+            session_id: None,
+            has_more: false,
+        })
+    } else {
+        let result = conn.query_iter(sql).await.map_err(|e| format!("Query failed: {e}"))?;
+        let affected_rows = result.affected_rows();
+        result.drop_result().await.map_err(|e| format!("Query failed: {e}"))?;
+        Ok(db::QueryResult {
+            columns: vec![],
+            column_types: Vec::new(),
+            column_sortables: vec![],
+            rows: vec![],
+            affected_rows,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+        })
     }
 }
 
@@ -2645,10 +2581,6 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
         }
         TxnConnection::Mysql(conn) => {
             conn.query_drop("COMMIT").await.map_err(|e| format!("COMMIT failed: {e}"))?;
-        }
-        TxnConnection::Sqlite(handle) => {
-            let guard = handle.lock().map_err(|e| e.to_string())?;
-            guard.execute_batch("COMMIT").map_err(|e| format!("COMMIT failed: {e}"))?;
         }
     }
 
@@ -2677,10 +2609,6 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
         }
         TxnConnection::Mysql(conn) => {
             conn.query_drop("ROLLBACK").await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
-        }
-        TxnConnection::Sqlite(handle) => {
-            let guard = handle.lock().map_err(|e| e.to_string())?;
-            guard.execute_batch("ROLLBACK").map_err(|e| format!("ROLLBACK failed: {e}"))?;
         }
     }
 

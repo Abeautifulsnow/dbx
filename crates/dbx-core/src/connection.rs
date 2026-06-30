@@ -87,11 +87,11 @@ pub enum PoolKind {
 pub enum TxnConnection {
     Postgres(deadpool_postgres::Object),
     Mysql(mysql_async::Conn),
-    Sqlite(Arc<std::sync::Mutex<rusqlite::Connection>>),
 }
 
 pub struct TransactionSession {
     pub connection: TxnConnection,
+    pub pool_key: String,
     pub last_activity: std::time::Instant,
     pub connection_id: String,
     pub database: String,
