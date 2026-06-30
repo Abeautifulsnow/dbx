@@ -201,7 +201,7 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
             size="icon"
             class="h-6 w-6"
             :class="isTransactionActive || autoCommit === false ? 'text-orange-600 bg-orange-100 dark:text-orange-300 dark:bg-orange-900/30' : 'text-muted-foreground/50'"
-            :disabled="activeTab.isExecuting"
+            :disabled="activeTab.isExecuting || activeTab.isExplaining"
             @click="emit('update:autoCommit', autoCommit === false)"
           >
             <span class="font-bold" style="font-size: 9px">Tx</span>
@@ -212,7 +212,7 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
       <!-- Commit button (only when transaction is active) -->
       <Tooltip v-if="isTransactionActive">
         <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6 text-green-600 hover:bg-green-500/10 hover:text-green-700 dark:text-green-300 dark:hover:text-green-200" @click="emit('commit')">
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-green-600 hover:bg-green-500/10 hover:text-green-700 dark:text-green-300 dark:hover:text-green-200" :disabled="activeTab.isExecuting" @click="emit('commit')">
             <Check class="h-3.5 w-3.5" />
           </Button>
         </TooltipTrigger>
@@ -222,7 +222,7 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
       <!-- Rollback button (only when transaction is active) -->
       <Tooltip v-if="isTransactionActive">
         <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-300 dark:hover:text-red-200" @click="emit('rollback')">
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-300 dark:hover:text-red-200" :disabled="activeTab.isExecuting" @click="emit('rollback')">
             <RotateCcw class="h-3.5 w-3.5" />
           </Button>
         </TooltipTrigger>

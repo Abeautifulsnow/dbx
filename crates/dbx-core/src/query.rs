@@ -9,6 +9,7 @@ use sqlparser::parser::Parser;
 use std::collections::HashSet;
 use std::future::Future;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::Duration;
 #[cfg(feature = "duckdb-bundled")]
 use tokio::task::JoinHandle;
@@ -2408,8 +2409,13 @@ pub async fn begin_manual_transaction(
         schema: schema.map(|s| s.to_string()),
     };
 
-    let mut sessions = state.transaction_sessions.write().await;
-    sessions.insert(txn_session_id.clone(), session);
+    {
+        let mut sessions = state.transaction_sessions.write().await;
+        sessions.insert(txn_session_id.clone(), session);
+    }
+
+    // Schedule idle timeout watcher
+    spawn_txn_idle_watcher(state, txn_session_id.clone());
 
     log::info!("[query][manual_txn:begin] session_id={}", txn_session_id);
     Ok(txn_session_id)
@@ -2425,6 +2431,30 @@ pub async fn execute_in_manual_transaction(
     max_rows: Option<usize>,
 ) -> Result<Vec<db::QueryResult>, String> {
     const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    // Resolve statements and validate BEFORE removing the session from the
+    // global map. Copy out session fields we need so the read lock doesn't
+    // span async calls.
+    let (pool_key, connection_id) = {
+        let sessions = state.transaction_sessions.read().await;
+        let session = sessions
+            .get(txn_session_id)
+            .ok_or("Transaction session not found or expired; it may have been auto-rolled back due to inactivity")?;
+        (session.pool_key.clone(), session.connection_id.clone())
+    };
+
+    let db_type = connection_database_type(state, &connection_id).await;
+    let statements = db_type.map_or_else(
+        || split_sql_statements(sql),
+        |db_type| crate::sql::split_sql_statements_for_database(sql, db_type),
+    );
+    if statements.is_empty() {
+        return Ok(vec![empty_query_result(0)]);
+    }
+
+    // Read-only check while the session is still in the map. If this fails the
+    // session remains intact.
+    check_read_only_for_connection_multi(state, &pool_key, &statements).await?;
 
     // Take the session out of the global map so we don't hold the write lock
     // across database I/O — one slow transaction must not block all others.
@@ -2447,40 +2477,96 @@ pub async fn execute_in_manual_transaction(
         return Err("Transaction was auto-rolled back due to 5 minutes of inactivity".to_string());
     }
 
-    let db_type = connection_database_type(state, &session.connection_id).await;
-    let statements = db_type.map_or_else(
-        || split_sql_statements(sql),
-        |db_type| crate::sql::split_sql_statements_for_database(sql, db_type),
-    );
-    if statements.is_empty() {
-        // Nothing to execute — put the session back.
-        let mut sessions = state.transaction_sessions.write().await;
-        sessions.insert(txn_session_id.to_string(), session);
-        return Ok(vec![empty_query_result(0)]);
-    }
-
-    check_read_only_for_connection_multi(state, &session.pool_key, &statements).await?;
-
     session.last_activity = std::time::Instant::now();
     let row_limit = max_rows.unwrap_or(MAX_ROWS).max(1);
     let mut results = Vec::with_capacity(statements.len());
 
-    for statement in statements {
+    for (i, statement) in statements.iter().enumerate() {
         let result = match &mut session.connection {
-            TxnConnection::Postgres(conn) => execute_manual_txn_postgres_statement(conn, &statement, row_limit).await?,
-            TxnConnection::Mysql(conn) => execute_manual_txn_mysql_statement(conn, &statement, row_limit).await?,
+            TxnConnection::Postgres(conn) => execute_manual_txn_postgres_statement(conn, statement, row_limit).await,
+            TxnConnection::Mysql(conn) => execute_manual_txn_mysql_statement(conn, statement, row_limit).await,
         };
-        results.push(result);
+        match result {
+            Ok(query_result) => results.push(query_result),
+            Err(e) => {
+                // Statement failed — rollback the held transaction and do NOT
+                // reinsert the session. The error message contains "auto-rolled back"
+                // so the frontend clears txnSessionId and shows the warning bar.
+                match &mut session.connection {
+                    TxnConnection::Postgres(conn) => {
+                        let _ = conn.execute("ROLLBACK", &[]).await;
+                    }
+                    TxnConnection::Mysql(conn) => {
+                        let _ = conn.query_drop("ROLLBACK").await;
+                    }
+                }
+                return Err(format!("Statement {} failed: {}. Transaction was auto-rolled back.", i + 1, e));
+            }
+        }
     }
 
-    // Execution succeeded — re-insert the session so follow-up statements reuse
-    // the same open transaction.
-    {
-        let mut sessions = state.transaction_sessions.write().await;
-        sessions.insert(txn_session_id.to_string(), session);
-    }
+    // Execution succeeded — re-insert the session and schedule idle timeout watcher.
+    let txn_id = txn_session_id.to_string();
+    reinsert_session_and_watch(state, txn_id, session).await;
 
     Ok(results)
+}
+
+/// Re-insert a transaction session into the global map and schedule an idle
+/// timeout watcher. The write lock is held only briefly for the insert.
+async fn reinsert_session_and_watch(state: &AppState, txn_session_id: String, session: TransactionSession) {
+    {
+        let mut sessions = state.transaction_sessions.write().await;
+        sessions.insert(txn_session_id.clone(), session);
+    }
+    spawn_txn_idle_watcher(state, txn_session_id);
+}
+
+/// Spawn a background task that removes and rolls back a transaction session
+/// after 5 minutes of inactivity. The task does not hold the global lock across
+/// I/O: it briefly checks the map, and if the session exists and is expired,
+/// removes it, drops the lock, then rolls back the held connection.
+///
+/// Safety: if multiple watchers exist for the same session ID (e.g. due to
+/// a race), only the one that actually finds the session in the map and
+/// observes an elapsed time >= timeout will remove and roll back. Others
+/// will see a missing session or a non-expired one and exit harmlessly.
+fn spawn_txn_idle_watcher(state: &AppState, txn_session_id: String) {
+    let sessions = Arc::clone(&state.transaction_sessions);
+    tokio::spawn(async move {
+        const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        tokio::time::sleep(TXN_IDLE_TIMEOUT).await;
+
+        // Check if session exists and is expired.
+        let expired = {
+            let guard = sessions.read().await;
+            guard.get(&txn_session_id).map(|s| s.last_activity.elapsed() >= TXN_IDLE_TIMEOUT).unwrap_or(false)
+        };
+        if !expired {
+            return; // Not yet expired or already gone
+        }
+
+        // Remove the session with a write lock, release, then rollback.
+        let removed: Option<TransactionSession> = {
+            let mut guard = sessions.write().await;
+            guard.remove(&txn_session_id)
+        };
+
+        if let Some(mut session) = removed {
+            match &mut session.connection {
+                TxnConnection::Postgres(conn) => {
+                    let _ = conn.execute("ROLLBACK", &[]).await;
+                }
+                TxnConnection::Mysql(conn) => {
+                    let _ = conn.query_drop("ROLLBACK").await;
+                }
+            }
+            log::info!(
+                "[query][manual_txn:idle_timeout] session_id={} auto-rolled back after 5 minutes of inactivity",
+                txn_session_id
+            );
+        }
+    });
 }
 
 async fn execute_manual_txn_postgres_statement(

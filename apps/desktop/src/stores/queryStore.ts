@@ -1963,10 +1963,11 @@ export const useQueryStore = defineStore("query", () => {
       console.error("[DBX][executeTabSql:error]", { traceId, elapsed: elapsed(), error: e });
       // Sync connection state if the error indicates a lost connection
       useConnectionStore().recordConnectionLostError(tab.connectionId, e);
-      // Handle manual transaction auto-rollback (e.g. deadlock detected by server)
+      // Handle manual transaction auto-rollback (e.g. deadlock detected by server,
+      // statement error inside a manual transaction, or idle timeout).
       if (tab.autoCommit === false) {
         const errMsg: string = e?.message ?? String(e);
-        if (/auto.?rolled.?back/i.test(errMsg) || errMsg.includes("已自动回滚")) {
+        if (/rolled.?back/i.test(errMsg) || errMsg.includes("已自动回滚")) {
           tab.txnSessionId = undefined;
           tab.txnAutoRolledBack = true;
         }
