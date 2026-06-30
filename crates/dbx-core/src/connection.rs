@@ -85,7 +85,7 @@ pub enum PoolKind {
 
 /// Held connection for a manual transaction session
 pub enum TxnConnection {
-    Postgres(deadpool_postgres::Object),
+    Postgres(Box<deadpool_postgres::Object>),
     Mysql(mysql_async::Conn),
 }
 

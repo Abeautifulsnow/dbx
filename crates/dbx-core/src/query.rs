@@ -2401,7 +2401,7 @@ pub async fn begin_manual_transaction(
                     .await
                     .map_err(|e| format!("SET search_path failed: {e}"))?;
             }
-            TxnConnection::Postgres(conn)
+            TxnConnection::Postgres(Box::new(conn))
         }
         TxnPoolHandle::Mysql(mysql_pool) => {
             let mut conn = mysql_pool.get_conn().await.map_err(|e| format!("Failed to get MySQL connection: {e}"))?;
@@ -2507,7 +2507,9 @@ pub async fn execute_in_manual_transaction(
     let mut conn = connection.lock().await;
     for (i, statement) in statements.iter().enumerate() {
         let result = match &mut *conn {
-            TxnConnection::Postgres(conn) => execute_manual_txn_postgres_statement(conn, statement, row_limit).await,
+            TxnConnection::Postgres(conn) => {
+                execute_manual_txn_postgres_statement(conn.as_ref(), statement, row_limit).await
+            }
             TxnConnection::Mysql(conn) => execute_manual_txn_mysql_statement(conn, statement, row_limit).await,
         };
         match result {
