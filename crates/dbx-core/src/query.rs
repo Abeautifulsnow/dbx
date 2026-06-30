@@ -2376,11 +2376,23 @@ pub async fn begin_manual_transaction(
         state.get_or_create_pool(connection_id, Some(database)).await?
     };
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Connection not found")?;
+    // Clone the pool handle under a brief read lock, then drop the lock before
+    // any async I/O — same pattern as do_execute throughout this file.
+    enum TxnPoolHandle {
+        Postgres(deadpool_postgres::Pool),
+        Mysql(db::mysql::MySqlPool),
+    }
+    let pool_handle = {
+        let connections = state.connections.read().await;
+        match connections.get(&pool_key).ok_or("Connection not found")? {
+            PoolKind::Postgres(pg) => TxnPoolHandle::Postgres(pg.clone()),
+            PoolKind::Mysql(mp, _) => TxnPoolHandle::Mysql(mp.clone()),
+            _ => return Err("Manual transaction is not supported for this database type".to_string()),
+        }
+    }; // connections lock released here
 
-    let txn_conn = match pool {
-        PoolKind::Postgres(pg_pool) => {
+    let txn_conn = match pool_handle {
+        TxnPoolHandle::Postgres(pg_pool) => {
             let conn = pg_pool.get().await.map_err(|e| format!("Failed to get Postgres connection: {e}"))?;
             conn.execute("BEGIN", &[]).await.map_err(|e| format!("BEGIN failed: {e}"))?;
             if let Some(schema) = schema {
@@ -2390,14 +2402,12 @@ pub async fn begin_manual_transaction(
             }
             TxnConnection::Postgres(conn)
         }
-        PoolKind::Mysql(mysql_pool, _) => {
+        TxnPoolHandle::Mysql(mysql_pool) => {
             let mut conn = mysql_pool.get_conn().await.map_err(|e| format!("Failed to get MySQL connection: {e}"))?;
             conn.query_drop("START TRANSACTION").await.map_err(|e| format!("START TRANSACTION failed: {e}"))?;
             TxnConnection::Mysql(conn)
         }
-        _ => return Err("Manual transaction is not supported for this database type".to_string()),
     };
-    drop(connections);
 
     let txn_session_id = uuid::Uuid::new_v4().to_string();
     let session = TransactionSession {
