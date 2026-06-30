@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use mysql_async::prelude::Queryable;
@@ -90,9 +90,10 @@ pub enum TxnConnection {
 }
 
 pub struct TransactionSession {
-    pub connection: TxnConnection,
+    pub connection: Arc<Mutex<TxnConnection>>,
     pub pool_key: String,
     pub last_activity: std::time::Instant,
+    pub busy: bool,
     pub connection_id: String,
     pub database: String,
     pub schema: Option<String>,

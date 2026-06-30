@@ -1219,6 +1219,7 @@ export const useConnectionStore = defineStore("connection", () => {
         queryStore.releaseConnectionTabs(connectionId);
         break;
       case "keep-tabs-keep-results":
+        queryStore.rollbackConnectionTransactions(connectionId);
         break;
     }
     connectedIds.value.delete(connectionId);
@@ -1251,6 +1252,7 @@ export const useConnectionStore = defineStore("connection", () => {
         queryStore.releaseDatabaseTabs(connectionId, database);
         break;
       case "keep-tabs-keep-results":
+        queryStore.rollbackDatabaseTransactions(connectionId, database);
         break;
     }
     const node = findDatabaseTreeNode(treeNodes.value, connectionId, database);
