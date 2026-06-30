@@ -2426,10 +2426,15 @@ pub async fn execute_in_manual_transaction(
 ) -> Result<Vec<db::QueryResult>, String> {
     const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-    let mut sessions = state.transaction_sessions.write().await;
-    let session = sessions.get_mut(txn_session_id).ok_or("Transaction session not found or expired")?;
+    // Take the session out of the global map so we don't hold the write lock
+    // across database I/O — one slow transaction must not block all others.
+    let mut session = {
+        let mut sessions = state.transaction_sessions.write().await;
+        sessions.remove(txn_session_id).ok_or("Transaction session not found or expired")?
+    };
 
-    // Check idle timeout — auto-rollback if expired
+    // Check idle timeout — auto-rollback if expired.
+    // Rollback also happens without the global lock.
     if session.last_activity.elapsed() > TXN_IDLE_TIMEOUT {
         match &mut session.connection {
             TxnConnection::Postgres(conn) => {
@@ -2439,7 +2444,6 @@ pub async fn execute_in_manual_transaction(
                 let _ = conn.query_drop("ROLLBACK").await;
             }
         }
-        sessions.remove(txn_session_id);
         return Err("Transaction was auto-rolled back due to 5 minutes of inactivity".to_string());
     }
 
@@ -2449,6 +2453,9 @@ pub async fn execute_in_manual_transaction(
         |db_type| crate::sql::split_sql_statements_for_database(sql, db_type),
     );
     if statements.is_empty() {
+        // Nothing to execute — put the session back.
+        let mut sessions = state.transaction_sessions.write().await;
+        sessions.insert(txn_session_id.to_string(), session);
         return Ok(vec![empty_query_result(0)]);
     }
 
@@ -2466,7 +2473,12 @@ pub async fn execute_in_manual_transaction(
         results.push(result);
     }
 
-    drop(sessions);
+    // Execution succeeded — re-insert the session so follow-up statements reuse
+    // the same open transaction.
+    {
+        let mut sessions = state.transaction_sessions.write().await;
+        sessions.insert(txn_session_id.to_string(), session);
+    }
 
     Ok(results)
 }
@@ -2572,8 +2584,10 @@ async fn execute_manual_txn_mysql_statement(
 
 /// Commit an existing manual transaction session.
 pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -> Result<db::QueryResult, String> {
-    let mut sessions = state.transaction_sessions.write().await;
-    let mut session = sessions.remove(txn_session_id).ok_or("Transaction session not found")?;
+    let mut session = {
+        let mut sessions = state.transaction_sessions.write().await;
+        sessions.remove(txn_session_id).ok_or("Transaction session not found")?
+    };
 
     match &mut session.connection {
         TxnConnection::Postgres(conn) => {
@@ -2600,8 +2614,10 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
 
 /// Rollback an existing manual transaction session.
 pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str) -> Result<db::QueryResult, String> {
-    let mut sessions = state.transaction_sessions.write().await;
-    let mut session = sessions.remove(txn_session_id).ok_or("Transaction session not found")?;
+    let mut session = {
+        let mut sessions = state.transaction_sessions.write().await;
+        sessions.remove(txn_session_id).ok_or("Transaction session not found")?
+    };
 
     match &mut session.connection {
         TxnConnection::Postgres(conn) => {
