@@ -1161,7 +1161,11 @@ fn is_bit_literal_column(column_info: Option<&DataGridColumnInfo>) -> bool {
 
 fn is_bit_column_type(data_type: &str) -> bool {
     let lower = data_type.to_ascii_lowercase();
-    lower.split(|ch: char| !ch.is_ascii_alphanumeric()).any(|token| token == "bit")
+    lower.split(|ch: char| !ch.is_ascii_alphanumeric()).any(|token| {
+        // SQL Server/tiberius reports nullable BIT result columns as `bitn`.
+        // They still need numeric 0/1 literals in generated UPDATE SQL.
+        matches!(token, "bit" | "bitn")
+    })
 }
 
 fn is_mysql_geometry_literal_database(database_type: Option<DatabaseType>) -> bool {
@@ -1845,7 +1849,9 @@ fn is_numeric_type(data_type: &str) -> bool {
 
 fn is_boolean_type(data_type: &str) -> bool {
     let lower = data_type.to_ascii_lowercase();
-    lower.split(|ch: char| !ch.is_ascii_alphanumeric()).any(|token| matches!(token, "bool" | "boolean" | "bit"))
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| matches!(token, "bool" | "boolean" | "bit" | "bitn"))
 }
 
 fn is_numeric_literal(text: &str) -> bool {
@@ -1881,6 +1887,7 @@ fn uses_keyless_row_predicate(database_type: Option<DatabaseType>) -> bool {
                 | DatabaseType::Vastbase
                 | DatabaseType::Goldendb
                 | DatabaseType::Yashandb
+                | DatabaseType::Oscar
                 | DatabaseType::Databricks
                 | DatabaseType::SapHana
                 | DatabaseType::Teradata
@@ -2038,6 +2045,16 @@ mod tests {
             })
             .as_deref(),
             Some("\"created_at\"::text NOT LIKE '%2026%'")
+        );
+        assert_eq!(
+            build_data_grid_column_value_filter_condition(DataGridColumnValueFilterConditionOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                column_name: "active".to_string(),
+                column_info: Some(column("active", "bitn", false, None)),
+                raw_value: "false".to_string(),
+            })
+            .as_deref(),
+            Some("[active] = 0")
         );
     }
 
@@ -2271,6 +2288,36 @@ mod tests {
             "b'10101010'"
         );
         assert_eq!(format_grid_sql_literal(&json!("0"), Some(DatabaseType::Postgres), Some(&bit)), "'0'");
+    }
+
+    #[test]
+    fn prepares_sqlserver_bitn_updates_with_numeric_literals() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::SqlServer),
+            table_meta: DataGridTableMeta {
+                schema: Some("dbo".to_string()),
+                table_name: "flags".to_string(),
+                primary_keys: vec![],
+                columns: Some(vec![column("id", "int", false, None), column("active", "bitn", false, None)]),
+            },
+            columns: vec!["id".to_string(), "active".to_string()],
+            source_columns: None,
+            rows: vec![vec![json!(1), json!(false)]],
+            dirty_rows: vec![(0, vec![(1, json!(true))])],
+            deleted_rows: vec![],
+            new_rows: vec![],
+        });
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(result.statements, vec!["UPDATE [dbo].[flags] SET [active] = 1 WHERE [id] = 1 AND [active] = 0;"]);
+        assert_eq!(
+            result.rollback_statements,
+            vec!["UPDATE [dbo].[flags] SET [active] = 0 WHERE [id] = 1 AND [active] = 1 AND [active] = 1;"]
+        );
+        for sql in result.statements.iter().chain(result.rollback_statements.iter()) {
+            assert!(!sql.contains("TRUE"));
+            assert!(!sql.contains("FALSE"));
+        }
     }
 
     #[test]
@@ -2544,6 +2591,33 @@ mod tests {
             vec![
                 "UPDATE `default`.`people` SET `name` = 'Linus' WHERE `id` = 1 AND `name` = 'Ada';",
                 "DELETE FROM `default`.`people` WHERE `id` = 1 AND `name` = 'Ada';",
+            ]
+        );
+    }
+
+    #[test]
+    fn prepares_oscar_keyless_save_statements_with_schema_qualified_row_predicate() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Oscar),
+            table_meta: DataGridTableMeta {
+                schema: Some("SYSDBA".to_string()),
+                table_name: "PEOPLE".to_string(),
+                primary_keys: vec![],
+                columns: Some(vec![column("ID", "INTEGER", true, None), column("NAME", "VARCHAR", true, None)]),
+            },
+            columns: vec!["ID".to_string(), "NAME".to_string()],
+            source_columns: None,
+            rows: vec![vec![json!(1), json!("Ada")]],
+            dirty_rows: vec![(0, vec![(1, json!("Linus"))])],
+            deleted_rows: vec![0],
+            new_rows: vec![],
+        });
+
+        assert_eq!(
+            result.statements,
+            vec![
+                "UPDATE \"SYSDBA\".\"PEOPLE\" SET \"NAME\" = 'Linus' WHERE \"ID\" = 1 AND \"NAME\" = 'Ada';",
+                "DELETE FROM \"SYSDBA\".\"PEOPLE\" WHERE \"ID\" = 1 AND \"NAME\" = 'Ada';",
             ]
         );
     }

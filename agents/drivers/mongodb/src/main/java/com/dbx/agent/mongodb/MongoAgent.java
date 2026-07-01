@@ -434,6 +434,22 @@ public final class MongoAgent {
         return Collections.singletonMap("modified_count", result.getModifiedCount());
     }
 
+    private static Object updateDocuments(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        String collection = params.get("collection").getAsString();
+        String filterJson = params.get("filter_json").getAsString();
+        String updateJson = params.get("update_json").getAsString();
+        boolean many = params.get("many").getAsBoolean();
+
+        var col = c.getDatabase(database).getCollection(collection);
+        Document filter = documentForWrite(filterJson);
+        Document update = documentForWrite(updateJson);
+        requireBulkUpdateOperatorDocument(update);
+        var result = many ? col.updateMany(filter, update) : col.updateOne(filter, update);
+        return Collections.singletonMap("modified_count", result.getModifiedCount());
+    }
+
     static Document documentForWrite(String docJson) {
         Document doc = Document.parse(docJson);
         convertMongoShellDates(doc);
@@ -456,6 +472,14 @@ public final class MongoAgent {
             }
         }
         return true;
+    }
+
+    static void requireBulkUpdateOperatorDocument(Document doc) {
+        if (!isUpdateOperatorDocument(doc)) {
+            // updateOne/updateMany are shell-style bulk updates here; replacements stay on the
+            // single-document save path so a broad filter cannot replace many documents by accident.
+            throw new IllegalArgumentException("Bulk update requires update operators such as $set");
+        }
     }
 
     private static Object deleteDocument(JsonObject params) {
@@ -588,6 +612,7 @@ public final class MongoAgent {
             case AgentProtocol.MONGO_METHOD_SERVER_VERSION -> serverVersion(params);
             case AgentProtocol.MONGO_METHOD_INSERT_DOCUMENT -> insertDocument(params);
             case AgentProtocol.MONGO_METHOD_UPDATE_DOCUMENT -> updateDocument(params);
+            case AgentProtocol.MONGO_METHOD_UPDATE_DOCUMENTS -> updateDocuments(params);
             case AgentProtocol.MONGO_METHOD_DELETE_DOCUMENT -> deleteDocument(params);
             case AgentProtocol.METHOD_DISCONNECT, AgentProtocol.METHOD_SHUTDOWN -> {
                 if (client != null) {

@@ -60,6 +60,7 @@ import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { generateDatabaseExportId } from "@/lib/databaseExport";
 import { copyToClipboard } from "@/lib/clipboard";
 import { formatSqlInsert } from "@/lib/exportFormats";
+import { buildSingleDdlExportFileContent } from "@/lib/ddlExport";
 import { fetchTableDataForExport } from "@/lib/tableDataExport";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useExportTracker, type ExportTask } from "@/composables/useExportTracker";
@@ -799,7 +800,7 @@ async function exportStructure(row: ObjectBrowserRow) {
   try {
     const schema = row.schema || selectedSchema.value || props.database;
     const ddl = await api.getTableDdl(props.connection.id, props.database, schema, row.name, tableDdlObjectType(row.type));
-    await saveFileContent(ddl + "\n", `${row.name}.sql`, "SQL", "sql");
+    await saveFileContent(buildSingleDdlExportFileContent(ddl), `${row.name}.sql`, "SQL", "sql");
   } catch (e: any) {
     console.error("Export structure failed:", e);
   }
@@ -1566,7 +1567,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                 </button>
                 <span v-else class="h-5 w-5 shrink-0" :class="{ 'ml-4': item.partitionParentId }" />
                 <component :is="iconFor(item)" class="h-3.5 w-3.5 shrink-0" :class="iconClass(item.type)" />
-                <span class="truncate text-[13px] font-medium text-foreground">{{ item.name }}</span>
+                <span class="truncate text-[13px] font-medium text-foreground" :title="item.displayName">{{ item.displayName }}</span>
                 <span v-if="item.partitionCount" class="shrink-0 rounded border bg-muted/40 px-1.5 py-0.5 text-[10px] font-medium leading-none text-muted-foreground">
                   {{ t("objects.partitions", { count: item.partitionCount }) }}
                 </span>

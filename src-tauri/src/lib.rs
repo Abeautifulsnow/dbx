@@ -850,14 +850,20 @@ pub fn run() {
             commands::mongo_cmd::mongo_create_database,
             commands::mongo_cmd::mongo_drop_database,
             commands::mongo_cmd::mongo_drop_collection,
-            commands::mongo_cmd::document_find_documents,
+            commands::document_cmd::document_list_databases,
+            commands::document_cmd::document_list_collections,
+            commands::document_cmd::document_find_documents,
             commands::mongo_cmd::mongo_find_documents,
             commands::mongo_cmd::mongo_server_version,
             commands::mongo_cmd::mongo_aggregate_documents,
+            commands::mongo_cmd::mongo_create_index,
+            commands::document_cmd::document_insert_document,
             commands::mongo_cmd::mongo_insert_document,
             commands::mongo_cmd::mongo_insert_documents,
+            commands::document_cmd::document_update_document,
             commands::mongo_cmd::mongo_update_document,
             commands::mongo_cmd::mongo_update_documents,
+            commands::document_cmd::document_delete_document,
             commands::mongo_cmd::mongo_delete_document,
             commands::mongo_cmd::mongo_delete_documents,
             #[cfg(feature = "mq-admin")]
@@ -939,7 +945,11 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_get_backlog,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_cluster_info,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_raw_request,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_send_message,
             commands::history::save_history,
             commands::history::load_history,
             commands::history::clear_history,

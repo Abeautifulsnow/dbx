@@ -440,6 +440,60 @@ fn gbase8a_uses_limited_mysql_ddl() {
 }
 
 #[test]
+fn gbase8a_allows_mysql_style_column_reorder() {
+    let mut id = column("id");
+    id.original_position = Some(0);
+    id.original = Some(ColumnInfo {
+        name: "id".to_string(),
+        data_type: "varchar(255)".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+    });
+
+    let mut name = column("name");
+    name.original_position = Some(1);
+    name.original = Some(ColumnInfo {
+        name: "name".to_string(),
+        data_type: "varchar(255)".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+    });
+
+    let mut email = column("email");
+    email.original_position = Some(2);
+    email.original = Some(ColumnInfo {
+        name: "email".to_string(),
+        data_type: "varchar(255)".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+    });
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::Gbase),
+        schema: None,
+        table_name: "users".to_string(),
+        columns: vec![id, email, name],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["ALTER TABLE `users` MODIFY COLUMN `email` varchar(255) AFTER `id`;"]);
+}
+
+#[test]
 fn manticoresearch_does_not_drop_id_column() {
     let mut id = column("id");
     id.data_type = "bigint".to_string();
@@ -803,6 +857,27 @@ fn builds_rqlite_changes_with_sqlite_dialect() {
 }
 
 #[test]
+fn builds_kingbase_add_column_without_column_keyword() {
+    let mut flag = column("flag");
+    flag.data_type = "varchar(100)".to_string();
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::Kingbase),
+        schema: Some("dbo".to_string()),
+        table_name: "dw_bill_info_copy".to_string(),
+        columns: vec![flag],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["ALTER TABLE \"dbo\".\"dw_bill_info_copy\" ADD \"flag\" varchar(100);"]);
+}
+
+#[test]
 fn builds_mysql_column_reorder_statements() {
     let mut id = column("id");
     id.data_type = "int".to_string();
@@ -1001,6 +1076,78 @@ fn builds_sql_server_quoted_column_and_index_statements() {
 }
 
 #[test]
+fn sqlserver_default_changes_drop_old_constraints_with_isolated_batches() {
+    let mut sku = column("sku");
+    sku.data_type = "nvarchar(64)".to_string();
+    sku.default_value = "new sku".to_string();
+    sku.original = Some(ColumnInfo {
+        name: "sku".to_string(),
+        data_type: "nvarchar(64)".to_string(),
+        is_nullable: true,
+        column_default: Some("'old sku'".to_string()),
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+    });
+
+    let mut active = column("active");
+    active.data_type = "bit".to_string();
+    active.is_nullable = false;
+    active.default_value = "1".to_string();
+    active.original = Some(ColumnInfo {
+        name: "active".to_string(),
+        data_type: "bit".to_string(),
+        is_nullable: false,
+        column_default: Some("0".to_string()),
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+    });
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::SqlServer),
+        schema: Some("core".to_string()),
+        table_name: "products".to_string(),
+        columns: vec![sku, active],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements.len(), 4);
+
+    let sku_drop = &result.statements[0];
+    let active_drop = &result.statements[2];
+    let sku_var = sku_drop.strip_prefix("DECLARE ").unwrap().split_once(" NVARCHAR(MAX);").unwrap().0;
+    let active_var = active_drop.strip_prefix("DECLARE ").unwrap().split_once(" NVARCHAR(MAX);").unwrap().0;
+    assert_ne!(sku_var, "@sql");
+    assert_ne!(active_var, "@sql");
+    assert_ne!(sku_var, active_var);
+
+    for (sql, column_name) in [(sku_drop, "sku"), (active_drop, "active")] {
+        assert!(sql.contains("SELECT TOP (1)"));
+        assert!(sql.contains(" + QUOTENAME(dc.name) FROM sys.default_constraints AS dc WHERE "));
+        assert!(sql.contains("OBJECT_ID(N'[core].[products]')"));
+        assert!(sql.contains(&format!("N'{column_name}', 'ColumnId'")));
+        assert!(sql.contains(" IF "));
+        assert!(!sql.contains("]'FROM"));
+        assert!(!sql.contains("constraintsWHERE"));
+    }
+
+    assert_eq!(
+        result.statements[1],
+        "ALTER TABLE [core].[products] ADD CONSTRAINT [DF_products_sku] DEFAULT 'new sku' FOR [sku];"
+    );
+    assert_eq!(
+        result.statements[3],
+        "ALTER TABLE [core].[products] ADD CONSTRAINT [DF_products_active] DEFAULT 1 FOR [active];"
+    );
+}
+
+#[test]
 fn sqlserver_unchanged_foreign_key_does_not_warn_when_saving_other_changes() {
     let mut email = column("email");
     email.data_type = "nvarchar(255)".to_string();
@@ -1032,6 +1179,33 @@ fn sqlserver_unchanged_foreign_key_does_not_warn_when_saving_other_changes() {
 
     assert_eq!(result.warnings, Vec::<String>::new());
     assert_eq!(result.statements, vec!["ALTER TABLE [dbo].[orders] ADD [email] nvarchar(255) NOT NULL;"]);
+}
+
+#[test]
+fn sqlserver_add_column_with_identity() {
+    let mut id = column("id");
+    id.data_type = "int".to_string();
+    id.is_nullable = false;
+    id.extra = Some(ColumnExtra {
+        auto_increment: Some(true),
+        identity: Some(ColumnIdentity { generation: None, seed: Some(10), increment: Some(2) }),
+        ..Default::default()
+    });
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::SqlServer),
+        schema: Some("dbo".to_string()),
+        table_name: "orders".to_string(),
+        columns: vec![id],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["ALTER TABLE [dbo].[orders] ADD [id] int NOT NULL IDENTITY(10, 2);"]);
 }
 
 #[test]

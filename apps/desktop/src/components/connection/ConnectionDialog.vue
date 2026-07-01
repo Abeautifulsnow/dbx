@@ -32,7 +32,7 @@ import { isLocalFileTypeDb } from "@/lib/connectionFile";
 import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedVersion } from "@/lib/mqPinnedVersionOptions";
 import { mongodbAuthFailureHint, mongoUrlParam, setMongoUrlParam } from "@/lib/mongoConnectionOptions";
 import { copyToClipboard } from "@/lib/clipboard";
-import { showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
+import { appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
 import { prestoSqlBuiltinDriverPaths } from "@/lib/prestoSqlBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/databaseFileDetection";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
@@ -48,7 +48,7 @@ type DbOption = { value: string; label: string };
 type DbCategory = { key: string; title: string; options: DbOption[] };
 type DialogStep = "select" | "config";
 type DbPickerView = "icon" | "list";
-type ConfigTab = "connection" | "advanced" | "tls" | "transport";
+export type ConfigTab = "connection" | "advanced" | "tls" | "transport";
 type MqTokenSigningMode = "none" | "hs256" | "rs256";
 type NacosAuthKind = NacosAuthConfig["kind"];
 type DremioConnectionMode = "arrow-flight-sql" | "legacy";
@@ -97,6 +97,7 @@ const isDesktop = isTauriRuntime();
 const props = defineProps<{
   editConfig?: ConnectionConfig;
   prefillConfig?: ConnectionDeepLinkDraft | null;
+  initialTab?: ConfigTab;
 }>();
 
 const emit = defineEmits<{
@@ -124,6 +125,10 @@ const visibleSchemaNames = ref<string[]>([]);
 const visibleSchemaInitialSelection = ref<string[]>([]);
 const visibleSchemaError = ref("");
 let testRunId = 0;
+
+function initialConfigTab(): ConfigTab {
+  return props.initialTab ?? "connection";
+}
 
 const defaultForm = (): ConnectionForm => ({
   name: "",
@@ -321,8 +326,12 @@ const dbPickerView = ref<DbPickerView>("icon");
 const dbSearchQuery = ref("");
 const configTab = ref<ConfigTab>("connection");
 type MqAuthKind = MqAuth["kind"];
+const MQ_KAFKA_SECURITY_PROTOCOL_AUTO = "__auto";
 const mqAdminUrl = ref("http://127.0.0.1:8080");
 const mqSystemKind = ref<MqSystemKind>("pulsar");
+const mqKafkaBootstrapServers = ref("127.0.0.1:9092");
+const mqKafkaSecurityProtocol = ref(MQ_KAFKA_SECURITY_PROTOCOL_AUTO);
+const mqKafkaSaslMechanism = ref("PLAIN");
 const mqAuthKind = ref<MqAuthKind>("none");
 const mqToken = ref("");
 const mqBasicUsername = ref("");
@@ -338,6 +347,22 @@ const mqTlsSkipVerify = ref(false);
 const mqPinnedVersion = ref(pinnedVersionToSelection(undefined));
 const mqTokenSigningMode = ref<MqTokenSigningMode>("none");
 const mqTokenSigningKey = ref("");
+const mqSystemOptions: Array<{ value: MqSystemKind; label: string }> = [
+  { value: "pulsar", label: "Apache Pulsar" },
+  { value: "kafka", label: "Apache Kafka" },
+];
+const mqKafkaSecurityProtocolOptions = [
+  { value: MQ_KAFKA_SECURITY_PROTOCOL_AUTO, label: "Auto" },
+  { value: "PLAINTEXT", label: "PLAINTEXT" },
+  { value: "SSL", label: "SSL" },
+  { value: "SASL_PLAINTEXT", label: "SASL_PLAINTEXT" },
+  { value: "SASL_SSL", label: "SASL_SSL" },
+];
+const mqKafkaSaslMechanismOptions = [
+  { value: "PLAIN", label: "PLAIN" },
+  { value: "SCRAM-SHA-256", label: "SCRAM-SHA-256" },
+  { value: "SCRAM-SHA-512", label: "SCRAM-SHA-512" },
+];
 const nacosServerAddr = ref(NACOS_DEFAULT_CONSOLE_URL);
 const nacosNamespace = ref("");
 const nacosContextPath = ref("");
@@ -545,6 +570,7 @@ const driverProfiles: Record<
   },
   kylin: { type: "kylin", port: 7070, user: "ADMIN", label: "Apache Kylin", icon: "kylin" },
   sundb: { type: "sundb", port: 22000, user: "root", label: "SunDB", icon: "sundb" },
+  oscar: { type: "oscar", port: 2003, user: "SYSDBA", label: "神通 OSCAR", icon: "oscar" },
   jdbc: { type: "jdbc", port: 0, user: "", label: "JDBC", icon: "jdbc" },
   tdengine: { type: "tdengine", port: 6041, user: "root", label: "TDengine", icon: "tdengine" },
   xugu: { type: "xugu", port: 5138, user: "", label: "虚谷 XuguDB", icon: "xugu" },
@@ -552,6 +578,7 @@ const driverProfiles: Record<
   etcd: { type: "etcd", port: 2379, user: "", label: "etcd", icon: "etcd" },
   zookeeper: { type: "zookeeper", port: 2181, user: "", label: "Apache ZooKeeper", icon: "zookeeper" },
   mq: { type: "mq", port: 8080, user: "", label: "Apache Pulsar", icon: "pulsar", host: "127.0.0.1" },
+  kafka: { type: "mq", port: 9092, user: "", label: "Apache Kafka", icon: "kafka", host: "127.0.0.1" },
   nacos: { type: "nacos", port: 8848, user: "nacos", label: "Nacos", icon: "nacos", host: "127.0.0.1" },
   iris: { type: "iris", port: 1972, user: "_SYSTEM", label: "IRIS", icon: "iris" },
   influxdb: { type: "influxdb", port: 8086, user: "", label: "InfluxDB", icon: "InfluxDB" },
@@ -579,6 +606,8 @@ function profileForConfig(config: ConnectionConfig) {
     if (config.driver_profile === "oceanbase-oracle") return "oceanbase";
     return config.driver_profile;
   }
+  if (config.db_type === "mq" && (config.external_config as MqAdminConfig | undefined)?.systemKind === "kafka") return "kafka";
+  if (config.db_type === "mq") return "mq";
   if (config.db_type === "dameng") return "dm";
   if (config.db_type === "oceanbase-oracle") return "oceanbase";
   return config.db_type;
@@ -588,13 +617,28 @@ function selectedProfile() {
   return driverProfiles[selectedType.value] ?? driverProfiles.mysql;
 }
 
+function mqExtraRecord(config?: Partial<MqAdminConfig>): Record<string, unknown> {
+  const extra = config?.extra;
+  return extra && typeof extra === "object" && !Array.isArray(extra) ? (extra as Record<string, unknown>) : {};
+}
+
+function mqExtraString(extra: Record<string, unknown>, key: string): string {
+  const value = extra[key];
+  return typeof value === "string" ? value : "";
+}
+
 function resetMqFields(config?: Partial<MqAdminConfig>) {
-  mqSystemKind.value = "pulsar";
-  mqAdminUrl.value = config?.adminUrl?.trim() || "http://127.0.0.1:8080";
+  const systemKind = config?.systemKind === "kafka" ? "kafka" : "pulsar";
+  const extra = mqExtraRecord(config);
+  mqSystemKind.value = systemKind;
+  mqAdminUrl.value = config?.adminUrl?.trim() || (systemKind === "kafka" ? "" : "http://127.0.0.1:8080");
+  mqKafkaBootstrapServers.value = mqExtraString(extra, "bootstrapServers") || "127.0.0.1:9092";
+  mqKafkaSecurityProtocol.value = mqExtraString(extra, "securityProtocol") || MQ_KAFKA_SECURITY_PROTOCOL_AUTO;
+  mqKafkaSaslMechanism.value = mqExtraString(extra, "saslMechanism") || "PLAIN";
   mqTlsSkipVerify.value = !!config?.tlsSkipVerify;
   mqPinnedVersion.value = pinnedVersionToSelection(config?.pinnedVersion);
   const auth = (config?.auth || { kind: "none" }) as MqAuth;
-  mqAuthKind.value = auth.kind || "none";
+  mqAuthKind.value = systemKind === "kafka" && auth.kind !== "basic" ? "none" : auth.kind || "none";
   mqToken.value = auth.token || "";
   mqBasicUsername.value = auth.username || "";
   mqBasicPassword.value = auth.password || "";
@@ -610,6 +654,16 @@ function resetMqFields(config?: Partial<MqAdminConfig>) {
   mqTokenSigningKey.value = tokenSigning?.key || "";
 }
 
+function defaultMqFieldsForProfile(profile: string): Partial<MqAdminConfig> | undefined {
+  if (profile !== "kafka") return undefined;
+  return {
+    systemKind: "kafka",
+    adminUrl: "",
+    auth: { kind: "none" },
+    extra: { bootstrapServers: "127.0.0.1:9092" },
+  };
+}
+
 function hydrateMqFields(value: unknown) {
   if (!value || typeof value !== "object") {
     resetMqFields();
@@ -617,6 +671,15 @@ function hydrateMqFields(value: unknown) {
   }
   resetMqFields(value as Partial<MqAdminConfig>);
 }
+
+watch(mqSystemKind, (kind) => {
+  if (kind === "kafka") {
+    if (!mqKafkaBootstrapServers.value.trim()) mqKafkaBootstrapServers.value = "127.0.0.1:9092";
+    if (!["none", "basic"].includes(mqAuthKind.value)) mqAuthKind.value = "none";
+    return;
+  }
+  if (!mqAdminUrl.value.trim()) mqAdminUrl.value = "http://127.0.0.1:8080";
+});
 
 function resetNacosFields(config?: Partial<NacosAdminConfig>) {
   nacosServerAddr.value = config?.serverAddr?.trim() || NACOS_DEFAULT_CONSOLE_URL;
@@ -642,6 +705,32 @@ function requireMqField(value: string, message: string): string {
   const trimmed = value.trim();
   if (!trimmed) throw new Error(message);
   return trimmed;
+}
+
+function normalizeMqKafkaBootstrapServer(server: string): string {
+  if (server.includes("://")) {
+    throw new Error("Kafka bootstrap servers must be host:port values without a URL scheme");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(`kafka://${server}`);
+  } catch {
+    throw new Error("Kafka bootstrap servers are invalid");
+  }
+  if (!parsed.hostname || parsed.username || parsed.password || parsed.search || parsed.hash || (parsed.pathname && parsed.pathname !== "/")) {
+    throw new Error("Kafka bootstrap servers are invalid");
+  }
+  return server;
+}
+
+function normalizeMqKafkaBootstrapServers(value: string): string {
+  const servers = requireMqField(value, "Kafka bootstrap servers are required")
+    .split(",")
+    .map((server) => server.trim())
+    .filter(Boolean)
+    .map(normalizeMqKafkaBootstrapServer);
+  if (!servers.length) throw new Error("Kafka bootstrap servers are required");
+  return servers.join(",");
 }
 
 function buildMqAuth(): MqAuth {
@@ -683,8 +772,25 @@ function buildMqTokenSigning() {
 }
 
 function buildMqAdminConfig(): MqAdminConfig {
+  const systemKind = mqSystemKind.value;
+  if (systemKind === "kafka") {
+    const bootstrapServers = normalizeMqKafkaBootstrapServers(mqKafkaBootstrapServers.value);
+    const extra: Record<string, string> = { bootstrapServers };
+    const securityProtocol = mqKafkaSecurityProtocol.value === MQ_KAFKA_SECURITY_PROTOCOL_AUTO ? "" : mqKafkaSecurityProtocol.value.trim();
+    const saslMechanism = mqKafkaSaslMechanism.value.trim();
+    if (securityProtocol) extra.securityProtocol = securityProtocol;
+    if (mqAuthKind.value === "basic" && saslMechanism) extra.saslMechanism = saslMechanism;
+    return {
+      systemKind: mqSystemKind.value,
+      adminUrl: "",
+      auth: buildMqAuth(),
+      tlsSkipVerify: mqTlsSkipVerify.value || undefined,
+      extra,
+    };
+  }
+
   return {
-    systemKind: "pulsar",
+    systemKind: mqSystemKind.value,
     adminUrl: requireMqField(mqAdminUrl.value, "MQ Admin URL is required"),
     auth: buildMqAuth(),
     tlsSkipVerify: mqTlsSkipVerify.value || undefined,
@@ -757,6 +863,33 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
+function connectionErrorWithDriverUpdateHint(config: ConnectionConfig, message: string): string {
+  if (!hasAgentDriverUpdate(config.db_type, agentDrivers.value, config.driver_profile)) return message;
+  return appendAgentDriverUpdateHint(message, t("connection.agentDriverUpdateConnectionHint"));
+}
+
+function isSqlServerLegacyUnencryptedMode(params: string | undefined): boolean {
+  const normalized = (params || "").trim().replace(/^\?/, "").replace(/;/g, "&");
+  if (!normalized) return false;
+  const parsed = new URLSearchParams(normalized);
+  for (const [key, value] of parsed.entries()) {
+    if (key.trim().toLowerCase() === "sqlserverencryption") {
+      return ["disabled", "disable", "false", "0", "off"].includes(value.trim().toLowerCase());
+    }
+  }
+  return false;
+}
+
+function setSqlServerLegacyUnencryptedMode(params: string | undefined, enabled: boolean): string {
+  const normalized = (params || "").trim().replace(/^\?/, "").replace(/;/g, "&");
+  return setUrlParam(normalized, "sqlserverEncryption", enabled ? "disabled" : "");
+}
+
+function isSqlServerTlsHandshakeFailure(message: string): boolean {
+  const text = message.toLowerCase();
+  return text.includes("sql server") && text.includes("tls") && (text.includes("handshake") || text.includes("eof") || text.includes("performing i/o"));
+}
+
 async function testConnectionWithTimeout(config: ConnectionConfig, runId: number): Promise<string> {
   const timeoutMs = connectionAttemptTimeoutMs(config);
   const timeoutMessage = connectionAttemptTimeoutMessage(timeoutMs);
@@ -768,7 +901,7 @@ async function testConnectionWithTimeout(config: ConnectionConfig, runId: number
     if (runId !== testRunId) return;
     testResult.value = {
       ok: false,
-      message: connectionAttemptOriginalErrorMessage(timeoutMessage, errorMessage(error)),
+      message: connectionErrorWithDriverUpdateHint(config, connectionAttemptOriginalErrorMessage(timeoutMessage, errorMessage(error))),
     };
   });
   try {
@@ -797,6 +930,20 @@ function applyMqAdminUrl(config: LegacyConnectionConfig, adminUrl: string) {
   config.host = parsed.hostname;
   config.port = port;
   config.ssl = parsed.protocol === "https:";
+}
+
+function applyMqKafkaBootstrapServers(config: LegacyConnectionConfig, bootstrapServers: string, securityProtocol?: string) {
+  const first = normalizeMqKafkaBootstrapServers(bootstrapServers).split(",")[0];
+  if (!first) throw new Error("Kafka bootstrap servers are required");
+  let parsed: URL;
+  try {
+    parsed = new URL(`kafka://${first}`);
+  } catch {
+    throw new Error("Kafka bootstrap servers are invalid");
+  }
+  config.host = parsed.hostname;
+  config.port = Number(parsed.port) || 9092;
+  config.ssl = securityProtocol === "SSL" || securityProtocol === "SASL_SSL";
 }
 
 function applyNacosServerAddr(config: LegacyConnectionConfig, serverAddr: string) {
@@ -929,7 +1076,7 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       applyPrestoSqlBuiltinDriverPathsIfAvailable();
     }
     if (profile.type === "mq") {
-      resetMqFields();
+      resetMqFields(defaultMqFieldsForProfile(val));
       form.value.database = undefined;
       form.value.connection_string = undefined;
     }
@@ -1046,7 +1193,7 @@ watch(
       jdbcManualClasspathOpen.value = config.db_type === "prestosql" || (config.jdbc_driver_paths || []).length > 0;
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
       dialogStep.value = "config";
-      configTab.value = "connection";
+      configTab.value = initialConfigTab();
     } else {
       editingId.value = null;
       form.value = defaultForm();
@@ -1197,6 +1344,7 @@ const iconTypeMap: Record<string, string> = {
   etcd: "etcd",
   zookeeper: "zookeeper",
   mq: "mq",
+  kafka: "kafka",
   nacos: "nacos",
   dm: "dm",
   h2: "h2",
@@ -1213,6 +1361,7 @@ const iconTypeMap: Record<string, string> = {
   bigquery: "bigquery",
   kylin: "kylin",
   sundb: "sundb",
+  oscar: "oscar",
   influxdb: "influxdb",
   jdbc: "jdbc",
   custom_mysql: "mysql",
@@ -1279,11 +1428,13 @@ const dbOptions: DbOption[] = [
   { value: "bigquery", label: "BigQuery" },
   { value: "kylin", label: "Kylin" },
   { value: "sundb", label: "SunDB" },
+  { value: "oscar", label: "神通 OSCAR" },
   { value: "xugu", label: "虚谷 XuguDB" },
   { value: "iotdb", label: "Apache IoTDB" },
   { value: "etcd", label: "etcd" },
   { value: "zookeeper", label: "Apache ZooKeeper" },
   { value: "mq", label: "Apache Pulsar" },
+  { value: "kafka", label: "Apache Kafka" },
   { value: "nacos", label: "Nacos" },
   { value: "influxdb", label: "InfluxDB" },
   { value: "iris", label: "IRIS" },
@@ -1482,6 +1633,13 @@ const testResultMessage = computed(() => {
   if (!testResult.value) return "";
   return testResult.value.ok ? t("connection.testSuccess") : translateBackendError(t, testResult.value.message);
 });
+const sqlServerLegacyUnencryptedModeEnabled = computed({
+  get: () => form.value.db_type === "sqlserver" && isSqlServerLegacyUnencryptedMode(form.value.url_params),
+  set: (enabled: boolean) => {
+    if (form.value.db_type !== "sqlserver") return;
+    form.value.url_params = setSqlServerLegacyUnencryptedMode(form.value.url_params, enabled);
+  },
+});
 const shouldUseWideConnectionDialog = computed(() => dialogStep.value === "config" && (canChooseVisibleDatabases.value || (canChooseVisibleSchemas.value && !visibleFilterUsesSchemas.value)));
 const connectionDialogContentClass = computed(() => {
   if (dialogStep.value === "select") return "sm:max-w-[760px]";
@@ -1492,7 +1650,9 @@ const connectionLabelSmallClass = `${connectionLabelClass} text-xs`;
 const connectionLabelTopClass = `${connectionLabelClass} mt-2`;
 const connectionLabelSmallPaddedClass = `${connectionLabelClass} pt-2 text-xs`;
 const hasRequiredConnectionTarget = computed(() => {
-  if (form.value.db_type === "mq") return !!mqAdminUrl.value.trim();
+  if (form.value.db_type === "mq") {
+    return mqSystemKind.value === "kafka" ? !!mqKafkaBootstrapServers.value.trim() : !!mqAdminUrl.value.trim();
+  }
   if (form.value.db_type === "zookeeper") return !!(form.value.host || form.value.connection_string || connectionUrlInput.value.trim());
   if (form.value.db_type === "nacos") return !!nacosServerAddr.value.trim();
   if (isH2FileMode.value) return !!(form.value.host.trim() || h2FilePathFromJdbcUrl(form.value.connection_string));
@@ -1554,9 +1714,13 @@ async function testConnection() {
     testResult.value = { ok: true, message: msg };
   } catch (e: any) {
     if (runId !== testRunId) return;
-    const message = mongodbAuthFailureHint(String(e));
+    const message = connectionErrorWithDriverUpdateHint(config, mongodbAuthFailureHint(String(e)));
     const fallbackMessage = await tryNacosDockerConsoleFallback(config, message, runId);
     if (runId !== testRunId) return;
+    const shouldShowSqlServerLegacyMode = !fallbackMessage && config.db_type === "sqlserver" && !isSqlServerLegacyUnencryptedMode(config.url_params) && isSqlServerTlsHandshakeFailure(message);
+    if (shouldShowSqlServerLegacyMode) {
+      configTab.value = "advanced";
+    }
     testResult.value = fallbackMessage ? { ok: true, message: fallbackMessage } : { ok: false, message };
   } finally {
     if (runId === testRunId) {
@@ -1740,7 +1904,14 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   if (config.db_type === "mq") {
     const mqConfig = buildMqAdminConfig();
     config.external_config = mqConfig;
-    applyMqAdminUrl(config, mqConfig.adminUrl);
+    config.driver_profile = mqConfig.systemKind === "kafka" ? "kafka" : "pulsar";
+    config.driver_label = mqConfig.systemKind === "kafka" ? "Apache Kafka" : "Apache Pulsar";
+    if (mqConfig.systemKind === "kafka") {
+      const extra = mqExtraRecord(mqConfig);
+      applyMqKafkaBootstrapServers(config, mqExtraString(extra, "bootstrapServers"), mqExtraString(extra, "securityProtocol"));
+    } else {
+      applyMqAdminUrl(config, mqConfig.adminUrl);
+    }
     config.username = "";
     config.password = "";
     config.database = undefined;
@@ -3261,21 +3432,51 @@ function openExternalUrl(url: string) {
                 <!-- Message Queue: admin URL and auth -->
                 <template v-else-if="form.db_type === 'mq'">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">Admin URL</Label>
-                    <Input v-model="mqAdminUrl" class="col-span-3" placeholder="http://127.0.0.1:8080" />
-                  </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">System</Label>
-                    <div class="col-span-3 h-9 rounded-md border border-input bg-muted px-3 py-2 text-sm text-muted-foreground">Apache Pulsar</div>
+                    <Select v-model="mqSystemKind">
+                      <SelectTrigger class="col-span-3 h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem v-for="option in mqSystemOptions" :key="option.value" :value="option.value">
+                          {{ option.label }}
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
+                  <template v-if="mqSystemKind === 'kafka'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Bootstrap Servers</Label>
+                      <Input v-model="mqKafkaBootstrapServers" class="col-span-3" placeholder="127.0.0.1:9092" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Security</Label>
+                      <Select v-model="mqKafkaSecurityProtocol">
+                        <SelectTrigger class="col-span-3 h-9">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem v-for="option in mqKafkaSecurityProtocolOptions" :key="option.value" :value="option.value">
+                            {{ option.label }}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Admin URL</Label>
+                      <Input v-model="mqAdminUrl" class="col-span-3" placeholder="http://127.0.0.1:8080" />
+                    </div>
+                  </template>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">Auth</Label>
                     <div class="col-span-3 flex flex-wrap gap-2">
                       <Button size="sm" :variant="mqAuthKind === 'none' ? 'default' : 'outline'" @click="mqAuthKind = 'none'">None</Button>
-                      <Button size="sm" :variant="mqAuthKind === 'token' ? 'default' : 'outline'" @click="mqAuthKind = 'token'">Token</Button>
+                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'token' ? 'default' : 'outline'" @click="mqAuthKind = 'token'">Token</Button>
                       <Button size="sm" :variant="mqAuthKind === 'basic' ? 'default' : 'outline'" @click="mqAuthKind = 'basic'">Basic</Button>
-                      <Button size="sm" :variant="mqAuthKind === 'apiKey' ? 'default' : 'outline'" @click="mqAuthKind = 'apiKey'">API Key</Button>
-                      <Button size="sm" :variant="mqAuthKind === 'oauth2' ? 'default' : 'outline'" @click="mqAuthKind = 'oauth2'">OAuth2</Button>
+                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'apiKey' ? 'default' : 'outline'" @click="mqAuthKind = 'apiKey'">API Key</Button>
+                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'oauth2' ? 'default' : 'outline'" @click="mqAuthKind = 'oauth2'">OAuth2</Button>
                     </div>
                   </div>
                   <template v-if="mqAuthKind === 'token'">
@@ -3292,6 +3493,19 @@ function openExternalUrl(url: string) {
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
                       <Input v-model="mqBasicPassword" type="password" class="col-span-3" />
+                    </div>
+                    <div v-if="mqSystemKind === 'kafka'" class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">SASL Mechanism</Label>
+                      <Select v-model="mqKafkaSaslMechanism">
+                        <SelectTrigger class="col-span-3 h-9">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem v-for="option in mqKafkaSaslMechanismOptions" :key="option.value" :value="option.value">
+                            {{ option.label }}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
                     </div>
                   </template>
                   <template v-else-if="mqAuthKind === 'apiKey'">
@@ -3333,7 +3547,7 @@ function openExternalUrl(url: string) {
                       <span class="text-xs text-muted-foreground">Skip certificate verification</span>
                     </label>
                   </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="mqSystemKind !== 'kafka'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">Pinned Version</Label>
                     <Select v-model="mqPinnedVersion">
                       <SelectTrigger class="col-span-3 h-9">
@@ -3349,7 +3563,7 @@ function openExternalUrl(url: string) {
                       </SelectContent>
                     </Select>
                   </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="mqSystemKind !== 'kafka'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">Broker Token 签发</Label>
                     <Select v-model="mqTokenSigningMode">
                       <SelectTrigger class="col-span-3 h-9">
@@ -3362,7 +3576,7 @@ function openExternalUrl(url: string) {
                       </SelectContent>
                     </Select>
                   </div>
-                  <div v-if="mqTokenSigningMode !== 'none'" class="grid grid-cols-4 items-start gap-4">
+                  <div v-if="mqSystemKind !== 'kafka' && mqTokenSigningMode !== 'none'" class="grid grid-cols-4 items-start gap-4">
                     <Label class="pt-2 text-right">签发密钥</Label>
                     <textarea
                       v-model="mqTokenSigningKey"
@@ -3370,7 +3584,7 @@ function openExternalUrl(url: string) {
                       :placeholder="mqTokenSigningMode === 'hs256' ? 'Broker SECRET' : '-----BEGIN PRIVATE KEY-----'"
                     />
                   </div>
-                  <div v-if="mqTokenSigningMode !== 'none'" class="grid grid-cols-4 items-start gap-4">
+                  <div v-if="mqSystemKind !== 'kafka' && mqTokenSigningMode !== 'none'" class="grid grid-cols-4 items-start gap-4">
                     <span />
                     <p class="col-span-3 m-0 text-xs leading-5 text-muted-foreground">按 Broker 的 jwt.broker.token.mode 选择：SECRET 使用 HS256，PRIVATE 使用 RS256。密钥会走连接 secret 存储。</p>
                   </div>
@@ -4119,6 +4333,18 @@ function openExternalUrl(url: string) {
                     <span class="text-xs text-muted-foreground">{{ t("connection.readOnlyHint") }}</span>
                   </label>
                 </div>
+                <div v-show="form.db_type === 'sqlserver'" class="grid grid-cols-4 items-start gap-4">
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.sqlServerLegacyUnencryptedMode") }}</Label>
+                  <div class="col-span-3 flex flex-col gap-1">
+                    <label class="flex h-5 cursor-pointer items-center gap-2">
+                      <input type="checkbox" v-model="sqlServerLegacyUnencryptedModeEnabled" class="mr-0" />
+                      <span class="text-xs text-foreground">{{ t("connection.sqlServerLegacyUnencryptedModeEnable") }}</span>
+                    </label>
+                    <p class="m-0 whitespace-pre-line text-xs leading-5 text-muted-foreground">
+                      {{ t("connection.sqlServerLegacyUnencryptedModeHint") }}
+                    </p>
+                  </div>
+                </div>
                 <div v-show="form.db_type === 'redis'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("settings.redisScanPageSize") }}</Label>
                   <div class="col-span-3 flex flex-col gap-1">
@@ -4140,7 +4366,7 @@ function openExternalUrl(url: string) {
 
             <TabsContent v-if="canUseTransportLayers" value="transport" class="m-0">
               <div class="connection-form-body grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
-                <div class="grid grid-cols-4 items-start gap-4">
+                <div class="connection-label-wide-grid grid grid-cols-4 items-start gap-4">
                   <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.sshHops") }}</Label>
                   <div class="col-span-3 grid gap-3">
                     <div class="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
@@ -4450,5 +4676,9 @@ function openExternalUrl(url: string) {
 .connection-dialog-content[data-wide="true"] .connection-form-body {
   width: min(100%, 36rem);
   margin-inline: auto;
+}
+
+.connection-dialog-content .grid.grid-cols-4.connection-label-wide-grid {
+  grid-template-columns: 7.75rem repeat(3, minmax(0, 1fr));
 }
 </style>

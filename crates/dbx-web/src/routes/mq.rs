@@ -698,6 +698,21 @@ pub async fn get_backlog(
     Ok(Json(result))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClusterInfoReq {
+    connection_id: String,
+}
+
+pub async fn get_cluster_info(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<ClusterInfoReq>,
+) -> Result<Json<dbx_core::mq::ClusterInfo>, AppError> {
+    let result =
+        dbx_core::mq::service::mq_get_cluster_info_core(&state.app, &req.connection_id).await.map_err(AppError)?;
+    Ok(Json(result))
+}
+
 pub async fn raw_request(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RawRequestReq>,
@@ -707,5 +722,23 @@ pub async fn raw_request(
     }
     let result =
         dbx_core::mq::service::mq_raw_request_core(&state.app, &req.connection_id, req.req).await.map_err(AppError)?;
+    Ok(Json(result))
+}
+
+// ---- Message production ----
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SendMessageReq {
+    connection_id: String,
+    req: dbx_core::mq::SendMessageRequest,
+}
+
+pub async fn send_message(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<SendMessageReq>,
+) -> Result<Json<dbx_core::mq::SendMessageResponse>, AppError> {
+    let result =
+        dbx_core::mq::service::mq_send_message_core(&state.app, &req.connection_id, req.req).await.map_err(AppError)?;
     Ok(Json(result))
 }

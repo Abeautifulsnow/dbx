@@ -1,6 +1,6 @@
 use mongodb::{
     bson::{doc, oid::ObjectId, Bson, DateTime, Document},
-    options::ClientOptions,
+    options::{ClientOptions, IndexOptions},
     Client, IndexModel,
 };
 use serde::{Deserialize, Serialize};
@@ -280,6 +280,36 @@ pub async fn aggregate_documents(
         documents.truncate(max_rows);
     }
     Ok(MongoDocumentResult { documents, total })
+}
+
+pub async fn create_index(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    keys_json: &str,
+    options_json: Option<&str>,
+) -> Result<String, String> {
+    let keys_value: serde_json::Value =
+        serde_json::from_str(keys_json).map_err(|e| format!("Invalid index keys JSON: {e}"))?;
+    let keys = json_object_to_document(&keys_value).map_err(|e| format!("Invalid index keys: {e}"))?;
+    if keys.is_empty() {
+        return Err("Index keys are required".to_string());
+    }
+
+    let options = match options_json.map(str::trim).filter(|json| !json.is_empty()) {
+        Some(json) => {
+            let value: serde_json::Value =
+                serde_json::from_str(json).map_err(|e| format!("Invalid index options JSON: {e}"))?;
+            let doc = json_object_to_document(&value).map_err(|e| format!("Invalid index options: {e}"))?;
+            Some(mongodb::bson::from_document::<IndexOptions>(doc).map_err(|e| format!("Invalid index options: {e}"))?)
+        }
+        None => None,
+    };
+
+    let col = client.database(database).collection::<Document>(collection);
+    let result =
+        col.create_index(IndexModel::builder().keys(keys).options(options).build()).await.map_err(|e| e.to_string())?;
+    Ok(result.index_name)
 }
 
 pub async fn insert_document(
@@ -689,7 +719,6 @@ fn expand_object_id_string_array(items: &[serde_json::Value]) -> Bson {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mongodb::options::IndexOptions;
 
     #[test]
     fn multi_seed_uri_removes_direct_connection_true_before_driver_parse() {

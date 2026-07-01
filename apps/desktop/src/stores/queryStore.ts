@@ -12,6 +12,7 @@ import { restoreOpenTabsState, serializeOpenTabs } from "@/lib/openTabsPersisten
 import {
   evaluateMongoAggregateSafety,
   mongoCountToQueryResult,
+  mongoCreateIndexToQueryResult,
   mongoDocumentsToQueryResult,
   mongoIndexesToQueryResult,
   mongoUseToQueryResult,
@@ -34,7 +35,7 @@ import { canUseKeylessRowPredicate, editableRowIdentifierColumns } from "@/lib/t
 import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/tableDataExport";
 import { tableMetaForDataTab } from "@/lib/tableDataTabMeta";
 import { quoteTableIdentifier } from "@/lib/tableSelectSql";
-import { connectionUsesDatabaseObjectTreeMode, connectionUsesSchemaExecutionContext, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
+import { connectionUsesDatabaseObjectTreeMode, connectionUsesSchemaExecutionContext, effectiveDatabaseTypeForConnection, metadataSchemaForConnection } from "@/lib/jdbcDialect";
 import { queryTimeoutSecsForConnection } from "@/lib/queryTimeout";
 import { sortDataGridRows, type DataGridSortDirection } from "@/lib/dataGridSort";
 import { normalizeResultPageSize } from "@/lib/paginationPageSize";
@@ -684,10 +685,11 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
-  function openMqAdmin(connectionId: string, target?: { tenant?: string }) {
+  function openMqAdmin(connectionId: string, target?: { tenant?: string; initialTab?: QueryTab["mqInitialTab"] }) {
     const existing = tabs.value.find((tab) => tab.mode === "mq" && tab.connectionId === connectionId);
     if (existing) {
       if (target?.tenant) existing.mqTenant = target.tenant;
+      if (target?.initialTab) existing.mqInitialTab = target.initialTab;
       activeTabId.value = existing.id;
       return existing.id;
     }
@@ -705,6 +707,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "mq",
       mqTenant: target?.tenant,
+      mqInitialTab: target?.initialTab,
     };
     tabs.value.push(tab);
     activeTabId.value = id;
@@ -913,6 +916,7 @@ export const useQueryStore = defineStore("query", () => {
       explainExecutionId: undefined,
       mode: original.mode,
       mqTenant: original.mqTenant,
+      mqInitialTab: original.mqInitialTab,
       nacosNamespace: original.nacosNamespace,
       nacosNamespaceName: original.nacosNamespaceName,
       structureTableName: original.structureTableName,
@@ -982,6 +986,10 @@ export const useQueryStore = defineStore("query", () => {
 
   function releaseDatabaseTabs(connectionId: string, database: string) {
     releaseTabsWhere((tab) => tab.connectionId === connectionId && tab.database === database);
+  }
+
+  function isDatabaseOpen(connectionId: string, database: string) {
+    return tabs.value.some((tab) => tab.connectionId === connectionId && tab.database === database);
   }
 
   function updateSql(id: string, sql: string) {
@@ -1326,7 +1334,8 @@ export const useQueryStore = defineStore("query", () => {
       if (dbType === "postgres" || dbType === "kwdb") schema = "public";
       else schema = "";
     }
-    const metadataSchema = normalizeOracleLikeMetadataIdentifier(dbType, schema || undefined, analysis.schema ? analysis.schemaQuoted : false) || "";
+    const resolvedSchema = metadataSchemaForConnection(conn, tab.database, schema || undefined);
+    const metadataSchema = normalizeOracleLikeMetadataIdentifier(dbType, resolvedSchema || undefined, analysis.schema ? analysis.schemaQuoted : false) || "";
     const metadataTableName = normalizeOracleLikeMetadataIdentifier(dbType, analysis.tableName, analysis.tableNameQuoted)!;
     const metadataAnalysis = normalizeOracleLikeQueryAnalysis(dbType, analysis, metadataSchema || undefined, metadataTableName);
 
@@ -1793,6 +1802,29 @@ export const useQueryStore = defineStore("query", () => {
         } else if (mongoWrite.kind === "update") {
           const result = await api.mongoUpdateDocuments(tab.connectionId, tab.database, mongoWrite.collection, mongoWrite.filter, mongoWrite.update, mongoWrite.many);
           affectedRows = result.affected_rows;
+        } else if (mongoWrite.kind === "createIndex") {
+          const result = await api.mongoCreateIndex(tab.connectionId, tab.database, mongoWrite.collection, mongoWrite.keys, mongoWrite.options);
+          console.info("[DBX][executeTabSql:mongo-write:done]", {
+            traceId,
+            indexName: result.name,
+            elapsed: elapsed(),
+          });
+          const current = tabs.value.find((t) => t.id === id);
+          if (current?.executionId === executionId) {
+            current.results = undefined;
+            current.activeResultIndex = undefined;
+            current.result = markQueryResultRowsRaw(mongoCreateIndexToQueryResult(result.name, performance.now() - startedAt));
+            touchResult(current);
+            current.queryAnalysis = undefined;
+            current.querySourceColumns = undefined;
+            current.queryEditabilityReason = undefined;
+            current.mongoEditTarget = undefined;
+            current.tableMeta = undefined;
+            current.resultBaseSql = options?.resultBaseSql ?? sql;
+            current.resultSortedSql = options?.resultSortedSql;
+            syncDisplayedResultRun(current, options?.resultBaseSql ?? sql);
+          }
+          return;
         } else {
           const result = await api.mongoDeleteDocuments(tab.connectionId, tab.database, mongoWrite.collection, mongoWrite.filter, mongoWrite.many);
           affectedRows = result.affected_rows;
@@ -2518,6 +2550,7 @@ export const useQueryStore = defineStore("query", () => {
     closeDatabaseTabs,
     releaseConnectionTabs,
     releaseDatabaseTabs,
+    isDatabaseOpen,
     updateSql,
     updateEditorViewport,
     updateEditorSelection,

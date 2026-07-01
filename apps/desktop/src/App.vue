@@ -12,6 +12,7 @@ import ContentArea from "@/components/layout/ContentArea.vue";
 import AppDialogs from "@/components/layout/AppDialogs.vue";
 import WelcomeScreen from "@/components/layout/WelcomeScreen.vue";
 import DdlViewDialog from "@/components/objects/DdlViewDialog.vue";
+import type { ConfigTab } from "@/components/connection/ConnectionDialog.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -58,9 +59,12 @@ import {
   isResetZoomShortcut,
   isRefreshDataShortcut,
   isSaveShortcut,
+  isSwitchToNextTabShortcut,
+  isSwitchToPreviousTabShortcut,
   isToggleSidebarShortcut,
   isZoomInShortcut,
   isZoomOutShortcut,
+  switchToTabIndexFromShortcut,
 } from "@/lib/keyboardShortcuts";
 import { isPreviewTab } from "@/lib/tabPresentation";
 import { supportsSqlFileExecution } from "@/lib/databaseCapabilities";
@@ -112,6 +116,7 @@ const setupRequired = ref(false);
 
 const showConnectionDialog = ref(false);
 const connectionDialogPrefill = ref<ConnectionDeepLinkDraft | null>(null);
+const connectionDialogInitialTab = ref<ConfigTab | undefined>(undefined);
 const showSettingsDialog = ref(false);
 const settingsInitialTab = ref("editor");
 const settingsInitialSection = ref<string | undefined>(undefined);
@@ -795,7 +800,17 @@ async function openPendingConnectionLinks() {
 
 function setConnectionDialogOpen(value: boolean) {
   showConnectionDialog.value = value;
-  if (!value) connectionDialogPrefill.value = null;
+  if (!value) {
+    connectionDialogPrefill.value = null;
+    connectionDialogInitialTab.value = undefined;
+  }
+}
+
+function openConnectionSettings(connectionId: string, initialTab: ConfigTab = "connection") {
+  if (!connectionStore.getConfig(connectionId)) return;
+  connectionDialogInitialTab.value = initialTab;
+  connectionStore.startEditing(connectionId);
+  showConnectionDialog.value = true;
 }
 
 async function newQuery() {
@@ -1161,10 +1176,37 @@ async function handleQuickOpenSelect(item: any) {
   }
 }
 
+function dispatchBeforeTabSwitch(tabId: string) {
+  if (tabId === queryStore.activeTabId) return;
+  window.dispatchEvent(new CustomEvent("dbx:before-tab-switch", { detail: { tabId, fromTabId: queryStore.activeTabId } }));
+}
+
+function activateQueryTab(tabId: string): boolean {
+  if (!queryStore.tabs.some((tab) => tab.id === tabId)) return false;
+  dispatchBeforeTabSwitch(tabId);
+  queryStore.activeTabId = tabId;
+  driverStoreActive.value = false;
+  return true;
+}
+
+function activateTabByIndex(index: number): boolean {
+  const tab = queryStore.tabs[index];
+  return tab ? activateQueryTab(tab.id) : false;
+}
+
+function activateAdjacentTab(direction: -1 | 1): boolean {
+  const count = queryStore.tabs.length;
+  if (count < 2) return false;
+  const currentIndex = queryStore.tabs.findIndex((tab) => tab.id === queryStore.activeTabId);
+  const nextIndex = currentIndex < 0 ? (direction > 0 ? 0 : count - 1) : (currentIndex + direction + count) % count;
+  return activateTabByIndex(nextIndex);
+}
+
 function handleKeydown(e: KeyboardEvent) {
   if (e.defaultPrevented) return;
 
   const shortcuts = settingsStore.editorSettings.shortcuts;
+  const switchTabIndex = switchToTabIndexFromShortcut(e, shortcuts);
 
   if (isOpenSettingsShortcut(e, shortcuts)) {
     e.preventDefault();
@@ -1202,6 +1244,27 @@ function handleKeydown(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
     setSidebarOpen(!sidebarOpen.value);
+    return;
+  }
+  if (switchTabIndex != null) {
+    if (activateTabByIndex(switchTabIndex)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    return;
+  }
+  if (isSwitchToPreviousTabShortcut(e, shortcuts)) {
+    if (activateAdjacentTab(-1)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    return;
+  }
+  if (isSwitchToNextTabShortcut(e, shortcuts)) {
+    if (activateAdjacentTab(1)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     return;
   }
   if (isCloseTabShortcut(e, shortcuts)) {
@@ -1598,6 +1661,7 @@ onUnmounted(() => {
                     "
                     @structure-editor-close="activeTab && queryStore.closeTab(activeTab.id)"
                     @open-settings="openSettings"
+                    @open-connection-settings="openConnectionSettings"
                   />
                 </KeepAlive>
               </div>
@@ -1643,6 +1707,7 @@ onUnmounted(() => {
         <AppDialogs
           :show-connection-dialog="showConnectionDialog"
           :connection-prefill="connectionDialogPrefill"
+          :connection-initial-tab="connectionDialogInitialTab"
           :show-settings-dialog="showSettingsDialog"
           :settings-initial-tab="settingsInitialTab"
           :settings-initial-section="settingsInitialSection"

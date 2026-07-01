@@ -36,7 +36,7 @@ pub async fn mongo_list_collections(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
     database: String,
-) -> Result<Vec<dbx_core::db::vector_driver::CollectionInfo>, String> {
+) -> Result<Vec<dbx_core::document_ops::CollectionInfo>, String> {
     dbx_core::mongo_ops::mongo_list_collections_core(&state, &connection_id, &database).await
 }
 
@@ -85,54 +85,17 @@ pub async fn mongo_find_documents(
     sort: Option<String>,
     execution_id: Option<String>,
 ) -> Result<MongoDocumentResult, String> {
-    let app = state.inner().clone();
-    run_cancellable(
-        &app,
+    crate::commands::document_cmd::document_find_documents(
+        state,
+        connection_id,
+        database,
+        collection,
+        skip,
+        limit,
+        filter,
+        projection,
+        sort,
         execution_id,
-        dbx_core::mongo_ops::mongo_find_documents_core(
-            &app,
-            &connection_id,
-            &database,
-            &collection,
-            skip,
-            limit,
-            filter.as_deref(),
-            projection.as_deref(),
-            sort.as_deref(),
-        ),
-    )
-    .await
-}
-
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub async fn document_find_documents(
-    state: State<'_, Arc<AppState>>,
-    connection_id: String,
-    database: String,
-    collection: String,
-    skip: u64,
-    limit: i64,
-    filter: Option<String>,
-    projection: Option<String>,
-    sort: Option<String>,
-    execution_id: Option<String>,
-) -> Result<MongoDocumentResult, String> {
-    let app = state.inner().clone();
-    run_cancellable(
-        &app,
-        execution_id,
-        dbx_core::mongo_ops::document_find_documents_core(
-            &app,
-            &connection_id,
-            &database,
-            &collection,
-            skip,
-            limit,
-            filter.as_deref(),
-            projection.as_deref(),
-            sort.as_deref(),
-        ),
     )
     .await
 }
@@ -176,6 +139,28 @@ pub async fn mongo_aggregate_documents(
 }
 
 #[tauri::command]
+pub async fn mongo_create_index(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    collection: String,
+    keys_json: String,
+    options_json: Option<String>,
+) -> Result<serde_json::Value, String> {
+    ensure_connection_writable(&state, &connection_id, "Create index").await?;
+    let name = dbx_core::mongo_ops::mongo_create_index_core(
+        &state,
+        &connection_id,
+        &database,
+        &collection,
+        &keys_json,
+        options_json.as_deref(),
+    )
+    .await?;
+    Ok(serde_json::json!({ "name": name }))
+}
+
+#[tauri::command]
 pub async fn mongo_insert_document(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -183,8 +168,7 @@ pub async fn mongo_insert_document(
     collection: String,
     doc_json: String,
 ) -> Result<String, String> {
-    ensure_connection_writable(&state, &connection_id, "Insert").await?;
-    dbx_core::mongo_ops::mongo_insert_document_core(&state, &connection_id, &database, &collection, &doc_json).await
+    crate::commands::document_cmd::document_insert_document(state, connection_id, database, collection, doc_json).await
 }
 
 #[tauri::command]
@@ -207,10 +191,18 @@ pub async fn mongo_update_document(
     collection: String,
     id: String,
     doc_json: String,
+    routing: Option<String>,
 ) -> Result<u64, String> {
-    ensure_connection_writable(&state, &connection_id, "Update").await?;
-    dbx_core::mongo_ops::mongo_update_document_core(&state, &connection_id, &database, &collection, &id, &doc_json)
-        .await
+    crate::commands::document_cmd::document_update_document(
+        state,
+        connection_id,
+        database,
+        collection,
+        id,
+        doc_json,
+        routing,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -243,9 +235,10 @@ pub async fn mongo_delete_document(
     database: String,
     collection: String,
     id: String,
+    routing: Option<String>,
 ) -> Result<u64, String> {
-    ensure_connection_writable(&state, &connection_id, "Delete").await?;
-    dbx_core::mongo_ops::mongo_delete_document_core(&state, &connection_id, &database, &collection, &id).await
+    crate::commands::document_cmd::document_delete_document(state, connection_id, database, collection, id, routing)
+        .await
 }
 
 #[tauri::command]

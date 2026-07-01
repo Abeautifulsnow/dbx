@@ -31,7 +31,11 @@ export interface MongoVersionCommand {
   kind: "version";
 }
 
-export type MongoWriteCommand = { kind: "insert"; collection: string; docsJson: string } | { kind: "update"; collection: string; filter: string; update: string; many: boolean } | { kind: "delete"; collection: string; filter: string; many: boolean };
+export type MongoWriteCommand =
+  | { kind: "insert"; collection: string; docsJson: string }
+  | { kind: "update"; collection: string; filter: string; update: string; many: boolean }
+  | { kind: "delete"; collection: string; filter: string; many: boolean }
+  | { kind: "createIndex"; collection: string; keys: string; options?: string };
 
 export interface MongoAggregateSafetyOptions {
   allowWrites?: boolean;
@@ -201,6 +205,21 @@ export function parseMongoWriteCommand(input: string): MongoWriteCommand | null 
     return { kind: "delete", collection: target.collection, filter, many: method === "deleteMany" };
   }
 
+  const createIndex = parseCollectionMethodTarget(source, "createIndex");
+  if (createIndex) {
+    const args = parseMethodArgs(source, createIndex.methodCallIndex);
+    if (!args || args.length < 1 || args.length > 2) return null;
+    const keys = normalizeJsonArgument(args[0]);
+    if (!keys) return null;
+    let options: string | undefined;
+    if (args[1]?.trim()) {
+      const parsedOptions = normalizeJsonArgument(args[1]);
+      if (!parsedOptions) return null;
+      options = parsedOptions;
+    }
+    return { kind: "createIndex", collection: createIndex.collection, keys, ...(options ? { options } : {}) };
+  }
+
   return null;
 }
 
@@ -278,6 +297,15 @@ export function mongoWriteToQueryResult(affectedRows: number, executionTimeMs: n
     columns: [],
     rows: [],
     affected_rows: affectedRows,
+    execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
+  };
+}
+
+export function mongoCreateIndexToQueryResult(name: string, executionTimeMs: number): QueryResult {
+  return {
+    columns: ["name"],
+    rows: [[name]],
+    affected_rows: 1,
     execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
   };
 }

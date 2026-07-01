@@ -210,10 +210,13 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
     if (write) {
       const safety = evaluateMongoWriteSafety(write, sqlSafetyFromEnv());
       if (!safety.allowed) throw new Error(safety.reason);
-      const affected = await executeMongoWrite(config, write);
-      return { columns: [], rows: [], row_count: affected };
+      const result = await executeMongoWrite(config, write);
+      if (write.kind === "createIndex") {
+        return { columns: ["name"], rows: [{ name: result.indexName ?? "" }], row_count: 1 };
+      }
+      return { columns: [], rows: [], row_count: result.affectedRows };
     }
-    throw new Error("Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})");
+    throw new Error("Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.createIndex({...}), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})");
   }
   const res = await apiFetch("/api/query/execute", {
     method: "POST",
@@ -252,7 +255,10 @@ export async function executeRedisCommand(config: ConnectionConfig, db: number, 
   return (await res.json()) as RedisCommandResult;
 }
 
-async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCommand): Promise<number> {
+async function executeMongoWrite(
+  config: ConnectionConfig,
+  command: MongoWriteCommand,
+): Promise<{ affectedRows: number; indexName?: string }> {
   if (command.kind === "insert") {
     const res = await apiFetch("/api/mongo/insert-documents", {
       method: "POST",
@@ -264,7 +270,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
       }),
     });
     const result = (await res.json()) as { affected_rows: number };
-    return result.affected_rows;
+    return { affectedRows: result.affected_rows };
   }
   if (command.kind === "update") {
     const res = await apiFetch("/api/mongo/update-documents", {
@@ -279,7 +285,21 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
       }),
     });
     const result = (await res.json()) as { affected_rows: number };
-    return result.affected_rows;
+    return { affectedRows: result.affected_rows };
+  }
+  if (command.kind === "createIndex") {
+    const res = await apiFetch("/api/mongo/create-index", {
+      method: "POST",
+      body: JSON.stringify({
+        connectionId: config.id,
+        database: config.database || "",
+        collection: command.collection,
+        keysJson: command.keys,
+        optionsJson: command.options,
+      }),
+    });
+    const result = (await res.json()) as { name: string };
+    return { affectedRows: 1, indexName: result.name };
   }
   const res = await apiFetch("/api/mongo/delete-documents", {
     method: "POST",
@@ -292,5 +312,5 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
     }),
   });
   const result = (await res.json()) as { affected_rows: number };
-  return result.affected_rows;
+  return { affectedRows: result.affected_rows };
 }

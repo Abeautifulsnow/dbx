@@ -66,6 +66,7 @@ export interface AgentDriverInfo {
   installed: boolean;
   installed_version: string | null;
   update_available: boolean;
+  requires_java_runtime?: boolean;
   jre: string;
   jre_installed: boolean;
 }
@@ -1457,12 +1458,20 @@ export interface MongoDocumentResult {
   total: number;
 }
 
+export async function documentListDatabases(connectionId: string): Promise<string[]> {
+  return invoke("document_list_databases", { connectionId });
+}
+
 export async function mongoListDatabases(connectionId: string): Promise<string[]> {
-  return invoke("mongo_list_databases", { connectionId });
+  return documentListDatabases(connectionId);
+}
+
+export async function documentListCollections(connectionId: string, database: string): Promise<CollectionInfo[]> {
+  return invoke("document_list_collections", { connectionId, database });
 }
 
 export async function mongoListCollections(connectionId: string, database: string): Promise<CollectionInfo[]> {
-  return invoke("mongo_list_collections", { connectionId, database });
+  return documentListCollections(connectionId, database);
 }
 
 export async function mongoCreateDatabase(connectionId: string, database: string): Promise<void> {
@@ -1478,16 +1487,16 @@ export async function mongoDropCollection(connectionId: string, database: string
 }
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
-  const collections = await mongoListCollections(connectionId, "default");
+  const collections = await documentListCollections(connectionId, "default");
   return collections.map((c) => c.name);
 }
 
-export async function vectorListCollections(connectionId: string): Promise<CollectionInfo[]> {
-  return mongoListCollections(connectionId, "default");
+export async function vectorListCollections(connectionId: string, database?: string): Promise<CollectionInfo[]> {
+  return documentListCollections(connectionId, database || "default");
 }
 
 export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return invoke("mongo_find_documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
+  return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, executionId);
 }
 
 export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
@@ -1502,8 +1511,16 @@ export async function mongoAggregateDocuments(connectionId: string, database: st
   return invoke("mongo_aggregate_documents", { connectionId, database, collection, pipelineJson, maxRows, executionId });
 }
 
+export async function mongoCreateIndex(connectionId: string, database: string, collection: string, keysJson: string, optionsJson?: string): Promise<{ name: string }> {
+  return invoke("mongo_create_index", { connectionId, database, collection, keysJson, optionsJson });
+}
+
 export async function mongoInsertDocument(connectionId: string, database: string, collection: string, docJson: string): Promise<string> {
-  return invoke("mongo_insert_document", { connectionId, database, collection, docJson });
+  return documentInsertDocument(connectionId, database, collection, docJson);
+}
+
+export async function documentInsertDocument(connectionId: string, database: string, collection: string, docJson: string): Promise<string> {
+  return invoke("document_insert_document", { connectionId, database, collection, docJson });
 }
 
 export async function mongoInsertDocuments(connectionId: string, database: string, collection: string, docsJson: string): Promise<{ affected_rows: number }> {
@@ -1511,8 +1528,12 @@ export async function mongoInsertDocuments(connectionId: string, database: strin
   return { affected_rows: affectedRows };
 }
 
-export async function mongoUpdateDocument(connectionId: string, database: string, collection: string, id: string, docJson: string): Promise<number> {
-  return invoke("mongo_update_document", { connectionId, database, collection, id, docJson });
+export async function mongoUpdateDocument(connectionId: string, database: string, collection: string, id: string, docJson: string, routing?: string): Promise<number> {
+  return documentUpdateDocument(connectionId, database, collection, id, docJson, routing);
+}
+
+export async function documentUpdateDocument(connectionId: string, database: string, collection: string, id: string, docJson: string, routing?: string): Promise<number> {
+  return invoke("document_update_document", { connectionId, database, collection, id, docJson, routing });
 }
 
 export async function mongoUpdateDocuments(connectionId: string, database: string, collection: string, filterJson: string, updateJson: string, many: boolean): Promise<{ affected_rows: number }> {
@@ -1527,8 +1548,12 @@ export async function mongoUpdateDocuments(connectionId: string, database: strin
   return { affected_rows: affectedRows };
 }
 
-export async function mongoDeleteDocument(connectionId: string, database: string, collection: string, id: string): Promise<number> {
-  return invoke("mongo_delete_document", { connectionId, database, collection, id });
+export async function mongoDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string): Promise<number> {
+  return documentDeleteDocument(connectionId, database, collection, id, routing);
+}
+
+export async function documentDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string): Promise<number> {
+  return invoke("document_delete_document", { connectionId, database, collection, id, routing });
 }
 
 export async function mongoDeleteDocuments(connectionId: string, database: string, collection: string, filterJson: string, many: boolean): Promise<{ affected_rows: number }> {

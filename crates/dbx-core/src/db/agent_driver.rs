@@ -246,17 +246,19 @@ pub enum MongoAgentMethod {
     ServerVersion,
     InsertDocument,
     UpdateDocument,
+    UpdateDocuments,
     DeleteDocument,
 }
 
 impl MongoAgentMethod {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ListDatabases,
         Self::ListCollections,
         Self::FindDocuments,
         Self::ServerVersion,
         Self::InsertDocument,
         Self::UpdateDocument,
+        Self::UpdateDocuments,
         Self::DeleteDocument,
     ];
 
@@ -268,6 +270,7 @@ impl MongoAgentMethod {
             Self::ServerVersion => "server_version",
             Self::InsertDocument => "insert_document",
             Self::UpdateDocument => "update_document",
+            Self::UpdateDocuments => "update_documents",
             Self::DeleteDocument => "delete_document",
         }
     }
@@ -943,6 +946,13 @@ impl AgentDriverClient {
         params: Value,
     ) -> Result<T, String> {
         self.call_mongo_method(MongoAgentMethod::UpdateDocument, params).await
+    }
+
+    pub async fn mongo_update_documents<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::UpdateDocuments, params).await
     }
 
     pub async fn mongo_delete_document<T: DeserializeOwned + Send + 'static>(

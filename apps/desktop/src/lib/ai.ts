@@ -393,7 +393,7 @@ export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig
   // Vector databases: load collections instead of SQL tables
   if (isVectorDbType(databaseType)) {
     try {
-      const collections = await api.vectorListCollections(tab.connectionId);
+      const collections = await api.vectorListCollections(tab.connectionId, tab.database);
 
       // Find the currently opened collection (tab.sql is UUID for ChromaDB, name for others)
       const currentCollection = collections.find((c) => c.id === tab.sql || c.name === tab.sql);

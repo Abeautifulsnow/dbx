@@ -42,6 +42,7 @@ public final class AgentProtocol {
     public static final String MONGO_METHOD_SERVER_VERSION = "server_version";
     public static final String MONGO_METHOD_INSERT_DOCUMENT = "insert_document";
     public static final String MONGO_METHOD_UPDATE_DOCUMENT = "update_document";
+    public static final String MONGO_METHOD_UPDATE_DOCUMENTS = "update_documents";
     public static final String MONGO_METHOD_DELETE_DOCUMENT = "delete_document";
 
     public static final String KV_METHOD_LIST_PREFIX = "kv_list_prefix";
@@ -117,6 +118,7 @@ public final class AgentProtocol {
         MONGO_METHOD_SERVER_VERSION,
         MONGO_METHOD_INSERT_DOCUMENT,
         MONGO_METHOD_UPDATE_DOCUMENT,
+        MONGO_METHOD_UPDATE_DOCUMENTS,
         MONGO_METHOD_DELETE_DOCUMENT
     ));
 

@@ -10,7 +10,8 @@ import SqlExecutionTargetPicker from "./SqlExecutionTargetPicker.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { copyToClipboard } from "@/lib/clipboard";
 import { resolveExecutableSql, type SqlExecutionSnapshot, type SqlExecutionOverride, type SqlExecutionCandidate } from "@/lib/sqlExecutionTarget";
-import { buildExecutionCandidates, executableStatementRanges, hasMultipleExecutionTargets, supportsExecutionTargetPicker } from "@/lib/sqlStatementRanges";
+import { buildExecutionCandidates, hasMultipleExecutionTargets, supportsExecutionTargetPicker, type SqlTextRange } from "@/lib/sqlStatementRanges";
+import { executableStatementRangeCacheForDoc, executableStatementRangeStartingAt as executableStatementRangeStartingAtLine, type ExecutableStatementRangeCache } from "@/lib/executableStatementRangeCache";
 import { formatSqlText, type SqlFormatDialect } from "@/lib/sqlFormatter";
 import { formatMongoShellText } from "@/lib/mongoFormatter";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -43,7 +44,7 @@ import { isSchemaAware, isSingleDatabase } from "@/lib/databaseFeatureSupport";
 import { usesLocalOnlyEditorCompletionMetadata, usesOnDemandOnlyEditorColumnMetadata } from "@/lib/completionMetadataPolicy";
 import { qualifiedTableNameAtSqlPosition } from "@/lib/queryCursorTableTarget";
 import * as api from "@/lib/api";
-import { areSqlSemanticDiagnosticsEqual, buildSqlParserErrorDiagnostic, buildSqlSemanticDiagnostics, isSqlSemanticDiagnosticInputContext, shouldRunSqlSemanticDiagnostics, tableReferenceKey, type SqlSemanticDiagnostic } from "@/lib/sqlSemanticDiagnostics";
+import { areSqlSemanticDiagnosticsEqual, buildSqlParserErrorDiagnostic, buildSqlSemanticDiagnostics, isSqlSemanticDiagnosticInputContext, shouldRunSqlSemanticDiagnostics, sqlSemanticDiagnosticRangesForViewport, tableReferenceKey, type SqlSemanticDiagnostic } from "@/lib/sqlSemanticDiagnostics";
 import { buildRedisSyntaxDiagnostics, shouldRunRedisDiagnostics } from "@/lib/redisSyntaxDiagnostics";
 import { buildRedisCompletionItemsFromContext, getRedisCompletionContext, getRedisCompletionResultValidFor, shouldAutoOpenRedisCompletion, takesKeyArgument, type RedisCompletionItem } from "@/lib/redisCompletion";
 import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionItem, SqlCompletionObject, SqlCompletionTable } from "@/lib/sqlCompletion";
@@ -208,10 +209,12 @@ let codeMirrorIndentUnit: typeof import("@codemirror/language").indentUnit | nul
 let semanticDiagnostics: SqlSemanticDiagnostic[] = [];
 let semanticDiagnosticTimer: ReturnType<typeof setTimeout> | null = null;
 let semanticDiagnosticRunId = 0;
+let pendingSemanticDiagnosticPreserveOutsideRanges = false;
 let editorIsActive = true;
 let tableReferenceDropListenerRegistered = false;
 let imeCompositionActive = false;
 let pendingImeModelEmit = false;
+let executableStatementRangeCache: ExecutableStatementRangeCache | null = null;
 const tableNavigationHoverClass = "query-editor--table-navigation-hover";
 
 function editorThemeAppearance() {
@@ -332,15 +335,20 @@ function handleTab(view: EditorViewType): boolean {
   return true;
 }
 
-function requestExecute(options: { forceCurrent?: boolean } = {}) {
+interface RequestExecuteOptions {
+  forceCurrent?: boolean;
+  ignoreSelection?: boolean;
+}
+
+function requestExecute(options: RequestExecuteOptions = {}) {
   const currentView = view.value;
   if (!currentView) return false;
   return requestExecuteFromView(currentView, currentView.state.selection.main.head, options);
 }
 
-function requestExecuteFromView(currentView: EditorViewType, cursorPos: number, options: { forceCurrent?: boolean } = {}) {
+function requestExecuteFromView(currentView: EditorViewType, cursorPos: number, options: RequestExecuteOptions = {}) {
   const selection = currentView.state.selection.main;
-  if (!selection.empty) {
+  if (!options.ignoreSelection && !selection.empty) {
     // Has manual selection → execute directly, skip picker.
     emit("execute", sqlExecutionSnapshotFromView(currentView));
     return true;
@@ -511,7 +519,8 @@ function openTableDdlFromContextMenu() {
 }
 
 function executableStatementRangeStartingAt(currentView: EditorViewType, lineFrom: number) {
-  return executableStatementRanges(currentView.state.doc.toString(), props.databaseType).find((range) => range.from === lineFrom) ?? null;
+  executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, currentView.state.doc, props.databaseType);
+  return executableStatementRangeStartingAtLine(executableStatementRangeCache, lineFrom);
 }
 
 function executeSqlStatementFromGutter(currentView: EditorViewType, line: { from: number; to: number }, event: Event): boolean {
@@ -520,7 +529,7 @@ function executeSqlStatementFromGutter(currentView: EditorViewType, line: { from
   if (!statementRange) return false;
   event.preventDefault();
   event.stopPropagation();
-  emit("execute", statementRange.sql);
+  requestExecuteFromView(currentView, line.from, { ignoreSelection: true });
   currentView.focus();
   return true;
 }
@@ -922,6 +931,65 @@ function setSemanticDiagnostics(next: SqlSemanticDiagnostic[]) {
   reconfigureDiagnostics();
 }
 
+function clearScheduledSemanticDiagnostics() {
+  semanticDiagnosticRunId++;
+  if (semanticDiagnosticTimer) clearTimeout(semanticDiagnosticTimer);
+  semanticDiagnosticTimer = null;
+  pendingSemanticDiagnosticPreserveOutsideRanges = false;
+}
+
+function shouldSkipSqlSemanticDiagnostics() {
+  return props.databaseType !== "redis" && !settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled;
+}
+
+function rangesOverlap(left: { from: number; to: number }, right: { from: number; to: number }): boolean {
+  return left.from < right.to && right.from < left.to;
+}
+
+function sqlLineColumnAtOffset(sql: string, offset: number): { line: number; column: number } {
+  const safeOffset = Math.max(0, Math.min(offset, sql.length));
+  let line = 1;
+  let lineStart = 0;
+  for (let index = 0; index < safeOffset; index += 1) {
+    if (sql[index] === "\n") {
+      line += 1;
+      lineStart = index + 1;
+    }
+  }
+  return { line, column: safeOffset - lineStart + 1 };
+}
+
+function offsetSqlTextSpan(span: SqlTextSpan, rangeStart: { line: number; column: number }): SqlTextSpan {
+  const offsetLine = (line: number) => rangeStart.line + line - 1;
+  const offsetColumn = (line: number, column: number) => (line === 1 ? rangeStart.column + column - 1 : column);
+  return {
+    start_line: offsetLine(span.start_line),
+    start_column: offsetColumn(span.start_line, span.start_column),
+    end_line: offsetLine(span.end_line),
+    end_column: offsetColumn(span.end_line, span.end_column),
+  };
+}
+
+function offsetSqlSemanticDiagnostics(diagnostics: readonly SqlSemanticDiagnostic[], range: SqlTextRange, fullSql: string): SqlSemanticDiagnostic[] {
+  const rangeStart = sqlLineColumnAtOffset(fullSql, range.from);
+  return diagnostics.map((diagnostic) => ({
+    ...diagnostic,
+    span: offsetSqlTextSpan(diagnostic.span, rangeStart),
+  }));
+}
+
+function replaceSemanticDiagnosticsInRanges(next: SqlSemanticDiagnostic[], ranges: readonly SqlTextRange[], fullSql: string) {
+  const retained = semanticDiagnostics.filter((diagnostic) => {
+    const diagnosticRange = sqlTextSpanToRange(fullSql, diagnostic.span);
+    return !diagnosticRange || !ranges.some((range) => rangesOverlap(diagnosticRange, range));
+  });
+  setSemanticDiagnostics([...retained, ...next].sort(compareSqlSemanticDiagnostics));
+}
+
+function compareSqlSemanticDiagnostics(left: SqlSemanticDiagnostic, right: SqlSemanticDiagnostic): number {
+  return left.span.start_line - right.span.start_line || left.span.start_column - right.span.start_column || left.span.end_line - right.span.end_line || left.span.end_column - right.span.end_column || left.message.localeCompare(right.message);
+}
+
 async function enrichSemanticDiagnosticTables(tables: SqlTableReference[]): Promise<{ tables: SqlTableReference[]; missingTables: Set<string> }> {
   if (!props.connectionId || props.database == null) return { tables, missingTables: new Set() };
 
@@ -968,7 +1036,7 @@ async function ensureColumnsForSemanticDiagnostics(tables: SqlTableReference[]):
   return missingTables;
 }
 
-async function refreshSemanticDiagnostics() {
+async function refreshSemanticDiagnostics(options: { preserveOutsideRanges?: boolean } = {}) {
   const currentView = view.value;
   const runId = ++semanticDiagnosticRunId;
   if (!currentView || !props.connectionId || props.database == null) {
@@ -988,54 +1056,84 @@ async function refreshSemanticDiagnostics() {
   if (props.databaseType === "redis") {
     // Redis has no SQL semantics; run command-name / arity / quote / danger checks instead.
     if (!shouldRunRedisDiagnostics(sql, currentView.state.selection.main.head)) {
-      scheduleSemanticDiagnostics(900);
+      scheduleSemanticDiagnostics(900, { preserveOutsideRanges: options.preserveOutsideRanges });
       return;
     }
     setSemanticDiagnostics(buildRedisSyntaxDiagnostics(sql));
     return;
   }
+  if (shouldSkipSqlSemanticDiagnostics()) {
+    setSemanticDiagnostics([]);
+    return;
+  }
   if (!shouldRunSqlSemanticDiagnostics(sql, currentView.state.selection.main.head, { databaseType: props.databaseType })) {
-    scheduleSemanticDiagnostics(1200);
+    scheduleSemanticDiagnostics(1200, { preserveOutsideRanges: options.preserveOutsideRanges });
     return;
   }
   if (codeMirrorCompletionStatus?.(currentView.state) && isSqlSemanticDiagnosticInputContext(sql, currentView.state.selection.main.head, { databaseType: props.databaseType })) {
-    scheduleSemanticDiagnostics(900);
+    scheduleSemanticDiagnostics(900, { preserveOutsideRanges: options.preserveOutsideRanges });
     return;
   }
 
-  try {
-    const analysis = await api.analyzeSqlReferences(sql, props.formatDialect ?? props.dialect ?? "generic");
-    if (runId !== semanticDiagnosticRunId) return;
+  const visibleRanges = currentView.visibleRanges.length > 0 ? currentView.visibleRanges : [currentView.viewport];
+  const diagnosticRanges = sqlSemanticDiagnosticRangesForViewport(sql, visibleRanges, props.databaseType);
+  if (diagnosticRanges.length === 0) {
+    if (!options.preserveOutsideRanges) setSemanticDiagnostics([]);
+    return;
+  }
 
-    const { tables, missingTables } = await enrichSemanticDiagnosticTables(analysis.tables);
-    const columnMetadataMissingTables = await ensureColumnsForSemanticDiagnostics(tables);
-    for (const tableKey of columnMetadataMissingTables) missingTables.add(tableKey);
-    if (runId !== semanticDiagnosticRunId) return;
+  const nextDiagnostics: SqlSemanticDiagnostic[] = [];
+  for (const range of diagnosticRanges) {
+    try {
+      const analysis = await api.analyzeSqlReferences(range.sql, props.formatDialect ?? props.dialect ?? "generic");
+      if (runId !== semanticDiagnosticRunId) return;
 
-    const enrichedAnalysis: SqlReferenceAnalysis = { ...analysis, tables };
-    setSemanticDiagnostics(
-      buildSqlSemanticDiagnostics(enrichedAnalysis, {
-        tables: cachedTables,
-        columnsByTable: cachedColumnsByTable,
-        missingTables,
-        loadedColumnTables: loadedColumnsByTable,
-        sql,
-      }),
-    );
-  } catch (error) {
-    if (runId === semanticDiagnosticRunId) {
-      const diagnostic = buildSqlParserErrorDiagnostic(error, sql);
-      setSemanticDiagnostics(diagnostic ? [diagnostic] : []);
+      const { tables, missingTables } = await enrichSemanticDiagnosticTables(analysis.tables);
+      const columnMetadataMissingTables = await ensureColumnsForSemanticDiagnostics(tables);
+      for (const tableKey of columnMetadataMissingTables) missingTables.add(tableKey);
+      if (runId !== semanticDiagnosticRunId) return;
+
+      const enrichedAnalysis: SqlReferenceAnalysis = { ...analysis, tables };
+      nextDiagnostics.push(
+        ...offsetSqlSemanticDiagnostics(
+          buildSqlSemanticDiagnostics(enrichedAnalysis, {
+            tables: cachedTables,
+            columnsByTable: cachedColumnsByTable,
+            missingTables,
+            loadedColumnTables: loadedColumnsByTable,
+            sql: range.sql,
+          }),
+          range,
+          sql,
+        ),
+      );
+    } catch (error) {
+      if (runId !== semanticDiagnosticRunId) return;
+      const diagnostic = buildSqlParserErrorDiagnostic(error, range.sql);
+      if (diagnostic) nextDiagnostics.push(...offsetSqlSemanticDiagnostics([diagnostic], range, sql));
     }
+  }
+  if (options.preserveOutsideRanges) {
+    replaceSemanticDiagnosticsInRanges(nextDiagnostics, diagnosticRanges, sql);
+  } else {
+    setSemanticDiagnostics(nextDiagnostics.sort(compareSqlSemanticDiagnostics));
   }
 }
 
-function scheduleSemanticDiagnostics(delay = 500) {
+function scheduleSemanticDiagnostics(delay = 500, options: { preserveOutsideRanges?: boolean } = {}) {
   if (!editorIsActive) return;
+  if (shouldSkipSqlSemanticDiagnostics()) {
+    clearScheduledSemanticDiagnostics();
+    setSemanticDiagnostics([]);
+    return;
+  }
+  pendingSemanticDiagnosticPreserveOutsideRanges = !!options.preserveOutsideRanges;
   if (semanticDiagnosticTimer) clearTimeout(semanticDiagnosticTimer);
   semanticDiagnosticTimer = setTimeout(() => {
+    const preserveOutsideRanges = pendingSemanticDiagnosticPreserveOutsideRanges;
+    pendingSemanticDiagnosticPreserveOutsideRanges = false;
     semanticDiagnosticTimer = null;
-    void refreshSemanticDiagnostics();
+    void refreshSemanticDiagnostics({ preserveOutsideRanges });
   }, delay);
 }
 
@@ -1356,7 +1454,8 @@ async function provideSqlCompletions(currentState: import("@codemirror/state").E
       scheduleCompletionMetadataRefresh(completionContext);
       if (!explicit) return localResult;
     }
-    if (!explicit) {
+    const shouldResolveAsyncColumnCompletion = completionContext.suggestColumns && completionContext.referencedTables.length > 0 && completionContext.prefix.length > 0;
+    if (!explicit && !shouldResolveAsyncColumnCompletion) {
       scheduleCompletionMetadataRefresh(completionContext);
       return null;
     }
@@ -1979,25 +2078,18 @@ onMounted(async () => {
   const theme = await loadEditorTheme(initialSettings.theme, editorThemeAppearance(), getCurrentCustomThemeColors());
 
   class RunStatementGutterMarker extends GutterMarker {
-    constructor(private readonly isExecutable: boolean) {
-      super();
-    }
-
     toDOM() {
-      const marker = document.createElement(this.isExecutable ? "button" : "span");
-      marker.className = this.isExecutable ? "cm-run-statement-marker cm-run-statement-marker--active" : "cm-run-statement-marker";
-      if (this.isExecutable) {
-        marker.setAttribute("type", "button");
-        marker.setAttribute("aria-label", "Execute statement");
-      }
+      const marker = document.createElement("button");
+      marker.className = "cm-run-statement-marker cm-run-statement-marker--active";
+      marker.setAttribute("type", "button");
+      marker.setAttribute("aria-label", "Execute statement");
       marker.innerHTML =
         '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"></path></svg>';
       return marker;
     }
   }
 
-  const executableStatementMarker = new RunStatementGutterMarker(true);
-  const inactiveStatementMarker = new RunStatementGutterMarker(false);
+  const executableStatementMarker = new RunStatementGutterMarker();
 
   const activeLineHighlighter = ViewPlugin.fromClass(
     class {
@@ -2041,7 +2133,7 @@ onMounted(async () => {
       gutter({
         class: "cm-run-statement-gutter",
         lineMarker(currentView, line) {
-          return executableStatementRangeStartingAt(currentView, line.from) ? executableStatementMarker : inactiveStatementMarker;
+          return executableStatementRangeStartingAt(currentView, line.from) ? executableStatementMarker : null;
         },
         domEventHandlers: {
           mousedown: executeSqlStatementFromGutter,
@@ -2445,14 +2537,25 @@ watch(
   { deep: true },
 );
 
+watch(
+  () => settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled,
+  (enabled) => {
+    if (props.databaseType === "redis") return;
+    if (!shouldSkipSqlSemanticDiagnostics() && enabled) {
+      scheduleSemanticDiagnostics(0);
+      return;
+    }
+    clearScheduledSemanticDiagnostics();
+    setSemanticDiagnostics([]);
+  },
+);
+
 function pauseQueryEditorBackgroundWork() {
   flushEditorViewport();
   flushEditorSelection();
   clearTableNavigationHover();
   editorIsActive = false;
-  semanticDiagnosticRunId++;
-  if (semanticDiagnosticTimer) clearTimeout(semanticDiagnosticTimer);
-  semanticDiagnosticTimer = null;
+  clearScheduledSemanticDiagnostics();
   completionEpoch++;
   unregisterTableReferenceDropListener();
 }
@@ -2544,6 +2647,7 @@ function emitEditorViewport(viewport: { scrollTop: number; scrollLeft: number })
 function scheduleEditorViewportEmit() {
   if (!view.value || !editorIsActive) return;
   latestViewport = readEditorViewport(view.value);
+  scheduleSemanticDiagnostics(700, { preserveOutsideRanges: true });
   if (viewportEmitFrame !== null) return;
   viewportEmitFrame = requestAnimationFrame(() => {
     viewportEmitFrame = null;

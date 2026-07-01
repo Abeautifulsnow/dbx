@@ -636,6 +636,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 &config.username,
                 &config.password,
                 config.database.as_deref(),
+                config.url_params.as_deref(),
                 connect_timeout,
             )
             .await
@@ -735,7 +736,8 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             #[cfg(feature = "mq-admin")]
             DatabaseType::MessageQueue => {
                 let mqc = state.mq_admin_config_for_connection(connection_id, &config).await?;
-                let adapter = state.mq_registry.build_transient_config(mqc).await?;
+                let kafka_launch = dbx_core::mq::service::resolve_kafka_launch_spec(&mqc, &state);
+                let adapter = state.mq_registry.build_transient_config(mqc, kafka_launch).await?;
                 adapter.test_connection().await?;
                 Ok("Connection successful".to_string())
             }
@@ -923,6 +925,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 &db_config.username,
                 &db_config.password,
                 db_config.database.as_deref(),
+                db_config.url_params.as_deref(),
                 connect_timeout,
             )
             .await?;
@@ -1018,7 +1021,8 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         #[cfg(feature = "mq-admin")]
         DatabaseType::MessageQueue => {
             let mqc = state.mq_admin_config_for_connection(&id, &config).await?;
-            let adapter = state.mq_registry.build_transient_config(mqc).await?;
+            let kafka_launch = dbx_core::mq::service::resolve_kafka_launch_spec(&mqc, &state);
+            let adapter = state.mq_registry.build_transient_config(mqc, kafka_launch).await?;
             adapter.test_connection().await?;
             PoolKind::MessageQueue
         }

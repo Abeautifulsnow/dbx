@@ -655,10 +655,17 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
     if (write) {
       const safety = evaluateMongoWriteSafety(write, sqlSafetyFromEnv());
       if (!safety.allowed) throw new Error(safety.reason);
-      const affected = await withTimeout(executeMongoWrite(config, write), resolveTimeoutMs(options));
-      return { columns: [], rows: [], row_count: affected };
+      const result = await withTimeout(executeMongoWrite(config, write), resolveTimeoutMs(options));
+      if (write.kind === "createIndex") {
+        return {
+          columns: ["name"],
+          rows: [{ name: result.indexName ?? "" }],
+          row_count: 1,
+        };
+      }
+      return { columns: [], rows: [], row_count: result.affectedRows };
     }
-    throw new Error("Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})");
+    throw new Error("Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.createIndex({...}), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})");
   }
   if (isDirectQueryType(config.db_type)) {
     return query(config, sql, undefined, options);
@@ -873,7 +880,10 @@ async function mongoServerVersion(config: ConnectionConfig): Promise<string> {
   });
 }
 
-async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCommand): Promise<number> {
+async function executeMongoWrite(
+  config: ConnectionConfig,
+  command: MongoWriteCommand,
+): Promise<{ affectedRows: number; indexName?: string }> {
   if (command.kind === "insert") {
     const result = await bridgeDataRequest<{ affected_rows: number }>("/data/mongo/insert-documents", {
       connection_name: config.name,
@@ -881,7 +891,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
       collection: command.collection,
       docs_json: command.docsJson,
     });
-    return result.affected_rows;
+    return { affectedRows: result.affected_rows };
   }
   if (command.kind === "update") {
     const result = await bridgeDataRequest<{ affected_rows: number }>("/data/mongo/update-documents", {
@@ -892,7 +902,17 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
       update_json: command.update,
       many: command.many,
     });
-    return result.affected_rows;
+    return { affectedRows: result.affected_rows };
+  }
+  if (command.kind === "createIndex") {
+    const result = await bridgeDataRequest<{ name: string }>("/data/mongo/create-index", {
+      connection_name: config.name,
+      database: config.database || "",
+      collection: command.collection,
+      keys_json: command.keys,
+      options_json: command.options,
+    });
+    return { affectedRows: 1, indexName: result.name };
   }
   const result = await bridgeDataRequest<{ affected_rows: number }>("/data/mongo/delete-documents", {
     connection_name: config.name,
@@ -901,7 +921,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
     filter_json: command.filter,
     many: command.many,
   });
-  return result.affected_rows;
+  return { affectedRows: result.affected_rows };
 }
 
 async function mongoAggregateDocuments(config: ConnectionConfig, collection: string, pipelineJson: string, maxRows: number): Promise<MongoDocumentResult> {
@@ -984,7 +1004,11 @@ interface MongoGetIndexesCommand {
   collection: string;
 }
 
-export type MongoWriteCommand = { kind: "insert"; collection: string; docsJson: string } | { kind: "update"; collection: string; filter: string; update: string; many: boolean } | { kind: "delete"; collection: string; filter: string; many: boolean };
+export type MongoWriteCommand =
+  | { kind: "insert"; collection: string; docsJson: string }
+  | { kind: "update"; collection: string; filter: string; update: string; many: boolean }
+  | { kind: "delete"; collection: string; filter: string; many: boolean }
+  | { kind: "createIndex"; collection: string; keys: string; options?: string };
 
 export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
@@ -1109,6 +1133,21 @@ export function parseMongoWriteCommand(input: string): MongoWriteCommand | null 
     const filter = normalizeJsonArgument(args[0]);
     if (!filter) return null;
     return { kind: "delete", collection: target.collection, filter, many: method === "deleteMany" };
+  }
+
+  const createIndex = parseCollectionMethodTarget(source, "createIndex");
+  if (createIndex) {
+    const args = parseMethodArgs(source, createIndex.methodCallIndex);
+    if (!args || args.length < 1 || args.length > 2) return null;
+    const keys = normalizeJsonArgument(args[0]);
+    if (!keys) return null;
+    let options: string | undefined;
+    if (args[1]?.trim()) {
+      const parsedOptions = normalizeJsonArgument(args[1]);
+      if (!parsedOptions) return null;
+      options = parsedOptions;
+    }
+    return { kind: "createIndex", collection: createIndex.collection, keys, ...(options ? { options } : {}) };
   }
 
   return null;

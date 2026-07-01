@@ -77,6 +77,7 @@ import { editableRowIdentifierColumns, usesSyntheticRowIdKey } from "@/lib/table
 import { supportsDatabaseCreation, supportsDatabaseSearch, supportsFieldLineage, supportsObjectBrowserTreeNode, supportsSchemaDiagram, supportsSqlFileExecution, supportsTableImport, supportsTableTruncate, supportsTableStructureEditing, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
 import { copyNameForTreeNode, objectSourceKindForTreeNode, sidebarSelectionCopyAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "@/lib/treeNodeClick";
 import { formatSqlInsert } from "@/lib/exportFormats";
+import { joinExportedDdls } from "@/lib/ddlExport";
 import { fetchTableDataForExport } from "@/lib/tableDataExport";
 import { buildCreateDatabaseSql, buildDuckDbAttachDatabaseSql, duckDbAttachedDatabaseNameFromPath, supportsCreateDatabaseCharset, uniqueDuckDbAttachedDatabaseName } from "@/lib/createDatabaseSql";
 import {
@@ -499,7 +500,7 @@ async function toggle() {
       queryStore.createTab(node.connectionId, node.database, tabTitle, "redis");
     } else if (node.type === "mq-tenant" && node.connectionId) {
       await connectionStore.ensureConnected(node.connectionId);
-      queryStore.openMqAdmin(node.connectionId, { tenant: node.mqTenant || node.label });
+      queryStore.openMqAdmin(node.connectionId, { tenant: node.mqTenant || node.label, initialTab: node.mqInitialTab });
     } else if (node.type === "nacos-namespace" && node.connectionId) {
       await connectionStore.ensureConnected(node.connectionId);
       queryStore.openNacosAdmin(node.connectionId, { namespace: node.nacosNamespace || "", namespaceName: node.nacosNamespaceName || node.label });
@@ -2592,7 +2593,7 @@ async function exportStructure() {
       const ddl = await api.getTableDdl(target.connectionId, target.database, target.schema || target.database, target.label, tableDdlObjectTypeForNode(target.type));
       parts.push(ddl.trim());
     }
-    structurePreviewSql.value = `${parts.filter(Boolean).join("\n\n")}\n`;
+    structurePreviewSql.value = joinExportedDdls(parts);
   } catch (e: any) {
     structurePreviewError.value = e?.message || String(e);
     console.error("Export structure failed:", e);
@@ -3126,6 +3127,7 @@ const paddingLeft = computed(() => treeItemPaddingLeft(props.depth));
 const isConnected = computed(() => props.node.type === "connection" && !!props.node.connectionId && connectionStore.connectedIds.has(props.node.connectionId));
 const isConnectionReadonly = computed(() => props.node.type === "connection" && !!props.node.connectionId && (connectionStore.getConfig(props.node.connectionId)?.read_only ?? false));
 const isOpenedDatabase = computed(() => isSidebarDatabaseOpened(props.node, connectionStore.isTreeNodeChildrenLoaded));
+const showsDatabaseOpenIndicator = computed(() => props.node.type === "database" && (isOpenedDatabase.value || (!!props.node.connectionId && props.node.database != null && queryStore.isDatabaseOpen(props.node.connectionId, props.node.database))));
 const canCloseDatabaseConnection = computed(() => canCloseSidebarDatabaseConnection(props.node, connectionStore.isTreeNodeChildrenLoaded));
 const nodeIconClass = computed(() => {
   const infoClass = getIconInfo(props.node)?.colorClass;
@@ -3468,6 +3470,14 @@ function copyStructureAsSubmenu(): ContextMenuItem {
   };
 }
 
+function moreActionsSubmenu(children: ContextMenuItem[]): ContextMenuItem {
+  return {
+    label: t("common.more"),
+    icon: ListTree,
+    children,
+  };
+}
+
 function savedSqlHistoryScopeForNode(node: TreeNode): SavedSqlHistoryScope | null {
   if (!node.connectionId) return null;
   if (node.type === "connection") {
@@ -3672,6 +3682,10 @@ function treeItemMenuItems(): ContextMenuItem[] {
 
   // 4. Database / Schema
   if (node.type === "database" || node.type === "schema") {
+    if (canCloseDatabaseConnection.value) {
+      items.push({ label: t("contextMenu.closeDatabaseConnection"), action: closeDatabaseConnection, icon: Unplug });
+      items.push({ label: "", separator: true });
+    }
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     items.push({ label: "", separator: true });
     if (canOpenObjectBrowser.value) {
@@ -3723,21 +3737,22 @@ function treeItemMenuItems(): ContextMenuItem[] {
     items.push({ label: t("diff.title"), action: openSchemaDiff, icon: ArrowRightLeft });
     items.push({ label: t("dataCompare.title"), action: openDataCompare, icon: ArrowRightLeft });
     items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Upload });
-    if (canCloseDatabaseConnection.value) {
-      items.push({ label: "", separator: true });
-      items.push({ label: t("contextMenu.closeDatabaseConnection"), action: closeDatabaseConnection, icon: Unplug });
-    }
-    if (canDropDatabase.value || canDropSchema.value) {
-      items.push({ label: "", separator: true });
-    }
+    const destructiveActions: ContextMenuItem[] = [];
     if (canDropDatabase.value) {
-      items.push({
+      destructiveActions.push({
         label: t("contextMenu.dropDatabase"),
         action: dropDatabase,
         icon: Trash2,
         shortcut: shortcutDelete,
         variant: "destructive" as const,
       });
+    }
+    if (destructiveActions.length > 0) {
+      items.push({ label: "", separator: true });
+      items.push(moreActionsSubmenu(destructiveActions));
+    }
+    if (canDropSchema.value) {
+      items.push({ label: "", separator: true });
     }
     if (canDropSchema.value) {
       items.push({
@@ -3775,7 +3790,17 @@ function treeItemMenuItems(): ContextMenuItem[] {
     }
     if (canDropMongoDatabase.value) {
       items.push({ label: "", separator: true });
-      items.push({ label: t("contextMenu.dropDatabase"), action: dropDatabase, icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
+      items.push(
+        moreActionsSubmenu([
+          {
+            label: t("contextMenu.dropDatabase"),
+            action: dropDatabase,
+            icon: Trash2,
+            shortcut: shortcutDelete,
+            variant: "destructive" as const,
+          },
+        ]),
+      );
     }
     return items;
   }
@@ -3818,6 +3843,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
 
   // 6. Table / View / Materialized View
   if (node.type === "table" || node.type === "view" || node.type === "materialized_view") {
+    const destructiveActions: ContextMenuItem[] = [];
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     items.push({ label: "", separator: true });
     items.push({ label: t("contextMenu.viewData"), action: openData, icon: TableProperties });
@@ -3848,7 +3874,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
       });
     }
     if (node.type === "view" || node.type === "materialized_view") {
-      items.push({
+      destructiveActions.push({
         label: deleteMenuLabel(t("contextMenu.dropView")),
         action: deleteMenuAction(requestDropObject),
         icon: Trash2,
@@ -3891,28 +3917,31 @@ function treeItemMenuItems(): ContextMenuItem[] {
     if (isTableNotView.value) {
       items.push({ label: "", separator: true });
       items.push({ label: t("contextMenu.duplicateStructure"), action: duplicateStructure, icon: CopyPlus });
-      items.push({ label: "", separator: true });
       if (supportsTruncate.value) {
-        items.push({
+        destructiveActions.push({
           label: t("contextMenu.truncateTable"),
           action: truncateTable,
           icon: Scissors,
           variant: "destructive" as const,
         });
       }
-      items.push({
+      destructiveActions.push({
         label: t("contextMenu.emptyTable"),
         action: emptyTable,
         icon: Eraser,
         variant: "destructive" as const,
       });
-      items.push({
+      destructiveActions.push({
         label: deleteMenuLabel(t("contextMenu.dropTable")),
         action: deleteMenuAction(dropTable),
         icon: Trash2,
         shortcut: shortcutDelete,
         variant: "destructive" as const,
       });
+    }
+    if (destructiveActions.length > 0) {
+      items.push({ label: "", separator: true });
+      items.push(moreActionsSubmenu(destructiveActions));
     }
     items.push({ label: "", separator: true });
     items.push({
@@ -4107,6 +4136,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
           <span v-if="columnComment" class="sidebar-object-comment ml-auto max-w-[20%] shrink-0 truncate text-right">{{ columnComment }}</span>
           <span v-if="tableComment" class="sidebar-object-comment ml-auto max-w-[20%] shrink-0 truncate text-right">{{ tableComment }}</span>
           <span v-if="node.type === 'connection' && node.connectionId && connectionStore.connectedIds.has(node.connectionId)" class="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
+          <span v-if="showsDatabaseOpenIndicator" class="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
           <Badge v-if="isConnectionReadonly" variant="secondary" class="h-4 px-1.5 text-[10px] gap-0.5"><Lock class="w-2.5 h-2.5" />{{ t("connection.readOnlyBadge") }}</Badge>
           <ConnectionErrorIndicator v-if="node.type === 'connection'" :connection-id="node.connectionId" trigger-class="h-4 w-4" />
           <Pin v-if="isPinned" class="w-3 h-3 shrink-0 text-primary fill-current" aria-hidden="true" />

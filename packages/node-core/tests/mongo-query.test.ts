@@ -135,6 +135,12 @@ test("parseMongoWriteCommand accepts supported write commands", () => {
     filter: '{"stale":true}',
     many: true,
   });
+  assert.deepEqual(parseMongoWriteCommand('db.projects.createIndex({"email":1},{"unique":true,"name":"projects_email_unique"})'), {
+    kind: "createIndex",
+    collection: "projects",
+    keys: '{"email":1}',
+    options: '{"unique":true,"name":"projects_email_unique"}',
+  });
 });
 
 test("mongodb executeQuery blocks writes when writes are explicitly disabled", async () => {
@@ -155,6 +161,31 @@ test("mongodb executeQuery blocks writes when writes are explicitly disabled", a
         ssl: false,
       },
       'db.projects.insertOne({"name":"demo"})',
+    ),
+    /read-only/i,
+  );
+  if (oldAllowWrites === undefined) delete process.env.DBX_MCP_ALLOW_WRITES;
+  else process.env.DBX_MCP_ALLOW_WRITES = oldAllowWrites;
+});
+
+test("mongodb executeQuery treats createIndex as a write when writes are explicitly disabled", async () => {
+  const oldAllowWrites = process.env.DBX_MCP_ALLOW_WRITES;
+  process.env.DBX_MCP_ALLOW_WRITES = "0";
+  await assert.rejects(
+    executeQuery(
+      {
+        id: "mongo",
+        name: "mongo",
+        db_type: "mongodb",
+        host: "127.0.0.1",
+        port: 27017,
+        username: "",
+        password: "",
+        database: "app",
+        ssh_enabled: false,
+        ssl: false,
+      },
+      'db.projects.createIndex({"email":1})',
     ),
     /read-only/i,
   );

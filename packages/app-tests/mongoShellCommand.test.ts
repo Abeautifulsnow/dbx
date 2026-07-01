@@ -105,6 +105,15 @@ test("parseMongoWriteCommand accepts unquoted insert and update commands", () =>
   });
 });
 
+test("parseMongoWriteCommand parses createIndex with optional options", () => {
+  assert.deepEqual(parseMongoWriteCommand("db.users.createIndex({email: 1}, {unique: true, name: 'users_email_unique'})"), {
+    kind: "createIndex",
+    collection: "users",
+    keys: '{"email": 1}',
+    options: '{"unique": true, "name": "users_email_unique"}',
+  });
+});
+
 test("parseMongoCountDocumentsCommand parses db collection countDocuments", () => {
   assert.deepEqual(parseMongoCountDocumentsCommand("db.products.countDocuments({})"), {
     collection: "products",

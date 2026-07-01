@@ -433,6 +433,14 @@ pub async fn mq_get_backlog(
     dbx_core::mq::service::mq_get_backlog_core(&state, &connection_id, topic, sub).await
 }
 
+#[tauri::command]
+pub async fn mq_get_cluster_info(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<dbx_core::mq::ClusterInfo, String> {
+    dbx_core::mq::service::mq_get_cluster_info_core(&state, &connection_id).await
+}
+
 // ---- Raw request (escape hatch) ----
 
 #[tauri::command]
@@ -445,4 +453,15 @@ pub async fn mq_raw_request(
         ensure_connection_writable(&state, &connection_id, "MQ admin write").await?;
     }
     dbx_core::mq::service::mq_raw_request_core(&state, &connection_id, req).await
+}
+
+// ---- Message production ----
+
+#[tauri::command]
+pub async fn mq_send_message(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    req: dbx_core::mq::SendMessageRequest,
+) -> Result<dbx_core::mq::SendMessageResponse, String> {
+    dbx_core::mq::service::mq_send_message_core(&state, &connection_id, req).await
 }
