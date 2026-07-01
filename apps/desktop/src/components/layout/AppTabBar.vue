@@ -2,7 +2,7 @@
 import { computed, ref, watch, nextTick } from "vue";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { X, Pin, ChevronDown, Table2, Code2, TableProperties, PencilRuler, KeyRound, Pencil, Package, Lock, Copy, AlertTriangle, Network, Minimize2, Maximize2 } from "@lucide/vue";
+import { X, Pin, ChevronDown, Table2, Code2, TableProperties, PencilRuler, KeyRound, Pencil, Package, Lock, Copy, AlertTriangle, Network, Minimize2, Maximize2, Settings } from "@lucide/vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
@@ -21,6 +21,8 @@ import type { QueryTab } from "@/types/database";
 const props = defineProps<{
   driverStoreOpen?: boolean;
   driverStoreActive?: boolean;
+  settingsPageOpen?: boolean;
+  settingsPageActive?: boolean;
   agentDriverUpdateCount?: number;
 }>();
 
@@ -28,6 +30,8 @@ const emit = defineEmits<{
   "activate-tab": [];
   "activate-driver-store": [];
   "close-driver-store": [];
+  "activate-settings-page": [];
+  "close-settings-page": [];
   "save-tab": [tabId: string];
 }>();
 
@@ -218,9 +222,25 @@ watch(
   },
 );
 
+watch(
+  () => props.settingsPageActive,
+  (show) => {
+    if (!show) return;
+    nextTick(() => {
+      const container = tabsContainerRef.value;
+      if (!container) return;
+      const el = container.querySelector("[data-settings-page-tab]");
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+      }
+      updateAllScrollButtons();
+    });
+  },
+);
+
 function tabColorStyle(tab: QueryTab) {
   const color = connectionColor(tab.connectionId);
-  const isActive = tab.id === queryStore.activeTabId && !props.driverStoreActive;
+  const isActive = tab.id === queryStore.activeTabId && !props.driverStoreActive && !props.settingsPageActive;
   const isClassic = isClassicLayout.value;
   if (!color) {
     if (isClassic) {
@@ -357,7 +377,7 @@ function activateTab(tabId: string) {
 </script>
 
 <template>
-  <div v-if="queryStore.tabs.length > 0 || driverStoreOpen" class="relative flex w-full min-w-0 shrink-0 overflow-hidden border-b" :class="[isClassicLayout ? 'bg-muted' : 'bg-background', hasFixedTabs ? 'flex-col' : '']">
+  <div v-if="queryStore.tabs.length > 0 || driverStoreOpen || settingsPageOpen" class="relative flex w-full min-w-0 shrink-0 overflow-hidden border-b" :class="[isClassicLayout ? 'bg-muted' : 'bg-background', hasFixedTabs ? 'flex-col' : '']">
     <div class="flex w-full min-w-0 shrink-0 overflow-hidden" :class="isClassicLayout ? 'h-9 items-stretch' : 'h-10 items-center px-2'">
       <div class="app-tab-strip relative h-full min-w-0 flex-1 overflow-hidden">
         <div v-if="showRegularTabScrollbar" class="app-tab-scrollbar" :class="{ 'app-tab-scrollbar--dragging': isScrollbarDragging }" @pointerdown="startScrollbarDrag">
@@ -372,11 +392,15 @@ function activateTab(tabId: string) {
                     class="group flex items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap select-none"
                     :class="
                       isClassicLayout
-                        ? [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-full border-r border-border/80 font-medium dark:border-border/45', tab.id === queryStore.activeTabId && !driverStoreActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90']
-                        : [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-7 rounded-md border', tab.id === queryStore.activeTabId && !driverStoreActive ? 'text-foreground font-medium' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
+                        ? [
+                            compactTabTitle ? 'min-w-24' : 'min-w-38',
+                            'h-full border-r border-border/80 font-medium dark:border-border/45',
+                            tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90',
+                          ]
+                        : [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-7 rounded-md border', tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive ? 'text-foreground font-medium' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
                     "
                     :style="[tabColorStyle(tab), tabDropStyle(tab.id)]"
-                    :data-active-tab="tab.id === queryStore.activeTabId && !driverStoreActive"
+                    :data-active-tab="tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive"
                     @click="handleTabClick(tab)"
                     @dblclick.stop="startRenameTab(tab)"
                     @mousedown.middle.prevent="queryStore.closeTab(tab.id)"
@@ -427,6 +451,28 @@ function activateTab(tabId: string) {
               </Tooltip>
             </div>
           </CustomContextMenu>
+
+          <!-- Settings Page Tab -->
+          <div
+            v-if="settingsPageOpen"
+            data-settings-page-tab
+            class="group flex min-w-36 items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap"
+            :class="
+              isClassicLayout
+                ? ['h-full border-r border-border/80 dark:border-border/45 font-medium', settingsPageActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90']
+                : ['h-7 rounded-md border font-medium', settingsPageActive ? 'border-ring text-foreground' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
+            "
+            :style="isClassicLayout && settingsPageActive ? { boxShadow: '0 1px 0 0 var(--color-background)' } : {}"
+            @click="emit('activate-settings-page')"
+          >
+            <span class="shrink-0 text-sky-600 dark:text-sky-400">
+              <Settings class="h-3.5 w-3.5" />
+            </span>
+            <span class="min-w-0 truncate flex-1">{{ t("settings.title") }}</span>
+            <button class="rounded hover:bg-muted-foreground/20 p-0.5 shrink-0" @click.stop="emit('close-settings-page')">
+              <X class="h-3 w-3" />
+            </button>
+          </div>
 
           <!-- Driver Store Tab -->
           <div
@@ -492,11 +538,15 @@ function activateTab(tabId: string) {
                     class="group flex items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap select-none"
                     :class="
                       isClassicLayout
-                        ? [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-full border-r border-border/80 font-medium dark:border-border/45', tab.id === queryStore.activeTabId && !driverStoreActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90']
-                        : [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-7 rounded-md border', tab.id === queryStore.activeTabId && !driverStoreActive ? 'text-foreground font-medium' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
+                        ? [
+                            compactTabTitle ? 'min-w-24' : 'min-w-38',
+                            'h-full border-r border-border/80 font-medium dark:border-border/45',
+                            tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90',
+                          ]
+                        : [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-7 rounded-md border', tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive ? 'text-foreground font-medium' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
                     "
                     :style="[tabColorStyle(tab), tabDropStyle(tab.id)]"
-                    :data-active-tab="tab.id === queryStore.activeTabId && !driverStoreActive"
+                    :data-active-tab="tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive"
                     @click="handleTabClick(tab)"
                     @dblclick.stop="startRenameTab(tab)"
                     @mousedown.middle.prevent="queryStore.closeTab(tab.id)"

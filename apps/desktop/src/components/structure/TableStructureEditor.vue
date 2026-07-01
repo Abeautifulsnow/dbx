@@ -27,7 +27,7 @@ import { PRESET_FIELDS_TEMPLATE_ID, createTableColumnTemplateDrafts } from "@/li
 import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
 import { canAddTableStructureColumn, getTableStructureCapabilities } from "@/lib/tableStructureCapabilities";
 import { connectionObjectTreeQuerySchema, tableStructureDatabaseTypeForConnection } from "@/lib/jdbcDialect";
-import type { TableStructureEditorDraft } from "@/types/database";
+import type { TableInfoTab, TableStructureEditorDraft } from "@/types/database";
 import {
   buildStructureTargetLabel,
   combineDataTypeForDatabase,
@@ -42,8 +42,10 @@ import {
   getDataTypeOptions,
   getDefaultLengthForType,
   isDataTypeLengthDisabled,
+  isSqlServerIdentityCompatibleDataType,
   isProtectedManticoreIdColumn,
   parseExtraToColumnExtra,
+  rehydrateColumnDraftsFromMetadata,
   splitDataType,
   toColumnNames,
   applyManticoreDdlColumnExtras,
@@ -80,6 +82,8 @@ const props = defineProps<{
   database: string;
   schema?: string;
   tableName: string;
+  initialTab?: TableInfoTab;
+  initialTabRequestId?: number;
   draft?: TableStructureEditorDraft;
 }>();
 
@@ -90,7 +94,7 @@ const emit = defineEmits<{
   openSettings: [initialTab?: string, initialSection?: string];
 }>();
 
-const activeTab = ref("columns");
+const activeTab = ref<TableInfoTab>("columns");
 const loading = ref(false);
 const saving = ref(false);
 const postSaveRefreshing = ref(false);
@@ -615,6 +619,7 @@ let skipNextRefreshVersion = false;
 let restoringDraft = false;
 let syncingDraft = false;
 let draftHydrated = false;
+let hydratingRestoredDraft = false;
 
 function cloneDraftValue<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -644,6 +649,7 @@ function syncDraftToParent() {
 
 function restoreDraft(draft: TableStructureEditorDraft) {
   restoringDraft = true;
+  draftHydrated = false;
   activeTab.value = draft.activeTab || "columns";
   newTableName.value = draft.newTableName || "";
   tableComment.value = draft.tableComment || "";
@@ -653,7 +659,45 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   foreignKeys.value = cloneDraftValue(draft.foreignKeys || []);
   triggers.value = cloneDraftValue(draft.triggers || []);
   restoringDraft = false;
-  draftHydrated = true;
+  draftHydrated = !needsColumnDraftMetadataHydration();
+}
+
+function needsColumnDraftMetadataHydration() {
+  return !isCreateMode.value && columns.value.some((column) => !column.original && !column.id.startsWith("new:") && !!column.name.trim());
+}
+
+async function hydrateRestoredDraftFromDatabase() {
+  if (!needsColumnDraftMetadataHydration() || hydratingRestoredDraft) return;
+  const connectionId = props.connectionId;
+  const database = props.database;
+  const schema = metadataSchema.value;
+  const tableName = props.tableName;
+  if (!connectionId || !database || !tableName) return;
+
+  hydratingRestoredDraft = true;
+  let shouldRefreshPreview = false;
+  try {
+    await store.ensureConnected(connectionId);
+    let nextColumns = await api.getColumns(connectionId, database, schema, tableName);
+    if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
+      try {
+        const ddl = await api.getTableDdl(connectionId, database, schema, tableName);
+        ddlContent.value = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(databaseType.value), settingsStore.editorSettings.sqlFormatter);
+        ddlFetched.value = true;
+        nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
+      } catch {
+        /* ignore — Manticore column properties can still come from SHOW COLUMNS when available */
+      }
+    }
+    columns.value = rehydrateColumnDraftsFromMetadata(columns.value, nextColumns, databaseType.value);
+    markDraftHydratedAndSync();
+    shouldRefreshPreview = true;
+  } catch (e: any) {
+    console.warn("[DBX][structure-editor:draft-hydration-failed]", e);
+  } finally {
+    hydratingRestoredDraft = false;
+    if (shouldRefreshPreview) scheduleSqlPreviewRefresh();
+  }
 }
 
 function markDraftHydratedAndSync() {
@@ -733,6 +777,18 @@ async function loadDynamicDataTypeOptions() {
 }
 
 function scheduleSqlPreviewRefresh() {
+  if (hydratingRestoredDraft || needsColumnDraftMetadataHydration()) {
+    if (sqlPreviewDebounceTimer) {
+      clearTimeout(sqlPreviewDebounceTimer);
+      sqlPreviewDebounceTimer = undefined;
+    }
+    sqlPreviewRequestId++;
+    deferredSqlPreviewRefresh = false;
+    pendingStatements.value = [];
+    warnings.value = [];
+    sqlPreviewLoading.value = true;
+    return;
+  }
   if (!hasPendingStructureChanges()) {
     clearSqlPreviewState();
     return;
@@ -1017,7 +1073,19 @@ function isSqlServerIdentityChecked(column: EditableStructureColumn): boolean {
 }
 
 function canEditSqlServerIdentity(column: EditableStructureColumn): boolean {
-  return !column.original && !column.markedForDrop;
+  return !column.original && !column.markedForDrop && isSqlServerIdentityCompatibleDataType(column.dataType);
+}
+
+function clearSqlServerIdentity(column: EditableStructureColumn) {
+  column.extra.autoIncrement = false;
+  column.extra.identity = undefined;
+}
+
+function syncSqlServerIdentityForDataType(column: EditableStructureColumn) {
+  if (databaseType.value !== "sqlserver") return;
+  if (!isSqlServerIdentityChecked(column)) return;
+  if (isSqlServerIdentityCompatibleDataType(column.dataType)) return;
+  clearSqlServerIdentity(column);
 }
 
 function ensureSqlServerIdentity(column: EditableStructureColumn) {
@@ -1034,8 +1102,7 @@ function setSqlServerIdentity(column: EditableStructureColumn, checked: boolean)
     ensureSqlServerIdentity(column);
     column.isNullable = false;
   } else {
-    column.extra.autoIncrement = false;
-    column.extra.identity = undefined;
+    clearSqlServerIdentity(column);
   }
 }
 
@@ -1057,6 +1124,16 @@ function updateSqlServerIdentityIncrement(column: EditableStructureColumn, value
   if (!canEditSqlServerIdentity(column)) return;
   ensureSqlServerIdentity(column);
   column.extra.identity!.increment = parseOptionalNumberInput(value);
+}
+
+function updateColumnDataType(column: EditableStructureColumn, baseType: string) {
+  column.dataType = combineDataTypeForDatabase(databaseType.value, baseType, getDefaultLengthForType(databaseType.value, baseType));
+  syncSqlServerIdentityForDataType(column);
+}
+
+function updateColumnDataTypeLength(column: EditableStructureColumn, value: string | number) {
+  column.dataType = combineDataTypeForDatabase(databaseType.value, splitDataType(column.dataType).baseType, String(value));
+  syncSqlServerIdentityForDataType(column);
 }
 
 function moveColumnTo(index: number, insertionIndex: number) {
@@ -1559,10 +1636,13 @@ function unregisterStructureEditorShortcuts() {
 
 onMounted(() => {
   resetState();
+  applyInitialStructureTab();
   registerStructureEditorShortcuts();
   void loadDynamicDataTypeOptions();
   if (props.draft?.initialized) {
     restoreDraft(props.draft);
+    applyInitialStructureTab();
+    void hydrateRestoredDraftFromDatabase();
   } else if (isCreateMode.value) {
     markDraftHydratedAndSync();
   } else {
@@ -1575,6 +1655,7 @@ onActivated(() => {
   void loadDynamicDataTypeOptions();
   if (props.draft?.initialized && !draftHydrated) {
     restoreDraft(props.draft);
+    void hydrateRestoredDraftFromDatabase();
   }
 });
 onDeactivated(unregisterStructureEditorShortcuts);
@@ -1594,14 +1675,27 @@ function firstStructureMetadataTab(capabilities = tableMetadataCapabilities.valu
   return "columns";
 }
 
+function isStructureMetadataTabSupported(tab: TableInfoTab, capabilities = tableMetadataCapabilities.value) {
+  return (tab === "columns" && capabilities.columns) || (tab === "indexes" && capabilities.indexes) || (tab === "foreignKeys" && capabilities.foreignKeys) || (tab === "triggers" && capabilities.triggers) || (tab === "ddl" && capabilities.ddl && !isCreateMode.value);
+}
+
+function resolveStructureMetadataTab(tab: TableInfoTab | undefined, capabilities = tableMetadataCapabilities.value): TableInfoTab {
+  if (tab && isStructureMetadataTabSupported(tab, capabilities)) return tab;
+  return firstStructureMetadataTab(capabilities);
+}
+
+function applyInitialStructureTab() {
+  if (!props.initialTab) return;
+  activeTab.value = resolveStructureMetadataTab(props.initialTab);
+}
+
 watch(tableMetadataCapabilities, (capabilities) => {
-  const supported =
-    (activeTab.value === "columns" && capabilities.columns) ||
-    (activeTab.value === "indexes" && capabilities.indexes) ||
-    (activeTab.value === "foreignKeys" && capabilities.foreignKeys) ||
-    (activeTab.value === "triggers" && capabilities.triggers) ||
-    (activeTab.value === "ddl" && capabilities.ddl && !isCreateMode.value);
-  if (!supported) activeTab.value = firstStructureMetadataTab(capabilities);
+  if (!isStructureMetadataTabSupported(activeTab.value, capabilities)) activeTab.value = firstStructureMetadataTab(capabilities);
+});
+
+watch([() => props.initialTab, () => props.initialTabRequestId], () => {
+  if (!props.initialTab) return;
+  applyInitialStructureTab();
 });
 
 watch([() => props.connectionId, () => props.database, databaseType], () => {
@@ -1797,17 +1891,12 @@ watch(activeTab, (tab) => {
                       :loading-text="t('common.loading')"
                       :allow-custom="true"
                       :trigger-class="[structureMonoControlClass, 'w-full']"
-                      @update:model-value="(v: string) => (column.dataType = combineDataTypeForDatabase(databaseType, v, getDefaultLengthForType(databaseType, v)))"
+                      @update:model-value="(v: string) => updateColumnDataType(column, v)"
                     />
                     <Input v-else :model-value="splitDataType(column.dataType).baseType" :class="[structureMonoControlClass, 'w-full']" disabled />
                   </td>
                   <td v-if="columnEditorControls.length" :class="structureCellClass">
-                    <Input
-                      :model-value="dataTypeLengthInputValue(databaseType, column.dataType)"
-                      :class="structureMonoControlClass"
-                      :disabled="isColumnLengthDisabled(column)"
-                      @update:model-value="column.dataType = combineDataTypeForDatabase(databaseType, splitDataType(column.dataType).baseType, String($event))"
-                    />
+                    <Input :model-value="dataTypeLengthInputValue(databaseType, column.dataType)" :class="structureMonoControlClass" :disabled="isColumnLengthDisabled(column)" @update:model-value="updateColumnDataTypeLength(column, $event)" />
                   </td>
                   <td v-if="columnEditorControls.nullable" :class="structureCellClass">
                     <label class="flex items-center gap-1.5">
@@ -1967,7 +2056,7 @@ watch(activeTab, (tab) => {
                       </template>
                       <!-- SQL Server: IDENTITY -->
                       <template v-else-if="structureDialect === 'sqlserver'">
-                        <label :class="structurePropertyLabelClass" :title="t('structureEditor.identity')">
+                        <label :class="structurePropertyLabelClass" :title="canEditSqlServerIdentity(column) || isSqlServerIdentityChecked(column) ? t('structureEditor.identity') : t('structureEditor.sqlServerIdentityTypeHint')">
                           <input :checked="isSqlServerIdentityChecked(column)" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="!canEditSqlServerIdentity(column)" @change="setSqlServerIdentity(column, ($event.target as HTMLInputElement).checked)" />
                           <span class="min-w-0 truncate">{{ t("structureEditor.autoIncrement") }}</span>
                         </label>

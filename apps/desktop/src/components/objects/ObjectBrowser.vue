@@ -8,6 +8,7 @@ import {
   ArrowUp,
   Braces,
   CheckSquare,
+  Clipboard,
   Code2,
   Copy,
   CopyPlus,
@@ -40,7 +41,7 @@ import {
 import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SearchableSelect } from "@/components/ui/searchable-select";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ProcedureExecutionDialog from "@/components/objects/ProcedureExecutionDialog.vue";
@@ -51,14 +52,15 @@ import { isSchemaAware } from "@/lib/databaseCapabilities";
 import { supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/databaseFeatureSupport";
 import { codeMirrorSqlDialect, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import { buildTableSelectSql } from "@/lib/tableSelectSql";
-import { buildDropObjectSql, buildDuplicateTableStructureSql, buildEmptyTableSql, buildTruncateTableSql, type TableAdminSqlOptions } from "@/lib/dbAdminSql";
+import { buildDropObjectSql, buildDuplicateTableStructureSql, buildCopyTableDataSql, buildEmptyTableSql, buildTruncateTableSql, type TableAdminSqlOptions } from "@/lib/dbAdminSql";
 import { useToast } from "@/composables/useToast";
 import { buildExecutableObjectSourceStatements, buildRoutineRenameObjectSourceStatements, objectSourceSaveExecutionMode, supportsSourceBackedRoutineRename } from "@/lib/objectSourceEditor";
 import { buildRenameObjectSql, supportsObjectRename } from "@/lib/objectRenameSql";
 import { buildViewDdl } from "@/lib/viewDdl";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { generateDatabaseExportId } from "@/lib/databaseExport";
-import { copyToClipboard } from "@/lib/clipboard";
+import { copyToClipboard, eventTargetAllowsAppClipboardShortcut } from "@/lib/clipboard";
+import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, tableDataCopyColumnOptions, type PasteTableMode, type TableClipboardContext } from "@/lib/tableClipboard";
 import { formatSqlInsert } from "@/lib/exportFormats";
 import { buildSingleDdlExportFileContent } from "@/lib/ddlExport";
 import { fetchTableDataForExport } from "@/lib/tableDataExport";
@@ -152,6 +154,11 @@ const selectedTableIds = ref<Set<string>>(new Set());
 const expandedPartitionParentIds = ref<Set<string>>(new Set());
 const showBatchDropConfirm = ref(false);
 const batchDropPreviewSql = ref("");
+// Paste table dialog state
+const showPasteDialog = ref(false);
+const pasteTableMode = ref<PasteTableMode>("structure-and-data");
+const pasteTableEntries = ref<{ sourceName: string; targetName: string; schema?: string }[]>([]);
+const pasteTableDataCopySupported = computed(() => supportsWholeRowTableDataCopy(effectiveDatabaseType.value));
 const objectColumnWidths = ref<Record<ObjectBrowserColumnKey, number>>({
   select: 34,
   name: 360,
@@ -964,6 +971,132 @@ async function confirmDuplicateStructure() {
   }
 }
 
+function copySelectedTablesToClipboard() {
+  const selectedRows = selectedTableRows.value;
+  if (selectedRows.length === 0) return;
+  connectionStore.treeClipboard = {
+    kind: "table-copy",
+    tables: selectedRows.map((row) => ({
+      connectionId: props.connection.id,
+      database: props.database,
+      schema: row.schema || selectedSchema.value,
+      tableName: row.name,
+    })),
+  };
+  toast(t("contextMenu.pasteTableClipboardUpdated"), 2000);
+}
+
+function canPasteTableClipboard(): boolean {
+  const clipboard = connectionStore.treeClipboard;
+  return clipboard?.kind === "table-copy" && tableClipboardMatchesTarget(clipboard.tables, pasteTableTargetContext());
+}
+
+function pasteTableTargetContext(): TableClipboardContext {
+  return {
+    connectionId: props.connection.id,
+    database: props.database,
+    schema: selectedSchema.value,
+  };
+}
+
+function copySingleTableToClipboard(row: ObjectBrowserRow) {
+  connectionStore.treeClipboard = {
+    kind: "table-copy",
+    tables: [
+      {
+        connectionId: props.connection.id,
+        database: props.database,
+        schema: row.schema || selectedSchema.value,
+        tableName: row.name,
+      },
+    ],
+  };
+  toast(t("contextMenu.pasteTableClipboardUpdated"), 2000);
+}
+
+function openPasteTableDialog() {
+  const clipboard = connectionStore.treeClipboard;
+  if (!canPasteTableClipboard() || !clipboard) {
+    toast(t("contextMenu.noTableToPaste"), 2000);
+    return;
+  }
+  pasteTableMode.value = defaultPasteTableMode(effectiveDatabaseType.value);
+  pasteTableEntries.value = clipboard.tables.map((entry) => ({
+    sourceName: entry.tableName,
+    targetName: `${entry.tableName}_copy`,
+    schema: entry.schema,
+  }));
+  showPasteDialog.value = true;
+}
+
+function onObjectBrowserKeydown(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
+  if (eventTargetAllowsAppClipboardShortcut(event, "c")) {
+    if (selectedTableCount.value === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    copySelectedTablesToClipboard();
+    return;
+  }
+  if (eventTargetAllowsAppClipboardShortcut(event, "v")) {
+    if (!canPasteTableClipboard()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openPasteTableDialog();
+  }
+}
+
+async function confirmPasteTable() {
+  const entries = pasteTableEntries.value.filter((entry) => entry.targetName.trim());
+  if (entries.length === 0) return;
+  const mode = pasteTableMode.value;
+  const copyData = pasteTableModeCopiesData(mode) && pasteTableDataCopySupported.value;
+  showPasteDialog.value = false;
+  let successCount = 0;
+  let failCount = 0;
+  for (const entry of entries) {
+    const targetName = entry.targetName.trim();
+    const schema = entry.schema || selectedSchema.value;
+    try {
+      if (mode === "structure-and-data" || mode === "structure-only") {
+        const structureSql = await buildDuplicateTableStructureSql({
+          databaseType: effectiveDatabaseType.value,
+          schema,
+          sourceName: entry.sourceName,
+          targetName,
+        });
+        await api.executeQuery(props.connection.id, props.database, structureSql, schema);
+      }
+      if (copyData) {
+        const sourceColumns = await api.getColumns(props.connection.id, props.database, schema || "", entry.sourceName);
+        const dataCopyColumnOptions = tableDataCopyColumnOptions(effectiveDatabaseType.value, sourceColumns);
+        if (dataCopyColumnOptions.columns.length === 0) {
+          throw new Error("No writable columns available for table data copy.");
+        }
+        const dataSql = await buildCopyTableDataSql({
+          databaseType: effectiveDatabaseType.value,
+          schema,
+          sourceName: entry.sourceName,
+          targetName,
+          ...dataCopyColumnOptions,
+        });
+        await api.executeQuery(props.connection.id, props.database, dataSql, schema);
+      }
+      successCount++;
+    } catch (e: any) {
+      failCount++;
+      console.error(`Failed to paste table "${entry.sourceName}" -> "${targetName}":`, e);
+    }
+  }
+  if (failCount === 0) {
+    toast(t("contextMenu.batchPasteSuccess", { count: successCount }), 3000);
+  } else {
+    toast(t("contextMenu.batchPastePartialFail", { success: successCount, failed: failCount }), 5000);
+  }
+  await reload();
+  await connectionStore.refreshObjectListTreeNode(props.connection.id, props.database, selectedSchema.value);
+}
+
 function tableAdminSqlOptions(row: ObjectBrowserRow): TableAdminSqlOptions {
   return {
     databaseType: effectiveDatabaseType.value,
@@ -1290,6 +1423,7 @@ function getTableMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     { label: t("contextMenu.exportStructure"), action: () => exportStructure(item), icon: FileCode },
     { label: "", separator: true },
     { label: t("contextMenu.duplicateStructure"), action: () => requestDuplicateStructure(item), icon: CopyPlus },
+    { label: t("contextMenu.copyTable"), action: () => copySingleTableToClipboard(item), icon: Copy },
     { label: "", separator: true },
     ...(supportsTruncateTable.value
       ? [
@@ -1378,7 +1512,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 </script>
 
 <template>
-  <div ref="rootRef" class="flex h-full min-h-0 flex-col bg-background">
+  <div ref="rootRef" data-object-browser-root class="flex h-full min-h-0 flex-col bg-background outline-none" tabindex="0" @keydown="onObjectBrowserKeydown">
     <div class="flex h-10 shrink-0 items-center gap-2 border-b px-3">
       <div class="flex min-w-0 flex-1 items-center gap-2">
         <Table2 class="h-4 w-4 text-muted-foreground" />
@@ -1406,16 +1540,27 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           </button>
         </div>
       </div>
-      <Select v-if="needsSchema" :model-value="selectedSchema" :disabled="loadingSchemas" @update:model-value="onSchemaChange">
-        <SelectTrigger class="h-7 w-36 text-xs">
-          <SelectValue :placeholder="loadingSchemas ? t('objects.loadingSchemas') : t('objects.schema')" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem v-for="schema in schemas" :key="schema" :value="schema">{{ schema }}</SelectItem>
-        </SelectContent>
-      </Select>
+      <SearchableSelect
+        v-if="needsSchema"
+        :model-value="selectedSchema || ''"
+        :options="schemas"
+        :placeholder="t('objects.schema')"
+        :search-placeholder="t('editor.searchSchema')"
+        :empty-text="t('grid.noSearchResults')"
+        :loading-text="t('objects.loadingSchemas')"
+        :loading="loadingSchemas"
+        :disabled="loadingSchemas"
+        trigger-variant="outline"
+        trigger-class="h-7 w-36 max-w-36 px-2 text-xs font-normal"
+        content-class="w-56"
+        @update:model-value="onSchemaChange"
+      />
       <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="loadingObjects" @click="reload">
         <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': loadingObjects }" />
+      </Button>
+      <Button v-if="canPasteTableClipboard()" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openPasteTableDialog">
+        <Clipboard class="mr-1.5 h-3.5 w-3.5" />
+        {{ t("objects.pasteTableSelected") }}
       </Button>
     </div>
     <div v-if="selectedTableCount > 0" class="flex h-9 shrink-0 items-center gap-2 border-b bg-muted/30 px-3 text-xs">
@@ -1425,6 +1570,10 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openBatchDatabaseExport">
         <Download class="mr-1.5 h-3.5 w-3.5" />
         {{ t("objects.exportSelected") }}
+      </Button>
+      <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="copySelectedTablesToClipboard">
+        <Clipboard class="mr-1.5 h-3.5 w-3.5" />
+        {{ t("objects.copyTableSelected") }}
       </Button>
       <Button variant="ghost" size="sm" class="h-7 px-2 text-xs text-destructive" @click="requestBatchDropTables">
         <Trash2 class="mr-1.5 h-3.5 w-3.5" />
@@ -1701,6 +1850,41 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         <Button :disabled="!duplicateTableName.trim()" @click="confirmDuplicateStructure">
           {{ t("dangerDialog.confirm") }}
         </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showPasteDialog">
+    <DialogContent class="sm:max-w-[500px]">
+      <DialogHeader>
+        <DialogTitle>{{ pasteTableEntries.length > 1 ? t("contextMenu.batchPasteTitle") : t("contextMenu.pasteTableConfirmTitle") }}</DialogTitle>
+      </DialogHeader>
+      <div class="space-y-4">
+        <div class="flex gap-2">
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer" :class="{ 'opacity-50 cursor-not-allowed': !pasteTableDataCopySupported }">
+            <input v-model="pasteTableMode" type="radio" value="structure-and-data" class="accent-primary" :disabled="!pasteTableDataCopySupported" />
+            {{ t("contextMenu.pasteOptionStructureAndData") }}
+          </label>
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer">
+            <input v-model="pasteTableMode" type="radio" value="structure-only" class="accent-primary" />
+            {{ t("contextMenu.pasteOptionStructureOnly") }}
+          </label>
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer" :class="{ 'opacity-50 cursor-not-allowed': !pasteTableDataCopySupported }">
+            <input v-model="pasteTableMode" type="radio" value="data-only" class="accent-primary" :disabled="!pasteTableDataCopySupported" />
+            {{ t("contextMenu.pasteOptionDataOnly") }}
+          </label>
+        </div>
+        <div class="space-y-2 max-h-64 overflow-y-auto">
+          <div v-for="(entry, idx) in pasteTableEntries" :key="idx" class="flex items-center gap-2">
+            <span class="text-sm text-muted-foreground truncate min-w-0 flex-shrink basis-1/3" :title="entry.sourceName">{{ entry.sourceName }}</span>
+            <span class="text-xs text-muted-foreground flex-shrink-0">&rarr;</span>
+            <Input v-model="entry.targetName" class="flex-1 h-8 text-sm" :placeholder="t('contextMenu.duplicateNamePlaceholder')" />
+          </div>
+        </div>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" @click="showPasteDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="pasteTableEntries.every((e) => !e.targetName.trim())" @click="confirmPasteTable">{{ t("dangerDialog.confirm") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

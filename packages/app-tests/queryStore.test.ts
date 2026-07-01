@@ -236,6 +236,64 @@ test("marked-clean object source tabs close without unsaved confirmation", () =>
   );
 });
 
+test("close all tabs pauses on unsaved query tabs", () => {
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const queryId = store.createTab("conn-1", "db", "draft query");
+  store.updateSql(queryId, "select 1;");
+  const dataId = store.createTab("conn-1", "db", "users", "data");
+
+  store.closeAllTabs();
+
+  assert.equal(store.showCloseConfirm, true);
+  assert.equal(store.pendingCloseTabId, queryId);
+  assert.deepEqual(
+    store.tabs.map((tab) => tab.id),
+    [queryId, dataId],
+  );
+
+  store.forceClosePendingTab();
+
+  assert.equal(store.showCloseConfirm, false);
+  assert.deepEqual(store.tabs, []);
+  assert.equal(store.activeTabId, null);
+});
+
+test("close other tabs pauses on unsaved query tabs before keeping target tab", () => {
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const queryId = store.createTab("conn-1", "db", "draft query");
+  store.updateSql(queryId, "select 1;");
+  const dataId = store.createTab("conn-1", "db", "users", "data");
+
+  store.closeOtherTabs(dataId);
+
+  assert.equal(store.showCloseConfirm, true);
+  assert.equal(store.pendingCloseTabId, queryId);
+  assert.deepEqual(
+    store.tabs.map((tab) => tab.id),
+    [queryId, dataId],
+  );
+
+  store.cancelClosePendingTab();
+
+  assert.equal(store.showCloseConfirm, false);
+  assert.deepEqual(
+    store.tabs.map((tab) => tab.id),
+    [queryId, dataId],
+  );
+
+  store.closeOtherTabs(dataId);
+  store.forceClosePendingTab();
+
+  assert.equal(store.showCloseConfirm, false);
+  assert.deepEqual(
+    store.tabs.map((tab) => tab.id),
+    [dataId],
+  );
+  assert.equal(store.activeTabId, dataId);
+});
+
 test("editing query sql preserves the displayed result editability state", () => {
   setActivePinia(createPinia());
   const store = useQueryStore();
@@ -1527,6 +1585,52 @@ test("data tab execution preserves pagination offset metadata", async () => {
   }
 });
 
+test("data tab default pagination is independent from query result page size", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const settingsStore = useSettingsStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  let executeBody: any;
+  let preparedPagination = false;
+
+  settingsStore.updateEditorSettings({ pageSize: 1000 });
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  const tabId = store.createTab("conn-1", "db", "users", "data", "public");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-pagination-plan") {
+      preparedPagination = true;
+      return new Response("unexpected pagination plan request", { status: 500 });
+    }
+    if (url === "/api/query/execute-multi") {
+      executeBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify([{ columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    await store.executeTabSql(tabId, 'SELECT * FROM "users" LIMIT 100;');
+
+    assert.equal(preparedPagination, false);
+    assert.equal(executeBody.maxRows, 100);
+    assert.equal(executeBody.fetchSize, 100);
+    assert.equal(tab.resultPageLimit, 100);
+    assert.equal(tab.resultPageOffset, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
 test("activating an empty data tab waits for explicit execution", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
@@ -2754,6 +2858,30 @@ test("new table structure tabs can open multiple drafts while existing tables st
     assert.notEqual(secondDraftId, firstDraftId);
     assert.equal(secondEditId, firstEditId);
     assert.equal(store.tabs.length, 3);
+  } finally {
+    restoreStorage();
+  }
+});
+
+test("reopening table structure tabs records the requested initial tab", () => {
+  const restoreStorage = installMemoryStorage();
+  try {
+    setActivePinia(createPinia());
+    const store = useQueryStore();
+
+    const structureId = store.openTableStructure("conn-1", "db", "public", "users", "indexes");
+    const firstTab = store.tabs.find((item) => item.id === structureId);
+
+    assert.equal(firstTab?.structureInitialTab, "indexes");
+    assert.equal(firstTab?.structureInitialTabRequestId, 1);
+
+    const reusedStructureId = store.openTableStructure("conn-1", "db", "public", "users", "foreignKeys");
+    const reusedTab = store.tabs.find((item) => item.id === reusedStructureId);
+
+    assert.equal(reusedStructureId, structureId);
+    assert.equal(reusedTab?.structureInitialTab, "foreignKeys");
+    assert.equal(reusedTab?.structureInitialTabRequestId, 2);
+    assert.equal(store.activeTabId, structureId);
   } finally {
     restoreStorage();
   }

@@ -34,6 +34,7 @@ jobs:
 
           VERSIONS=$(cat agents/versions.json)
           PREV_VERSIONS="$VERSIONS"
+          MANUAL_VERSIONS_CHANGED=false
 
           if [ -z "$PREV_TAG" ]; then
             echo "No previous agents-v tag found; treating this as the first migrated agents release"
@@ -50,9 +51,9 @@ jobs:
           echo "Comparing $PREV_TAG..HEAD"
 
           if [ "$SKIP_BUMP" != "true" ] && ! git diff --quiet "$PREV_TAG"..HEAD -- agents/versions.json 2>/dev/null; then
-            echo "Manual agents/versions.json bump detected; using it as the release version source."
-            PREV_VERSIONS=$(git show "$PREV_TAG:agents/versions.json")
-            SKIP_BUMP=true
+            echo "Manual agents/versions.json changes detected; preserving manually changed module versions and auto-bumping the rest."
+            PREV_VERSIONS=$(git show "${PREV_TAG}:agents/versions.json")
+            MANUAL_VERSIONS_CHANGED=true
           fi
 
           CHANGED=false
@@ -60,6 +61,12 @@ jobs:
           if [ "$SKIP_BUMP" = "true" ]; then
             echo "Skipping automatic module version bump for migrated first release; versions.json was carried over from dbx-agents."
           else
+            if git diff --quiet "$PREV_TAG"..HEAD -- agents/common/ 2>/dev/null; then
+              COMMON_CHANGED=false
+            else
+              COMMON_CHANGED=true
+            fi
+
             for dir in $(echo "$VERSIONS" | python3 -c "import sys,json; [print(k) for k in json.load(sys.stdin)]"); do
               if [ "$dir" = "oracle" ] && [ -d "agents/drivers/oracle-go" ]; then
                 CHECK_DIR="drivers/oracle-go"
@@ -71,30 +78,40 @@ jobs:
                 continue
               fi
               DIFF_PATHS=("agents/$CHECK_DIR/")
-                # common changes affect all modules
-                if git diff --quiet "$PREV_TAG"..HEAD -- agents/common/ 2>/dev/null; then
-                  COMMON_CHANGED=false
-                else
-                  COMMON_CHANGED=true
-                fi
+              OLD_VER=$(echo "$VERSIONS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('$dir','0.1.0'))")
+              PREV_VER=$(PREV_VERSIONS_JSON="$PREV_VERSIONS" MODULE_NAME="$dir" python3 - <<'PY'
+          import json, os
+          versions = json.loads(os.environ["PREV_VERSIONS_JSON"])
+          print(versions.get(os.environ["MODULE_NAME"], ""))
+          PY
+          )
+              MANUALLY_VERSIONED=false
+              if [ "$MANUAL_VERSIONS_CHANGED" = "true" ] && { [ -z "$PREV_VER" ] || [ "$PREV_VER" != "$OLD_VER" ]; }; then
+                MANUALLY_VERSIONED=true
+              fi
 
-                if git diff --quiet "$PREV_TAG"..HEAD -- "${DIFF_PATHS[@]}" 2>/dev/null && [ "$COMMON_CHANGED" = "false" ]; then
-                  echo "  $dir: no changes"
+              if git diff --quiet "$PREV_TAG"..HEAD -- "${DIFF_PATHS[@]}" 2>/dev/null && [ "$COMMON_CHANGED" = "false" ]; then
+                echo "  $dir: no changes"
+              elif [ "$MANUALLY_VERSIONED" = "true" ]; then
+                if [ -z "$PREV_VER" ]; then
+                  echo "  $dir: CHANGED, new module version kept at $OLD_VER"
                 else
-                  echo "  $dir: CHANGED"
-                  OLD_VER=$(echo "$VERSIONS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('$dir','0.1.0'))")
-                  IFS='.' read -r major minor patch <<< "$OLD_VER"
-                  NEW_VER="$major.$minor.$((patch + 1))"
-                  VERSIONS=$(echo "$VERSIONS" | python3 -c "
+                  echo "  $dir: CHANGED, manual version $PREV_VER -> $OLD_VER"
+                fi
+              else
+                echo "  $dir: CHANGED"
+                IFS='.' read -r major minor patch <<< "$OLD_VER"
+                NEW_VER="$major.$minor.$((patch + 1))"
+                VERSIONS=$(echo "$VERSIONS" | python3 -c "
           import sys, json
           d = json.load(sys.stdin)
           d['$dir'] = '$NEW_VER'
           json.dump(d, sys.stdout, indent=2)
           print()
           ")
-                  CHANGED=true
-                  echo "  $dir: $OLD_VER -> $NEW_VER"
-                fi
+                CHANGED=true
+                echo "  $dir: $OLD_VER -> $NEW_VER"
+              fi
             done
           fi
 

@@ -58,6 +58,7 @@ import { kvRootNodeLabel } from "@/lib/kvRootPresentation";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redisKeyPattern";
 import { appendAgentDriverUpdateHint, hasAgentDriverUpdate, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
 import i18n from "@/i18n";
+import type { MqAdminConfig } from "@/types/mq";
 
 const PINNED_TREE_NODES_STORAGE_KEY = "dbx-pinned-tree-nodes";
 const ACTIVE_CONNECTION_STORAGE_KEY = "dbx-active-connection";
@@ -75,6 +76,13 @@ function sidebarObjectGroupPageSize(): number {
   const size = settingsStore.desktopSettings.sidebar_table_page_size;
   return typeof size === "number" && size > 0 ? size : 500;
 }
+
+function isKafkaMqConnection(config: ConnectionConfig | undefined): boolean {
+  if (!config || config.db_type !== "mq") return false;
+  if (config.driver_profile === "kafka") return true;
+  return (config.external_config as Partial<MqAdminConfig> | undefined)?.systemKind === "kafka";
+}
+
 type ImportSource = "dbx" | "navicat" | "dbeaver" | "datagrip";
 
 interface LocateTableTarget {
@@ -127,12 +135,16 @@ function ensureSqlServerLinkedRootNode(connectionId: string, children: TreeNode[
 // Temporary storage for DataGrip import payload (used to read Keychain passwords after import)
 let pendingDataGripPayload: { format: "datagrip-import"; dataSources: string; dataSourcesLocal?: string } | null = null;
 
-interface TreeClipboardTableStructure {
-  kind: "table-structure";
+interface TreeClipboardTableEntry {
   connectionId: string;
   database: string;
   schema?: string;
   tableName: string;
+}
+
+export interface TreeClipboard {
+  kind: "table-copy";
+  tables: TreeClipboardTableEntry[];
 }
 
 interface LoadTreeOptions {
@@ -160,7 +172,7 @@ export const useConnectionStore = defineStore("connection", () => {
   const selectedTreeNodeId = ref<string | null>(null);
   const selectedTreeNodeIds = ref<string[]>([]);
   const treeSelectionAnchorId = ref<string | null>(null);
-  const treeClipboard = ref<TreeClipboardTableStructure | null>(null);
+  const treeClipboard = ref<TreeClipboard | null>(null);
 
   watch(activeConnectionId, (id) => {
     if (id) localStorage.setItem(ACTIVE_CONNECTION_STORAGE_KEY, id);
@@ -1629,9 +1641,7 @@ export const useConnectionStore = defineStore("connection", () => {
       if (useCachedChildren(node, options)) return;
 
       const config = getConfig(connectionId);
-      const isKafka = config?.driver_profile === "kafka";
-
-      if (isKafka) {
+      if (isKafkaMqConnection(config)) {
         // Kafka has no tenant/namespace concept. Create a synthetic child
         // that opens the MQ admin console directly when clicked.
         setChildren(node, [

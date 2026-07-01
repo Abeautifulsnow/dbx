@@ -582,7 +582,7 @@ pub fn run() {
             open_connection_deep_links(app.handle(), startup_links);
 
             let app_handle = app.handle().clone();
-            commands::mcp_bridge::start(app_handle, state);
+            commands::mcp_bridge::start(app_handle, state, data_dir);
             eprintln!("[STARTUP] setup complete in {:?} (total {:?})", setup_start.elapsed(), startup_begin.elapsed());
 
             if let Some(decorations) = native_window_decorations_override(std::env::consts::OS) {
@@ -745,6 +745,7 @@ pub fn run() {
             commands::query::build_create_schema_sql,
             commands::query::build_drop_schema_sql,
             commands::query::build_duplicate_table_structure_sql,
+            commands::query::build_copy_table_data_sql,
             commands::query::build_executable_object_source_statements,
             commands::query::build_executable_object_source_sql,
             commands::query::build_editable_object_source,

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, watch, onBeforeUnmount, inject } from "vue";
+import { ref, computed, nextTick, watch, onMounted, onBeforeUnmount, inject } from "vue";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
@@ -74,6 +74,7 @@ import { connectionFilePath, defaultSqliteBackupFileName, isMemorySqlitePath, sq
 import { revealPathInFileManager } from "@/lib/tauri";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/queryEditorTableDrop";
 import { editableRowIdentifierColumns, usesSyntheticRowIdKey } from "@/lib/tableEditing";
+import { tableOpenPageLimit } from "@/lib/tableOpenPageLimit";
 import { supportsDatabaseCreation, supportsDatabaseSearch, supportsFieldLineage, supportsObjectBrowserTreeNode, supportsSchemaDiagram, supportsSqlFileExecution, supportsTableImport, supportsTableTruncate, supportsTableStructureEditing, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
 import { copyNameForTreeNode, objectSourceKindForTreeNode, sidebarSelectionCopyAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "@/lib/treeNodeClick";
 import { formatSqlInsert } from "@/lib/exportFormats";
@@ -89,6 +90,7 @@ import {
   buildDropTableSql,
   buildDropTableChildObjectSql,
   buildDuplicateTableStructureSql,
+  buildCopyTableDataSql,
   buildEmptyTableSql,
   buildSetSchemaCommentSql,
   buildTruncateTableSql,
@@ -108,6 +110,7 @@ import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionObjectT
 import { hexToRgba } from "@/lib/color";
 import { focusSidebarRenameInput } from "@/lib/sidebarRenameFocus";
 import { hasTreeNodeDatabaseContext } from "@/lib/treeNodeContext";
+import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, tableDataCopyColumnOptions, type PasteTableMode, type TableClipboardContext } from "@/lib/tableClipboard";
 import { sidebarDisplayTableName } from "@/lib/sidebarTableNameDisplay";
 import { selectedTreeNodesInVisibleOrder as orderSelectedTreeNodes, treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebarTreeSelection";
 import { selectedConnectionDeleteTargets } from "@/lib/sidebarConnectionSelection";
@@ -747,18 +750,39 @@ function isPasteTreeClipboardShortcut(event: KeyboardEvent): boolean {
   return (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "v";
 }
 
+function pasteTableTargetContext(): TableClipboardContext | null {
+  if (!props.node.connectionId || !props.node.database) return null;
+  return {
+    connectionId: props.node.connectionId,
+    database: props.node.database,
+    schema: props.node.schema,
+  };
+}
+
+function canPasteTreeClipboardToCurrentNode(): boolean {
+  const clipboard = connectionStore.treeClipboard;
+  return clipboard?.kind === "table-copy" && tableClipboardMatchesTarget(clipboard.tables, pasteTableTargetContext());
+}
+
 function requestPasteTreeClipboard(): boolean {
   const clipboard = connectionStore.treeClipboard;
-  if (clipboard?.kind !== "table-structure") return false;
-  duplicateStructure({
-    id: `clipboard:${clipboard.connectionId}:${clipboard.database}:${clipboard.schema || ""}:${clipboard.tableName}`,
-    type: "table",
-    label: clipboard.tableName,
-    connectionId: clipboard.connectionId,
-    database: clipboard.database,
-    schema: clipboard.schema,
-  });
+  if (clipboard?.kind !== "table-copy" || !canPasteTreeClipboardToCurrentNode()) return false;
+  pasteTableMode.value = defaultPasteTableMode(currentDatabaseType());
+  pasteTableEntries.value = clipboard.tables.map((entry) => ({
+    sourceName: entry.tableName,
+    targetName: `${entry.tableName}_copy`,
+    connectionId: entry.connectionId,
+    database: entry.database,
+    schema: entry.schema,
+  }));
+  showPasteDialog.value = true;
   return true;
+}
+
+function onSidebarRequestPasteTable(event: Event) {
+  const nodeId = (event as CustomEvent<{ nodeId?: string }>).detail?.nodeId;
+  if (nodeId !== props.node.id) return;
+  requestPasteTreeClipboard();
 }
 
 function requestRefreshSelectedNode(): boolean {
@@ -1024,7 +1048,7 @@ async function openData() {
 
     const querySchema = connectionObjectTreeQuerySchema(config, node.database, tableSchema);
     const effectiveDbType = effectiveDatabaseTypeForConnection(config);
-    const limit = settingsStore.editorSettings.pageSize;
+    const limit = tableOpenPageLimit();
     const refreshTableMetaInBackground = async () => {
       const metadataStartedAt = performance.now();
       console.info("[DBX][openData:metadata:start]", {
@@ -1111,7 +1135,11 @@ async function openData() {
     logPhase("sql-updated", { tabId });
 
     console.info("[DBX][openData:execute:start]", { traceId, tabId, elapsed: elapsed() });
-    await queryStore.executeTabSql(tabId, sql, { sourceTraceId: traceId, skipEnsureConnected: true });
+    await queryStore.executeTabSql(tabId, sql, {
+      sourceTraceId: traceId,
+      skipEnsureConnected: true,
+      pagination: { limit, offset: 0 },
+    });
     console.info("[DBX][openData:execute:done]", { traceId, tabId, elapsed: elapsed() });
     logPhase("execute-tab-sql", { tabId });
     if (shouldRefreshTableMeta && isCurrentDataTab()) {
@@ -1407,17 +1435,18 @@ async function copySelectedNames() {
 
 function updateTreeClipboardForNodes(nodes: TreeNode[]) {
   const tableNodes = nodes.filter((node): node is DuplicateStructureSource => node.type === "table" && !!node.connectionId && !!node.database && typeof node.label === "string");
-  if (nodes.length !== 1 || tableNodes.length !== 1) {
+  if (tableNodes.length === 0) {
     connectionStore.treeClipboard = null;
     return;
   }
-  const table = tableNodes[0]!;
   connectionStore.treeClipboard = {
-    kind: "table-structure",
-    connectionId: table.connectionId,
-    database: table.database,
-    schema: table.schema,
-    tableName: table.label,
+    kind: "table-copy",
+    tables: tableNodes.map((node) => ({
+      connectionId: node.connectionId,
+      database: node.database,
+      schema: node.schema,
+      tableName: node.label,
+    })),
   };
 }
 
@@ -1461,6 +1490,12 @@ const dropSchemaPreviewSql = ref("");
 const showDuplicateDialog = ref(false);
 const duplicateTableName = ref("");
 const duplicateStructureSource = ref<DuplicateStructureSource | null>(null);
+
+// Paste table dialog state
+const showPasteDialog = ref(false);
+const pasteTableMode = ref<PasteTableMode>("structure-and-data");
+const pasteTableEntries = ref<{ sourceName: string; targetName: string; connectionId: string; database: string; schema?: string }[]>([]);
+const pasteTableDataCopySupported = computed(() => supportsWholeRowTableDataCopy(currentDatabaseType()));
 
 const ddlTarget = ref<TreeNode | null>(null);
 const showDdlDialog = ref(false);
@@ -2542,6 +2577,96 @@ async function confirmDuplicateStructure() {
   }
 }
 
+async function confirmPasteTable() {
+  const entries = pasteTableEntries.value.filter((entry) => entry.targetName.trim());
+  if (entries.length === 0) return;
+  const mode = pasteTableMode.value;
+  const copyData = pasteTableModeCopiesData(mode) && pasteTableDataCopySupported.value;
+  showPasteDialog.value = false;
+  let successCount = 0;
+  let failCount = 0;
+  const refreshedConnections = new Set<string>();
+  for (const entry of entries) {
+    const targetName = entry.targetName.trim();
+    try {
+      await connectionStore.ensureConnected(entry.connectionId);
+      const databaseType = entry.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(entry.connectionId)) : undefined;
+      if (mode === "structure-and-data" || mode === "structure-only") {
+        const structureSql = await buildDuplicateTableStructureSql({
+          databaseType,
+          schema: entry.schema,
+          sourceName: entry.sourceName,
+          targetName,
+        });
+        await api.executeQuery(entry.connectionId, entry.database, structureSql, entry.schema);
+      }
+      if (copyData) {
+        const sourceColumns = await api.getColumns(entry.connectionId, entry.database, entry.schema || "", entry.sourceName);
+        const dataCopyColumnOptions = tableDataCopyColumnOptions(databaseType, sourceColumns);
+        if (dataCopyColumnOptions.columns.length === 0) {
+          throw new Error("No writable columns available for table data copy.");
+        }
+        const dataSql = await buildCopyTableDataSql({
+          databaseType,
+          schema: entry.schema,
+          sourceName: entry.sourceName,
+          targetName,
+          ...dataCopyColumnOptions,
+        });
+        await api.executeQuery(entry.connectionId, entry.database, dataSql, entry.schema);
+      }
+      successCount++;
+      const refreshKey = `${entry.connectionId}:${entry.database}:${entry.schema || ""}`;
+      if (!refreshedConnections.has(refreshKey)) {
+        refreshedConnections.add(refreshKey);
+        await connectionStore.refreshObjectListTreeNode(entry.connectionId, entry.database, entry.schema);
+      }
+    } catch (e: any) {
+      failCount++;
+      console.error(`Failed to paste table "${entry.sourceName}" -> "${targetName}":`, e);
+    }
+  }
+  if (failCount === 0) {
+    toast(t("contextMenu.batchPasteSuccess", { count: successCount }), 3000);
+  } else {
+    toast(t("contextMenu.batchPastePartialFail", { success: successCount, failed: failCount }), 5000);
+  }
+}
+
+function copyTableToClipboard() {
+  const node = props.node;
+  if (node.type !== "table" || !node.connectionId || !node.database) return;
+  connectionStore.treeClipboard = {
+    kind: "table-copy",
+    tables: [
+      {
+        connectionId: node.connectionId,
+        database: node.database,
+        schema: node.schema,
+        tableName: node.label,
+      },
+    ],
+  };
+  toast(t("contextMenu.pasteTableClipboardUpdated"), 2000);
+}
+
+function openPasteTableDialog() {
+  const clipboard = connectionStore.treeClipboard;
+  if (clipboard?.kind !== "table-copy" || !canPasteTreeClipboardToCurrentNode()) {
+    toast(t("contextMenu.noTableToPaste"), 2000);
+    return;
+  }
+  pasteTableMode.value = defaultPasteTableMode(currentDatabaseType());
+  pasteTableEntries.value = clipboard.tables.map((entry) => ({
+    sourceName: entry.tableName,
+    targetName: `${entry.tableName}_copy`,
+    connectionId: entry.connectionId,
+    database: entry.database,
+    schema: entry.schema,
+  }));
+  showPasteDialog.value = true;
+}
+
 function createTable() {
   const node = props.node;
   if (!node.connectionId || !node.database) return;
@@ -3437,7 +3562,14 @@ function onRowMouseDown(event: MouseEvent) {
   }
 }
 
-onBeforeUnmount(() => finishTableReferenceDrag());
+onMounted(() => {
+  window.addEventListener("dbx:sidebar-request-paste-table", onSidebarRequestPasteTable);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("dbx:sidebar-request-paste-table", onSidebarRequestPasteTable);
+  finishTableReferenceDrag();
+});
 
 // ---- CustomContextMenu ----
 
@@ -3917,6 +4049,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
     if (isTableNotView.value) {
       items.push({ label: "", separator: true });
       items.push({ label: t("contextMenu.duplicateStructure"), action: duplicateStructure, icon: CopyPlus });
+      items.push({ label: t("contextMenu.copyTable"), action: copyTableToClipboard, icon: Copy });
       if (supportsTruncate.value) {
         destructiveActions.push({
           label: t("contextMenu.truncateTable"),
@@ -4033,6 +4166,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
     const canLoadAllObjectGroup = node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views";
     if (node.type === "group-tables" && canCreateTable.value) {
       items.push({ label: t("contextMenu.createTable"), action: createTable, icon: Plus });
+      if (canPasteTreeClipboardToCurrentNode()) {
+        items.push({ label: t("contextMenu.pasteTable"), action: openPasteTableDialog, icon: Clipboard });
+      }
     }
     if (node.type === "group-views" && node.connectionId && node.database) {
       items.push({ label: t("contextMenu.createView"), action: createView, icon: Plus });
@@ -4319,6 +4455,41 @@ function treeItemMenuItems(): ContextMenuItem[] {
       <DialogFooter>
         <Button variant="outline" @click="showDuplicateDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button :disabled="!duplicateTableName.trim()" @click="confirmDuplicateStructure">{{ t("dangerDialog.confirm") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showPasteDialog">
+    <DialogContent class="sm:max-w-[500px]">
+      <DialogHeader>
+        <DialogTitle>{{ pasteTableEntries.length > 1 ? t("contextMenu.batchPasteTitle") : t("contextMenu.pasteTableConfirmTitle") }}</DialogTitle>
+      </DialogHeader>
+      <div class="space-y-4">
+        <div class="flex gap-2">
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer" :class="{ 'opacity-50 cursor-not-allowed': !pasteTableDataCopySupported }">
+            <input v-model="pasteTableMode" type="radio" value="structure-and-data" class="accent-primary" :disabled="!pasteTableDataCopySupported" />
+            {{ t("contextMenu.pasteOptionStructureAndData") }}
+          </label>
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer">
+            <input v-model="pasteTableMode" type="radio" value="structure-only" class="accent-primary" />
+            {{ t("contextMenu.pasteOptionStructureOnly") }}
+          </label>
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer" :class="{ 'opacity-50 cursor-not-allowed': !pasteTableDataCopySupported }">
+            <input v-model="pasteTableMode" type="radio" value="data-only" class="accent-primary" :disabled="!pasteTableDataCopySupported" />
+            {{ t("contextMenu.pasteOptionDataOnly") }}
+          </label>
+        </div>
+        <div class="space-y-2 max-h-64 overflow-y-auto">
+          <div v-for="(entry, idx) in pasteTableEntries" :key="idx" class="flex items-center gap-2">
+            <span class="text-sm text-muted-foreground truncate min-w-0 flex-shrink basis-1/3" :title="entry.sourceName">{{ entry.sourceName }}</span>
+            <span class="text-xs text-muted-foreground flex-shrink-0">&rarr;</span>
+            <Input v-model="entry.targetName" class="flex-1 h-8 text-sm" :placeholder="t('contextMenu.duplicateNamePlaceholder')" />
+          </div>
+        </div>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" @click="showPasteDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="pasteTableEntries.every((e) => !e.targetName.trim())" @click="confirmPasteTable">{{ t("dangerDialog.confirm") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

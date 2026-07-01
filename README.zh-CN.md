@@ -157,6 +157,8 @@ npx @dbx-app/mcp-server
 }
 ```
 
+Windows 便携版需要在 MCP 配置中设置 `DBX_DATA_DIR`，指向 `DBX.exe` 同级的 `data` 目录（即包含 `dbx.db` 的文件夹）。
+
 支持 Claude Code、Cursor、Windsurf 等 MCP 兼容的 AI 助手。可列出连接、浏览表、执行 SQL，还能直接在 DBX 界面中打开表。
 
 DBX 也提供独立 CLI 包，适合终端、脚本和 Codex 工作流：
@@ -248,6 +250,10 @@ environment:
 ```bash
 sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
 ```
+
+**NIXOS/NIX :** 
+
+<a href="README-NIX.md">查看 README-NIX.md</a>
 
 **Windows：**
 

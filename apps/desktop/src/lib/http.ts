@@ -108,7 +108,7 @@ import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceI
 import type { BuildViewDdlInput } from "@/lib/viewDdl";
 import type { BuildRenameObjectSqlOptions } from "@/lib/objectRenameSql";
 import type { CreateDatabaseSqlOptions } from "@/lib/createDatabaseSql";
-import type { DatabaseNameSqlOptions, DropTableChildObjectSqlOptions, DropObjectSqlOptions, DuplicateTableStructureSqlOptions, SchemaNameSqlOptions, TableAdminSqlOptions } from "@/lib/dbAdminSql";
+import type { DatabaseNameSqlOptions, DropTableChildObjectSqlOptions, DropObjectSqlOptions, DuplicateTableStructureSqlOptions, CopyTableDataSqlOptions, SchemaNameSqlOptions, TableAdminSqlOptions } from "@/lib/dbAdminSql";
 import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions } from "@/lib/databaseExport";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataCompare";
 import { apiUrl } from "@/lib/webPath";
@@ -774,6 +774,10 @@ export async function buildDropSchemaSql(options: SchemaNameSqlOptions): Promise
 
 export async function buildDuplicateTableStructureSql(options: DuplicateTableStructureSqlOptions): Promise<string> {
   return post("/api/query/build-duplicate-table-structure-sql", { options });
+}
+
+export async function buildCopyTableDataSql(options: CopyTableDataSqlOptions): Promise<string> {
+  return post("/api/query/build-copy-table-data-sql", { options });
 }
 
 export async function buildExecutableObjectSourceStatements(input: BuildEditableObjectSourceSqlInput): Promise<string[]> {
@@ -1861,11 +1865,13 @@ export async function checkMcpServerStatus(): Promise<import("./tauri").McpServe
   return {
     installed: false,
     npm_available: false,
+    node_path: null,
     node_version: null,
     current_version: null,
     latest_version: null,
     update_available: false,
     bin_path: null,
+    script_path: null,
     install_command: "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org",
     update_command: "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org",
     error: "MCP Server status is only available in the desktop app.",

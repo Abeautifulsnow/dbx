@@ -88,6 +88,7 @@ const AiAssistant = defineAsyncComponent(() => import("@/components/editor/AiAss
 const QueryHistory = defineAsyncComponent(() => import("@/components/editor/QueryHistory.vue"));
 const SqlLibraryPanel = defineAsyncComponent(() => import("@/components/layout/SqlLibraryPanel.vue"));
 const DriverStorePage = defineAsyncComponent(() => import("@/components/config/DriverStoreDialog.vue"));
+const EditorSettingsPage = defineAsyncComponent(() => import("@/components/editor/EditorSettingsDialog.vue"));
 const UpdateDialog = defineAsyncComponent(() => import("@/components/layout/UpdateDialog.vue"));
 const CloseActionPromptDialog = defineAsyncComponent(() => import("@/components/layout/CloseActionPromptDialog.vue"));
 const LoginPage = defineAsyncComponent(() => import("@/components/auth/LoginPage.vue"));
@@ -117,13 +118,16 @@ const setupRequired = ref(false);
 const showConnectionDialog = ref(false);
 const connectionDialogPrefill = ref<ConnectionDeepLinkDraft | null>(null);
 const connectionDialogInitialTab = ref<ConfigTab | undefined>(undefined);
-const showSettingsDialog = ref(false);
+const settingsPageTabOpen = ref(false);
+const settingsPageActive = ref(false);
 const settingsInitialTab = ref("editor");
 const settingsInitialSection = ref<string | undefined>(undefined);
 const showQueryEditorDdlDialog = ref(false);
 const driverStoreTabOpen = ref(false);
 const driverStoreActive = ref(false);
+const settingsReturnSurface = ref<"query" | "driverStore" | "welcome">("welcome");
 const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
+const showSettingsPage = computed(() => settingsPageTabOpen.value && settingsPageActive.value);
 const showQuickOpen = ref(false);
 const agentDriverUpdateCount = ref(0);
 const showHistory = ref(false);
@@ -259,7 +263,37 @@ const updateNotificationsEnabled = computed(() => settingsStore.editorSettings.u
 function openSettings(initialTab = "editor", initialSection?: string) {
   settingsInitialTab.value = initialTab;
   settingsInitialSection.value = initialSection;
-  showSettingsDialog.value = true;
+  if (!settingsPageActive.value) {
+    settingsReturnSurface.value = showDriverStore.value ? "driverStore" : activeTab.value ? "query" : "welcome";
+  }
+  activateSettingsPage();
+}
+
+function activateSettingsPage() {
+  settingsPageTabOpen.value = true;
+  settingsPageActive.value = true;
+  driverStoreActive.value = false;
+}
+
+function closeSettingsPage() {
+  settingsPageTabOpen.value = false;
+  settingsPageActive.value = false;
+  if (settingsReturnSurface.value === "driverStore" && driverStoreTabOpen.value) {
+    driverStoreActive.value = true;
+    return;
+  }
+  driverStoreActive.value = false;
+}
+
+function openDriverStorePage() {
+  driverStoreTabOpen.value = true;
+  driverStoreActive.value = true;
+  settingsPageActive.value = false;
+}
+
+function closeDriverStorePage() {
+  driverStoreTabOpen.value = false;
+  driverStoreActive.value = false;
 }
 const toolbarAgentDriverUpdateCount = computed(() => (updateNotificationsEnabled.value ? agentDriverUpdateCount.value : 0));
 const toolbarHasUpdateAvailable = computed(() => updateNotificationsEnabled.value && hasUpdateAvailable.value);
@@ -369,6 +403,7 @@ watch(
     }
     if (id) newQueryContextSource.value = "tab";
     if (id && driverStoreActive.value) driverStoreActive.value = false;
+    if (id && settingsPageActive.value) settingsPageActive.value = false;
     selectedSql.value = "";
     activeOutputView.value = "result";
     if (id) queryStore.reloadEvictedTab(id);
@@ -1186,6 +1221,7 @@ function activateQueryTab(tabId: string): boolean {
   dispatchBeforeTabSwitch(tabId);
   queryStore.activeTabId = tabId;
   driverStoreActive.value = false;
+  settingsPageActive.value = false;
   return true;
 }
 
@@ -1269,9 +1305,10 @@ function handleKeydown(e: KeyboardEvent) {
   }
   if (isCloseTabShortcut(e, shortcuts)) {
     e.preventDefault();
-    if (showDriverStore.value) {
-      driverStoreTabOpen.value = false;
-      driverStoreActive.value = false;
+    if (showSettingsPage.value) {
+      closeSettingsPage();
+    } else if (showDriverStore.value) {
+      closeDriverStorePage();
     } else if (queryStore.activeTabId) {
       queryStore.closeTab(queryStore.activeTabId);
     }
@@ -1401,8 +1438,7 @@ function handleContextMenu(e: MouseEvent) {
 }
 
 function openDriverStoreFromEvent() {
-  driverStoreTabOpen.value = true;
-  driverStoreActive.value = true;
+  openDriverStorePage();
 }
 
 function runUpdateNotificationChecks() {
@@ -1516,6 +1552,7 @@ onUnmounted(() => {
           :show-history="showHistory"
           :show-sql-library="showSqlLibraryPanel"
           :show-driver-store="showDriverStore"
+          :show-settings-page="showSettingsPage"
           :checking-updates="checkingUpdates"
           :has-update-available="toolbarHasUpdateAvailable"
           :agent-driver-update-count="toolbarAgentDriverUpdateCount"
@@ -1529,10 +1566,7 @@ onUnmounted(() => {
           @toggle-sql-library="toggleSqlLibrary"
           @open-github="openGitHub"
           @open-settings="openSettings()"
-          @open-driver-store="
-            driverStoreTabOpen = true;
-            driverStoreActive = true;
-          "
+          @open-driver-store="openDriverStorePage"
           @check-updates="checkUpdates()"
           @open-transfer="dialogs.showTransferDialog.value = true"
           @open-sql-file="dialogs.showSqlFileDialog.value = true"
@@ -1553,20 +1587,32 @@ onUnmounted(() => {
               <AppTabBar
                 :driver-store-open="driverStoreTabOpen"
                 :driver-store-active="driverStoreActive"
+                :settings-page-open="settingsPageTabOpen"
+                :settings-page-active="settingsPageActive"
                 :agent-driver-update-count="toolbarAgentDriverUpdateCount"
-                @activate-driver-store="
-                  driverStoreTabOpen = true;
-                  driverStoreActive = true;
-                "
-                @activate-tab="driverStoreActive = false"
-                @close-driver-store="
-                  driverStoreTabOpen = false;
+                @activate-driver-store="openDriverStorePage"
+                @activate-settings-page="activateSettingsPage"
+                @activate-tab="
                   driverStoreActive = false;
+                  settingsPageActive = false;
                 "
+                @close-driver-store="closeDriverStorePage"
+                @close-settings-page="closeSettingsPage"
                 @save-tab="handleSaveTab"
               />
               <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" @update-count-change="updateAgentDriverUpdateCount" />
-              <div v-if="activeTab" v-show="!driverStoreActive" class="flex flex-col flex-1 min-h-0">
+              <EditorSettingsPage
+                v-if="settingsPageTabOpen"
+                v-show="settingsPageActive"
+                variant="page"
+                :open="settingsPageTabOpen"
+                :initial-tab="settingsInitialTab"
+                :initial-section="settingsInitialSection"
+                :app-version="appVersion"
+                class="flex-1 min-h-0"
+                @update:open="(open: boolean) => (open ? activateSettingsPage() : closeSettingsPage())"
+              />
+              <div v-if="activeTab" v-show="!driverStoreActive && !settingsPageActive" class="flex flex-col flex-1 min-h-0">
                 <EditorToolbar
                   v-if="activeTab.mode === 'query' && !isPreviewTab(activeTab)"
                   :active-tab="activeTab"
@@ -1666,7 +1712,7 @@ onUnmounted(() => {
                 </KeepAlive>
               </div>
               <WelcomeScreen
-                v-else-if="!driverStoreActive"
+                v-else-if="!driverStoreActive && !settingsPageActive"
                 :connection-stats="connectionStats"
                 :recent-connections="recentConnections"
                 :saved-sql-history-items="savedSqlHistoryItems"
@@ -1708,10 +1754,6 @@ onUnmounted(() => {
           :show-connection-dialog="showConnectionDialog"
           :connection-prefill="connectionDialogPrefill"
           :connection-initial-tab="connectionDialogInitialTab"
-          :show-settings-dialog="showSettingsDialog"
-          :settings-initial-tab="settingsInitialTab"
-          :settings-initial-section="settingsInitialSection"
-          :app-version="appVersion"
           :show-danger-dialog="showDangerDialog"
           :danger-sql="dangerSql"
           :suppress-danger-confirm="suppressDangerConfirm"
@@ -1719,7 +1761,6 @@ onUnmounted(() => {
           :sql-parameter-source-sql="sqlParameterSourceSql"
           :sql-parameter-names="sqlParameterNames"
           @update:show-connection-dialog="setConnectionDialogOpen"
-          @update:show-settings-dialog="showSettingsDialog = $event"
           @update:show-danger-dialog="showDangerDialog = $event"
           @update:suppress-danger-confirm="suppressDangerConfirm = $event"
           @update:show-sql-parameter-dialog="showSqlParameterDialog = $event"
@@ -1738,8 +1779,7 @@ onUnmounted(() => {
           "
           @open-driver-store="
             setConnectionDialogOpen(false);
-            driverStoreTabOpen = true;
-            driverStoreActive = true;
+            openDriverStorePage();
           "
           @open-lineage-target="openLineageTarget"
           @open-database-search-target="openDatabaseSearchTarget"

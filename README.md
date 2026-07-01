@@ -156,6 +156,8 @@ Add to your `.mcp.json`:
 }
 ```
 
+Windows portable builds need `DBX_DATA_DIR` in the MCP config, pointing to the `data` directory next to `DBX.exe` (the folder that contains `dbx.db`).
+
 Works with Claude Code, Cursor, Windsurf, and any MCP-compatible agent. Supports listing connections, browsing tables, executing SQL, and opening tables directly in DBX's UI.
 
 DBX also provides a dedicated CLI package for terminal, script, and Codex workflows:
@@ -249,6 +251,10 @@ No additional dependencies required.
 ```bash
 sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
 ```
+
+**NIXOS/NIX :** 
+
+<a href="README-NIX.md">See README-NIX.md</a>
 
 **Windows:**
 

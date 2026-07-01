@@ -55,7 +55,7 @@ import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceI
 import type { BuildViewDdlInput } from "@/lib/viewDdl";
 import type { BuildRenameObjectSqlOptions } from "@/lib/objectRenameSql";
 import type { CreateDatabaseSqlOptions } from "@/lib/createDatabaseSql";
-import type { DatabaseNameSqlOptions, DropTableChildObjectSqlOptions, DropObjectSqlOptions, DuplicateTableStructureSqlOptions, SchemaNameSqlOptions, TableAdminSqlOptions } from "@/lib/dbAdminSql";
+import type { DatabaseNameSqlOptions, DropTableChildObjectSqlOptions, DropObjectSqlOptions, DuplicateTableStructureSqlOptions, CopyTableDataSqlOptions, SchemaNameSqlOptions, TableAdminSqlOptions } from "@/lib/dbAdminSql";
 import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions } from "@/lib/databaseExport";
 
 export interface AgentDriverInfo {
@@ -764,6 +764,10 @@ export async function buildDuplicateTableStructureSql(options: DuplicateTableStr
   return invoke("build_duplicate_table_structure_sql", { options });
 }
 
+export async function buildCopyTableDataSql(options: CopyTableDataSqlOptions): Promise<string> {
+  return invoke("build_copy_table_data_sql", { options });
+}
+
 export async function buildExecutableObjectSourceStatements(input: BuildEditableObjectSourceSqlInput): Promise<string[]> {
   return invoke("build_executable_object_source_statements", { input });
 }
@@ -1154,11 +1158,13 @@ export interface UpdateDownloadProgress {
 export interface McpServerStatus {
   installed: boolean;
   npm_available: boolean;
+  node_path: string | null;
   node_version: string | null;
   current_version: string | null;
   latest_version: string | null;
   update_available: boolean;
   bin_path: string | null;
+  script_path: string | null;
   install_command: string;
   update_command: string;
   error: string | null;
