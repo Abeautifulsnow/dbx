@@ -2,6 +2,7 @@
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 #[cfg(feature = "duckdb-bundled")]
 use duckdb::types::{TimeUnit, Value, ValueRef};
+use futures::StreamExt;
 use mysql_async::prelude::Queryable;
 use sqlparser::ast::{visit_relations_mut, Ident, ObjectName, ObjectNamePart, ObjectType, Statement};
 use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
@@ -2405,7 +2406,7 @@ pub async fn begin_manual_transaction(
                     .await
                     .map_err(|e| format!("SET search_path failed: {e}"))?;
             }
-            TxnConnection::Postgres(conn)
+            TxnConnection::Postgres(Box::new(conn))
         }
         TxnPoolHandle::Mysql(mysql_pool) => {
             let mut conn = mysql_pool.get_conn().await.map_err(|e| format!("Failed to get MySQL connection: {e}"))?;
@@ -2416,9 +2417,10 @@ pub async fn begin_manual_transaction(
 
     let txn_session_id = uuid::Uuid::new_v4().to_string();
     let session = TransactionSession {
-        connection: txn_conn,
+        connection: Arc::new(tokio::sync::Mutex::new(txn_conn)),
         pool_key: pool_key.clone(),
         last_activity: std::time::Instant::now(),
+        busy: false,
         connection_id: connection_id.to_string(),
         database: database.to_string(),
         schema: schema.map(|s| s.to_string()),
@@ -2447,9 +2449,9 @@ pub async fn execute_in_manual_transaction(
 ) -> Result<Vec<db::QueryResult>, String> {
     const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-    // Resolve statements and validate BEFORE removing the session from the
-    // global map. Copy out session fields we need so the read lock doesn't
-    // span async calls.
+    // Resolve statements and validate before taking the per-session connection
+    // lock. The session stays visible in the map so close/disconnect cleanup can
+    // remove it and roll back once the current DB operation releases the lock.
     let (pool_key, connection_id) = {
         let sessions = state.transaction_sessions.read().await;
         let session = sessions
@@ -2471,70 +2473,95 @@ pub async fn execute_in_manual_transaction(
     // session remains intact.
     check_read_only_for_connection_multi(state, &pool_key, &statements).await?;
 
-    // Take the session out of the global map so we don't hold the write lock
-    // across database I/O — one slow transaction must not block all others.
-    let mut session = {
+    let connection = {
         let mut sessions = state.transaction_sessions.write().await;
-        sessions.remove(txn_session_id).ok_or("Transaction session not found or expired")?
-    };
-
-    // Check idle timeout — auto-rollback if expired.
-    // Rollback also happens without the global lock.
-    if session.last_activity.elapsed() > TXN_IDLE_TIMEOUT {
-        match &mut session.connection {
-            TxnConnection::Postgres(conn) => {
-                let _ = conn.execute("ROLLBACK", &[]).await;
-            }
-            TxnConnection::Mysql(conn) => {
-                let _ = conn.query_drop("ROLLBACK").await;
-            }
+        let Some(session) = sessions.get_mut(txn_session_id) else {
+            return Err(
+                "Transaction session not found or expired; it may have been auto-rolled back due to inactivity"
+                    .to_string(),
+            );
+        };
+        if session.busy {
+            return Err("Transaction session is already executing".to_string());
         }
+        if session.last_activity.elapsed() > TXN_IDLE_TIMEOUT {
+            let session = sessions.remove(txn_session_id).expect("session exists");
+            Some(session.connection)
+        } else {
+            session.busy = true;
+            session.last_activity = std::time::Instant::now();
+            None
+        }
+    };
+    if let Some(connection) = connection {
+        let mut conn = connection.lock().await;
+        let _ = rollback_manual_txn_connection(&mut conn).await;
         return Err("Transaction was auto-rolled back due to 5 minutes of inactivity".to_string());
     }
 
-    session.last_activity = std::time::Instant::now();
+    let connection = {
+        let sessions = state.transaction_sessions.read().await;
+        sessions
+            .get(txn_session_id)
+            .map(|session| Arc::clone(&session.connection))
+            .ok_or("Transaction session not found or expired; it may have been auto-rolled back due to inactivity")?
+    };
     let row_limit = max_rows.unwrap_or(MAX_ROWS).max(1);
     let mut results = Vec::with_capacity(statements.len());
 
+    let mut conn = connection.lock().await;
     for (i, statement) in statements.iter().enumerate() {
-        let result = match &mut session.connection {
-            TxnConnection::Postgres(conn) => execute_manual_txn_postgres_statement(conn, statement, row_limit).await,
+        let result = match &mut *conn {
+            TxnConnection::Postgres(conn) => {
+                execute_manual_txn_postgres_statement(conn.as_ref(), statement, row_limit).await
+            }
             TxnConnection::Mysql(conn) => execute_manual_txn_mysql_statement(conn, statement, row_limit).await,
         };
         match result {
             Ok(query_result) => results.push(query_result),
             Err(e) => {
-                // Statement failed — rollback the held transaction and do NOT
-                // reinsert the session. The error message contains "auto-rolled back"
-                // so the frontend clears txnSessionId and shows the warning bar.
-                match &mut session.connection {
-                    TxnConnection::Postgres(conn) => {
-                        let _ = conn.execute("ROLLBACK", &[]).await;
-                    }
-                    TxnConnection::Mysql(conn) => {
-                        let _ = conn.query_drop("ROLLBACK").await;
-                    }
+                // Statement failure ends the transaction. If another cleanup path
+                // already removed the session, it owns the final rollback.
+                let should_rollback = {
+                    let mut sessions = state.transaction_sessions.write().await;
+                    sessions.remove(txn_session_id).is_some()
+                };
+                if should_rollback {
+                    let _ = rollback_manual_txn_connection(&mut conn).await;
                 }
                 return Err(format!("Statement {} failed: {}. Transaction was auto-rolled back.", i + 1, e));
             }
         }
     }
+    drop(conn);
 
-    // Execution succeeded — re-insert the session and schedule idle timeout watcher.
-    let txn_id = txn_session_id.to_string();
-    reinsert_session_and_watch(state, txn_id, session).await;
+    let should_watch = {
+        let mut sessions = state.transaction_sessions.write().await;
+        if let Some(session) = sessions.get_mut(txn_session_id) {
+            session.busy = false;
+            session.last_activity = std::time::Instant::now();
+            true
+        } else {
+            false
+        }
+    };
+    if should_watch {
+        spawn_txn_idle_watcher(state, txn_session_id.to_string());
+    }
 
     Ok(results)
 }
 
-/// Re-insert a transaction session into the global map and schedule an idle
-/// timeout watcher. The write lock is held only briefly for the insert.
-async fn reinsert_session_and_watch(state: &AppState, txn_session_id: String, session: TransactionSession) {
-    {
-        let mut sessions = state.transaction_sessions.write().await;
-        sessions.insert(txn_session_id.clone(), session);
+async fn rollback_manual_txn_connection(conn: &mut TxnConnection) -> Result<(), String> {
+    match conn {
+        TxnConnection::Postgres(conn) => {
+            conn.execute("ROLLBACK", &[]).await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
+        }
+        TxnConnection::Mysql(conn) => {
+            conn.query_drop("ROLLBACK").await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
+        }
     }
-    spawn_txn_idle_watcher(state, txn_session_id);
+    Ok(())
 }
 
 /// Spawn a background task that removes and rolls back a transaction session
@@ -2552,30 +2579,19 @@ fn spawn_txn_idle_watcher(state: &AppState, txn_session_id: String) {
         const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
         tokio::time::sleep(TXN_IDLE_TIMEOUT).await;
 
-        // Check if session exists and is expired.
-        let expired = {
-            let guard = sessions.read().await;
-            guard.get(&txn_session_id).map(|s| s.last_activity.elapsed() >= TXN_IDLE_TIMEOUT).unwrap_or(false)
-        };
-        if !expired {
-            return; // Not yet expired or already gone
-        }
-
-        // Remove the session with a write lock, release, then rollback.
         let removed: Option<TransactionSession> = {
             let mut guard = sessions.write().await;
-            guard.remove(&txn_session_id)
+            match guard.get(&txn_session_id) {
+                Some(session) if !session.busy && session.last_activity.elapsed() >= TXN_IDLE_TIMEOUT => {
+                    guard.remove(&txn_session_id)
+                }
+                _ => None,
+            }
         };
 
-        if let Some(mut session) = removed {
-            match &mut session.connection {
-                TxnConnection::Postgres(conn) => {
-                    let _ = conn.execute("ROLLBACK", &[]).await;
-                }
-                TxnConnection::Mysql(conn) => {
-                    let _ = conn.query_drop("ROLLBACK").await;
-                }
-            }
+        if let Some(session) = removed {
+            let mut conn = session.connection.lock().await;
+            let _ = rollback_manual_txn_connection(&mut conn).await;
             log::info!(
                 "[query][manual_txn:idle_timeout] session_id={} auto-rolled back after 5 minutes of inactivity",
                 txn_session_id
@@ -2590,23 +2606,23 @@ async fn execute_manual_txn_postgres_statement(
     row_limit: usize,
 ) -> Result<db::QueryResult, String> {
     if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "WITH", "TABLE"]) {
-        let rows = conn.query(sql, &[]).await.map_err(|e| format!("Query failed: {e}"))?;
-        let columns: Vec<String> =
-            if rows.is_empty() { vec![] } else { rows[0].columns().iter().map(|c| c.name().to_string()).collect() };
-        let column_types: Vec<String> = if rows.is_empty() {
-            Vec::new()
-        } else {
-            rows[0].columns().iter().map(|c| c.type_().name().to_string()).collect()
-        };
-        let mut data: Vec<Vec<serde_json::Value>> = Vec::with_capacity(rows.len().min(row_limit));
+        let start = std::time::Instant::now();
+        let stmt = conn.prepare_cached(sql).await.map_err(|e| format!("Prepare failed: {e}"))?;
+        let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
+        let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        let stream = conn.query_raw(&stmt, params).await.map_err(|e| format!("Query failed: {e}"))?;
+        tokio::pin!(stream);
+        let mut data: Vec<Vec<serde_json::Value>> = Vec::with_capacity(row_limit.min(1024));
         let mut truncated = false;
-        for (idx, row) in rows.iter().enumerate() {
-            if idx >= row_limit {
+        while let Some(row_result) = stream.next().await {
+            if data.len() >= row_limit {
                 truncated = true;
                 break;
             }
+            let row = row_result.map_err(|e| format!("Query failed: {e}"))?;
             let values: Vec<serde_json::Value> = (0..row.columns().len())
-                .map(|i| row.try_get::<_, serde_json::Value>(i).unwrap_or(serde_json::Value::Null))
+                .map(|i| db::postgres::pg_value_to_json(&row, i, column_types.get(i).map(String::as_str).unwrap_or("")))
                 .collect();
             data.push(values);
         }
@@ -2616,7 +2632,7 @@ async fn execute_manual_txn_postgres_statement(
             column_sortables: vec![],
             rows: data,
             affected_rows: 0,
-            execution_time_ms: 0,
+            execution_time_ms: start.elapsed().as_millis(),
             truncated,
             session_id: None,
             has_more: false,
@@ -2643,24 +2659,33 @@ async fn execute_manual_txn_mysql_statement(
     row_limit: usize,
 ) -> Result<db::QueryResult, String> {
     if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"]) {
-        let result = conn.query_iter(sql).await.map_err(|e| format!("Query failed: {e}"))?;
+        let start = std::time::Instant::now();
+        let mut result = conn.query_iter(sql).await.map_err(|e| format!("Query failed: {e}"))?;
         let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
-        let column_types: Vec<String> = result.columns_ref().iter().map(|c| format!("{:?}", c.column_type())).collect();
-        let rows: Vec<mysql_async::Row> =
-            result.collect_and_drop().await.map_err(|e| format!("Failed to collect rows: {e}"))?;
-        let truncated = rows.len() > row_limit;
-        let data: Vec<Vec<serde_json::Value>> = rows
-            .iter()
-            .take(row_limit)
-            .map(|row| (0..row.len()).map(|i| db::mysql::mysql_value_to_json(row, i)).collect())
-            .collect();
+        let column_types: Vec<String> =
+            result.columns_ref().iter().map(|c| db::mysql::mysql_column_type_name(c.column_type())).collect();
+        let mut data: Vec<Vec<serde_json::Value>> = Vec::with_capacity(row_limit.min(1024));
+        let mut stream = result
+            .stream::<mysql_async::Row>()
+            .await
+            .map_err(|e| format!("Query failed: {e}"))?
+            .ok_or_else(|| "Empty result set stream".to_string())?;
+        let mut truncated = false;
+        while let Some(row) = stream.next().await {
+            if data.len() >= row_limit {
+                truncated = true;
+                break;
+            }
+            let row = row.map_err(|e| format!("Query failed: {e}"))?;
+            data.push((0..row.len()).map(|i| db::mysql::mysql_value_to_json(&row, i)).collect());
+        }
         Ok(db::QueryResult {
             columns,
             column_types,
             column_sortables: vec![],
             rows: data,
             affected_rows: 0,
-            execution_time_ms: 0,
+            execution_time_ms: start.elapsed().as_millis(),
             truncated,
             session_id: None,
             has_more: false,
@@ -2685,12 +2710,13 @@ async fn execute_manual_txn_mysql_statement(
 
 /// Commit an existing manual transaction session.
 pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -> Result<db::QueryResult, String> {
-    let mut session = {
+    let session = {
         let mut sessions = state.transaction_sessions.write().await;
         sessions.remove(txn_session_id).ok_or("Transaction session not found")?
     };
 
-    match &mut session.connection {
+    let mut conn = session.connection.lock().await;
+    match &mut *conn {
         TxnConnection::Postgres(conn) => {
             conn.execute("COMMIT", &[]).await.map_err(|e| format!("COMMIT failed: {e}"))?;
         }
@@ -2715,19 +2741,13 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
 
 /// Rollback an existing manual transaction session.
 pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str) -> Result<db::QueryResult, String> {
-    let mut session = {
+    let session = {
         let mut sessions = state.transaction_sessions.write().await;
         sessions.remove(txn_session_id).ok_or("Transaction session not found")?
     };
 
-    match &mut session.connection {
-        TxnConnection::Postgres(conn) => {
-            conn.execute("ROLLBACK", &[]).await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
-        }
-        TxnConnection::Mysql(conn) => {
-            conn.query_drop("ROLLBACK").await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
-        }
-    }
+    let mut conn = session.connection.lock().await;
+    rollback_manual_txn_connection(&mut conn).await?;
 
     log::info!("[query][manual_txn:rollback] session_id={}", txn_session_id);
     Ok(db::QueryResult {

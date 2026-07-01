@@ -972,6 +972,7 @@ export const useQueryStore = defineStore("query", () => {
     tabs.value
       .filter((tab) => predicate(tab))
       .forEach((tab) => {
+        rollbackTabTransaction(tab, { resetAutoCommit: true });
         if (tab.isExecuting) void cancelTabExecution(tab.id);
         if (tab.isExplaining) void cancelTabExplain(tab.id);
         void closeResultSession(tab);
@@ -990,6 +991,18 @@ export const useQueryStore = defineStore("query", () => {
 
   function isDatabaseOpen(connectionId: string, database: string) {
     return tabs.value.some((tab) => tab.connectionId === connectionId && tab.database === database);
+  }
+
+  function rollbackTabsWhere(predicate: (tab: QueryTab) => boolean, options?: { resetAutoCommit?: boolean }) {
+    tabs.value.filter((tab) => predicate(tab)).forEach((tab) => rollbackTabTransaction(tab, options));
+  }
+
+  function rollbackConnectionTransactions(connectionId: string) {
+    rollbackTabsWhere((tab) => tab.connectionId === connectionId, { resetAutoCommit: true });
+  }
+
+  function rollbackDatabaseTransactions(connectionId: string, database: string) {
+    rollbackTabsWhere((tab) => tab.connectionId === connectionId && tab.database === database, { resetAutoCommit: true });
   }
 
   function updateSql(id: string, sql: string) {
@@ -1012,6 +1025,12 @@ export const useQueryStore = defineStore("query", () => {
         }
       }
     }
+  }
+
+  function rollbackTabTransaction(tab: QueryTab, options?: { resetAutoCommit?: boolean }) {
+    if (tab.txnSessionId) void rollbackTransaction(tab.id);
+    if (options?.resetAutoCommit) tab.autoCommit = true;
+    tab.txnAutoRolledBack = false;
   }
 
   async function commitTransaction(id: string) {
@@ -1148,6 +1167,7 @@ export const useQueryStore = defineStore("query", () => {
   function updateDatabase(id: string, database: string) {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab || tab.database === database) return;
+    rollbackTabTransaction(tab);
     void closeResultSession(tab);
     void closeClientConnectionSession(tab);
     tab.database = database;
@@ -1164,6 +1184,7 @@ export const useQueryStore = defineStore("query", () => {
   function updateSchema(id: string, schema: string | undefined) {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab || tab.schema === schema) return;
+    rollbackTabTransaction(tab);
     tab.schema = schema;
     if (tab.mode === "objects") tab.objectBrowser = { ...tab.objectBrowser, schema };
   }
@@ -1171,6 +1192,7 @@ export const useQueryStore = defineStore("query", () => {
   function updateConnection(id: string, connectionId: string, database = "") {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab || tab.connectionId === connectionId) return;
+    rollbackTabTransaction(tab, { resetAutoCommit: true });
     void closeResultSession(tab);
     void closeClientConnectionSession(tab);
     tab.connectionId = connectionId;
@@ -2551,6 +2573,8 @@ export const useQueryStore = defineStore("query", () => {
     releaseConnectionTabs,
     releaseDatabaseTabs,
     isDatabaseOpen,
+    rollbackConnectionTransactions,
+    rollbackDatabaseTransactions,
     updateSql,
     updateEditorViewport,
     updateEditorSelection,
