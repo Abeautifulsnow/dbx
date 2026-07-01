@@ -10,9 +10,11 @@ import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQuer
 import { restoreOpenTabsState, serializeOpenTabs } from "@/lib/openTabsPersistence";
 import {
   evaluateMongoAggregateSafety,
+  evaluateMongoWriteSafety,
   mongoCountToQueryResult,
   mongoCreateIndexToQueryResult,
   mongoDocumentsToQueryResult,
+  mongoDroppedIndexesToQueryResult,
   mongoIndexesToQueryResult,
   mongoUseToQueryResult,
   mongoVersionToQueryResult,
@@ -188,6 +190,7 @@ export const useQueryStore = defineStore("query", () => {
   const restored = loadSavedTabs();
   const tabs = ref<QueryTab[]>(restored.tabs);
   const activeTabId = ref<string | null>(restored.activeTabId);
+  const activeTabHistory = ref<string[]>(restored.activeTabId ? [restored.activeTabId] : []);
   const showCloseConfirm = ref(false);
   const pendingCloseTabId = ref<string | null>(null);
   const pendingBatchCloseTabIds = ref<string[] | null>(null);
@@ -865,7 +868,7 @@ export const useQueryStore = defineStore("query", () => {
     clearResultPayload(tabs.value[idx]);
     tabs.value.splice(idx, 1);
     if (activeTabId.value === id) {
-      activeTabId.value = tabs.value[Math.min(idx, tabs.value.length - 1)]?.id ?? null;
+      activeTabId.value = fallbackActiveTabAfterClose(id, idx);
     }
     if (force) resumePendingBatchCloseAfter(id);
   }
@@ -1853,6 +1856,10 @@ export const useQueryStore = defineStore("query", () => {
 
       const mongoWrite = conn?.db_type === "mongodb" ? parseMongoWriteCommand(sql) : null;
       if (mongoWrite) {
+        if (options?.mongoSafety) {
+          const safety = evaluateMongoWriteSafety(mongoWrite, options.mongoSafety);
+          if (!safety.allowed) throw new Error(safety.reason);
+        }
         await connStore.ensureConnected(tab.connectionId);
         console.info("[DBX][executeTabSql:mongo-write:start]", {
           traceId,
@@ -1878,6 +1885,29 @@ export const useQueryStore = defineStore("query", () => {
             current.results = undefined;
             current.activeResultIndex = undefined;
             current.result = markQueryResultRowsRaw(mongoCreateIndexToQueryResult(result.name, performance.now() - startedAt));
+            touchResult(current);
+            current.queryAnalysis = undefined;
+            current.querySourceColumns = undefined;
+            current.queryEditabilityReason = undefined;
+            current.mongoEditTarget = undefined;
+            current.tableMeta = undefined;
+            current.resultBaseSql = options?.resultBaseSql ?? sql;
+            current.resultSortedSql = options?.resultSortedSql;
+            syncDisplayedResultRun(current, options?.resultBaseSql ?? sql);
+          }
+          return;
+        } else if (mongoWrite.kind === "dropIndex" || mongoWrite.kind === "dropIndexes") {
+          const result = await api.mongoDropIndexes(tab.connectionId, tab.database, mongoWrite.collection, mongoWrite.kind === "dropIndex" ? mongoWrite.index : mongoWrite.indexes, mongoWrite.kind === "dropIndex");
+          console.info("[DBX][executeTabSql:mongo-write:done]", {
+            traceId,
+            droppedNames: result.dropped_names,
+            elapsed: elapsed(),
+          });
+          const current = tabs.value.find((t) => t.id === id);
+          if (current?.executionId === executionId) {
+            current.results = undefined;
+            current.activeResultIndex = undefined;
+            current.result = markQueryResultRowsRaw(mongoDroppedIndexesToQueryResult(result.dropped_names, performance.now() - startedAt));
             touchResult(current);
             current.queryAnalysis = undefined;
             current.querySourceColumns = undefined;
@@ -1958,7 +1988,7 @@ export const useQueryStore = defineStore("query", () => {
         executionPromise = api.executeInManualTransaction(tab.txnSessionId, sqlToExecute, tab.database, executionSchema, pageLimit);
       } else {
         console.info("[DBX][executeTabSql:execute-multi:start]", { traceId, elapsed: elapsed() });
-        const clientSessionId = tab.mode === "query" ? tabClientSessionId(tab) : undefined;
+        const clientSessionId = tab.mode === "query" || tab.mode === "data" ? tabClientSessionId(tab) : undefined;
         const executionOptions = {
           ...(typeof pageLimit === "number"
             ? useAgentResultSession
@@ -2299,9 +2329,28 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
-  watch(activeTabId, (id) => {
-    touchResult(tabs.value.find((tab) => tab.id === id));
-  });
+  function rememberActiveTab(id: string | null) {
+    if (!id || !tabs.value.some((tab) => tab.id === id)) return;
+    activeTabHistory.value = [...activeTabHistory.value.filter((tabId) => tabId !== id), id];
+  }
+
+  function fallbackActiveTabAfterClose(closedId: string, closedIndex: number): string | null {
+    const remainingIds = new Set(tabs.value.map((tab) => tab.id));
+    // Prefer the most recently focused remaining tab. This preserves the
+    // source query tab when a transient table-info/data tab is closed.
+    const history = activeTabHistory.value.filter((tabId) => tabId !== closedId && remainingIds.has(tabId));
+    activeTabHistory.value = history;
+    return [...history].reverse().find((tabId) => remainingIds.has(tabId)) ?? tabs.value[Math.min(closedIndex, tabs.value.length - 1)]?.id ?? null;
+  }
+
+  watch(
+    activeTabId,
+    (id) => {
+      rememberActiveTab(id);
+      touchResult(tabs.value.find((tab) => tab.id === id));
+    },
+    { flush: "sync" },
+  );
 
   function restoreCachedResultPayload(tab: QueryTab, snapshot: Awaited<ReturnType<typeof readTabResultSnapshot>>) {
     if (!snapshot) return false;

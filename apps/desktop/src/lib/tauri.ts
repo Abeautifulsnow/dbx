@@ -1521,6 +1521,10 @@ export async function mongoCreateIndex(connectionId: string, database: string, c
   return invoke("mongo_create_index", { connectionId, database, collection, keysJson, optionsJson });
 }
 
+export async function mongoDropIndexes(connectionId: string, database: string, collection: string, indexesJson?: string, single = false): Promise<{ dropped_names: string[]; affected_rows: number }> {
+  return invoke("mongo_drop_indexes", { connectionId, database, collection, indexesJson, single });
+}
+
 export async function mongoInsertDocument(connectionId: string, database: string, collection: string, docJson: string): Promise<string> {
   return documentInsertDocument(connectionId, database, collection, docJson);
 }

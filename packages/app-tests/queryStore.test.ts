@@ -101,6 +101,22 @@ test("renames query tab titles", () => {
   assert.equal(tab?.customTitle, true);
 });
 
+test("closing an active data tab restores the previously focused query tab", () => {
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const firstQueryId = store.createTab("conn-1", "db", "query_1", "query");
+  store.createTab("conn-1", "db", "query_2", "query");
+
+  store.activeTabId = firstQueryId;
+  const dataTabId = store.createTab("conn-1", "db", "public.users", "data", "public");
+
+  assert.equal(store.activeTabId, dataTabId);
+
+  store.closeTab(dataTabId);
+
+  assert.equal(store.activeTabId, firstQueryId);
+});
+
 test("linkExternalSqlPath records the local path and detaches saved SQL", () => {
   setActivePinia(createPinia());
   const store = useQueryStore();
@@ -1999,6 +2015,111 @@ test("mongo createIndex execution uses the dedicated create-index endpoint", asy
   }
 });
 
+test("mongo dropIndex execution uses the dedicated drop-indexes endpoint", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  let dropIndexesBody: any;
+
+  connectionStore.addEphemeralConnection({
+    ...conn("mongo-1"),
+    db_type: "mongodb",
+    port: 27017,
+  });
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ sqlToExecute: body.options.sql, useAgentResultSession: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "/api/mongo/drop-indexes") {
+      dropIndexesBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ dropped_names: ["users_email_unique"], affected_rows: 1 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const tabId = store.createTab("mongo-1", "accounting", "Query", "query", "");
+    await store.executeTabSql(tabId, 'db.users.dropIndex("users_email_unique")');
+    const tab = store.tabs.find((item) => item.id === tabId);
+
+    assert.deepEqual(dropIndexesBody, {
+      connectionId: "mongo-1",
+      database: "accounting",
+      collection: "users",
+      indexesJson: '"users_email_unique"',
+      single: true,
+    });
+    assert.deepEqual(tab?.result?.columns, ["name"]);
+    assert.deepEqual(tab?.result?.rows, [["users_email_unique"]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("mongo dropIndexes execution returns dropped index names", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  let dropIndexesBody: any;
+
+  connectionStore.addEphemeralConnection({
+    ...conn("mongo-1"),
+    db_type: "mongodb",
+    port: 27017,
+  });
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ sqlToExecute: body.options.sql, useAgentResultSession: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "/api/mongo/drop-indexes") {
+      dropIndexesBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ dropped_names: ["a_1", "b_1"], affected_rows: 2 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const tabId = store.createTab("mongo-1", "accounting", "Query", "query", "");
+    await store.executeTabSql(tabId, "db.users.dropIndexes()");
+    const tab = store.tabs.find((item) => item.id === tabId);
+
+    assert.deepEqual(dropIndexesBody, {
+      connectionId: "mongo-1",
+      database: "accounting",
+      collection: "users",
+      single: false,
+    });
+    assert.deepEqual(tab?.result?.columns, ["name"]);
+    assert.deepEqual(tab?.result?.rows, [["a_1"], ["b_1"]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
 test("table data export fetches every filtered page", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
@@ -2498,6 +2619,40 @@ test("query execution is scoped to the tab client session", async () => {
 
   try {
     await store.executeTabSql(tabId, "select 1");
+
+    assert.equal(executeBody.clientSessionId, tabId);
+    assert.equal(executeBody.timeoutSecs, 30);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("data tab execution is scoped to the tab client session", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  const tabId = store.createTab("conn-1", "db", "users", "data", "public");
+  let executeBody: any;
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/execute-multi") {
+      executeBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify([{ columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    await store.executeTabSql(tabId, "select * from users");
 
     assert.equal(executeBody.clientSessionId, tabId);
     assert.equal(executeBody.timeoutSecs, 30);
