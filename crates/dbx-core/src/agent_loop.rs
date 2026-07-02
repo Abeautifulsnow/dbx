@@ -198,6 +198,7 @@ pub async fn run_agent_loop(
                 if !chunk.delta.is_empty() {
                     emitted.store(true, Ordering::Relaxed);
                     acc.lock().unwrap_or_else(|e| e.into_inner()).push_str(&chunk.delta);
+                    on_event2(AgentEvent::TextDelta { delta: chunk.delta.clone() });
                 }
                 if let Some(ref reasoning) = chunk.reasoning_delta {
                     emitted.store(true, Ordering::Relaxed);
@@ -285,9 +286,6 @@ pub async fn run_agent_loop(
         if collected_tool_calls.is_empty() {
             match validate_final_answer(task_contract.as_ref(), &accumulated_text) {
                 FinalAnswerCheck::Satisfied => {
-                    if !accumulated_text.is_empty() {
-                        on_event(AgentEvent::TextDelta { delta: accumulated_text.clone() });
-                    }
                     final_text = accumulated_text;
                     loop_exit = LoopExit::Completed;
                     break;
