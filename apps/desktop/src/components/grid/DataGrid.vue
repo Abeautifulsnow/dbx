@@ -65,6 +65,7 @@ import {
   Database,
   Columns3,
   PencilRuler,
+  Timer,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
@@ -112,7 +113,7 @@ import { getApplicablePreviewActions } from "@/lib/resultPreviewRegistry";
 import "@/lib/previewHandlers/geometryMapPreview";
 import { BINARY_CELL_DOWNLOAD_MODES, binaryCellDisplayText, binaryCellDownloadFileName, binaryCellDownloadPayload, canDownloadBinaryCellValue, downloadBinaryCellPayload, isBinaryCellColumnType, parseBinaryCellBytes, type BinaryCellDownloadMode } from "@/lib/binaryCellDownload";
 import { buildBinaryHexViewRows } from "@/lib/binaryHexViewer";
-import { canFormatCellDetailJson, cellDetailEditorText, defaultCellDetailTab, formatJsonText, isGeometryColumnType, linkedCellDetailTarget, valueEditorActions, visibleCellDetailTabs, type CellDetailTab } from "@/lib/cellDetailPresentation";
+import { canFormatCellDetailJson, cellDetailEditorText, compactJsonText, defaultCellDetailTab, formatJsonText, isGeometryColumnType, linkedCellDetailTarget, looksLikeJsonContainerText, valueEditorActions, visibleCellDetailTabs, type CellDetailTab } from "@/lib/cellDetailPresentation";
 import { renderWktOnCanvas, isHexGeometry } from "@/lib/geometryPreview";
 import { buildDataGridCellDetail, buildDataGridColumnDetail, buildDataGridRowDetail, dataGridColumnDetailJson, dataGridColumnDetailTsv, dataGridRowDetailJson, dataGridRowDetailTsv, filterDataGridDetailFields, type DataGridCellDetail } from "@/lib/dataGridDetail";
 import { applyColumnFormatter, buildColumnFormatterKey, normalizeColumnFormatter, resolveColumnFormatter, type ColumnFormatterConfig, type DateTimeFormatterUnit, DateTimePatterns } from "@/lib/columnFormatter";
@@ -237,6 +238,7 @@ const isMac = isMacOS();
 const shortcutMod = isMac ? "Cmd" : "Ctrl";
 const saveShortcutLabel = computed(() => formatShortcut(settingsStore.editorSettings.shortcuts.saveSql));
 const DATA_GRID_COMPACT_TOPBAR_WIDTH = 900;
+const AUTO_REFRESH_INTERVAL_OPTIONS = [5, 10, 30, 60, 300];
 
 const emit = defineEmits<{
   reload: [sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number];
@@ -245,6 +247,11 @@ const emit = defineEmits<{
   "update:whereInput": [value: string];
   "update:orderByInput": [value: string];
 }>();
+
+const autoRefreshIntervalSeconds = ref(10);
+const autoRefreshEnabled = ref(false);
+let autoRefreshTimer: ReturnType<typeof setInterval> | undefined;
+const autoRefreshLabel = computed(() => (autoRefreshEnabled.value ? t("tabs.autoRefreshEvery", { seconds: autoRefreshIntervalSeconds.value }) : t("tabs.autoRefresh")));
 
 console.info("[DBX][DataGrid:setup]", {
   traceId: dataGridTraceId,
@@ -3822,6 +3829,36 @@ async function onToolbarRefresh() {
   emit("reload", props.sql, searchText.value, currentWhereInput(), currentOrderBy(), pageSize.value, 0);
 }
 
+function stopAutoRefreshTimer() {
+  clearInterval(autoRefreshTimer);
+  autoRefreshTimer = undefined;
+}
+
+function runAutoRefreshTick() {
+  if (!autoRefreshEnabled.value || !canAutoRefresh.value) return;
+  void onToolbarRefresh();
+}
+
+function restartAutoRefreshTimer() {
+  stopAutoRefreshTimer();
+  if (!autoRefreshEnabled.value) return;
+  autoRefreshTimer = setInterval(runAutoRefreshTick, autoRefreshIntervalSeconds.value * 1000);
+}
+
+function setAutoRefreshInterval(seconds: number) {
+  autoRefreshIntervalSeconds.value = seconds;
+  if (autoRefreshEnabled.value) restartAutoRefreshTimer();
+}
+
+function toggleAutoRefresh() {
+  autoRefreshEnabled.value = !autoRefreshEnabled.value;
+  if (autoRefreshEnabled.value) {
+    restartAutoRefreshTimer();
+  } else {
+    stopAutoRefreshTimer();
+  }
+}
+
 async function onToolbarCommit() {
   await saveChanges();
 }
@@ -4550,6 +4587,15 @@ const sideJsonPreviewText = computed(() => {
   if (!detail?.formattedJson) return "";
   return sideDetailJsonView.value ? detail.formattedJson : detail.rawValuePreview;
 });
+const canCompactDetailJson = computed(() => {
+  const detail = activeCellDetail.value;
+  return !!detail && isEditingDetail.value && canFormatCellDetailJson(detailEditValue.value, detail.type);
+});
+const showCompactDetailJson = computed(() => {
+  const detail = activeCellDetail.value;
+  if (!detail || !isEditingDetail.value) return false;
+  return !!detail.formattedJson || looksLikeJsonContainerText(detailEditValue.value);
+});
 
 // CodeMirror-based cell detail editors
 const detailsEditorContainer = ref<HTMLElement>();
@@ -4782,6 +4828,13 @@ function formatValueEditorJson() {
   detailEditValue.value = formatJsonText(detailEditValue.value) ?? detailEditValue.value;
   syncEditorFromDetailEdit();
   warnFormattedJsonEditIfNeeded(detail, true);
+}
+
+function compactDetailJson() {
+  const detail = activeCellDetail.value;
+  if (!detail || !canFormatCellDetailJson(detailEditValue.value, detail.type)) return;
+  detailEditValue.value = compactJsonText(detailEditValue.value) ?? detailEditValue.value;
+  syncEditorFromDetailEdit();
 }
 
 function setDetailNull() {
@@ -5727,6 +5780,8 @@ const {
   exportProgressState,
   exportCancelHandler,
 });
+
+const canAutoRefresh = computed(() => !isSaving.value && !props.loading);
 
 const pageSizeMenuItems = computed(() =>
   pageSizeOptions.value.map((size) => ({
@@ -7587,11 +7642,18 @@ watch(
   },
 );
 
-onActivated(startLoadingElapsedTimer);
-onDeactivated(stopLoadingElapsedTimer);
+onActivated(() => {
+  startLoadingElapsedTimer();
+  restartAutoRefreshTimer();
+});
+onDeactivated(() => {
+  stopLoadingElapsedTimer();
+  stopAutoRefreshTimer();
+});
 
 onUnmounted(() => {
   cleanupFrames();
+  stopAutoRefreshTimer();
   onSearchSplitResizeEnd();
   onDdlResizeEnd();
   onDetailResizeEnd();
@@ -8419,7 +8481,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 {{ t("grid.keylessEditWarningHint") }}
               </TooltipContent>
             </Tooltip>
-            <Tooltip v-if="props.context !== 'results'">
+            <Tooltip>
               <TooltipTrigger as-child>
                 <Button variant="ghost" size="sm" :class="['data-grid-topbar-action-button h-5 shrink-0 text-xs px-1.5', compactDataGridToolbar ? 'data-grid-topbar-action-button--compact' : '', isSaving ? '' : '']" :disabled="isSaving" @click="onToolbarRefresh">
                   <Loader2 v-if="loading" class="data-grid-topbar-action-icon w-3 h-3 animate-spin" />
@@ -8429,6 +8491,33 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               </TooltipTrigger>
               <TooltipContent side="bottom">{{ t("grid.refresh") }} ({{ shortcutMod }}+R)</TooltipContent>
             </Tooltip>
+            <DropdownMenu>
+              <DropdownMenuTrigger as-child>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  :class="['data-grid-topbar-action-button h-5 shrink-0 text-xs px-1.5', compactDataGridToolbar ? 'data-grid-topbar-action-button--compact' : '', autoRefreshEnabled ? 'text-primary bg-primary/10 hover:bg-primary/15' : 'text-muted-foreground hover:text-foreground']"
+                  :title="autoRefreshLabel"
+                  :aria-label="autoRefreshLabel"
+                  :aria-pressed="autoRefreshEnabled"
+                >
+                  <Timer class="data-grid-topbar-action-icon w-3 h-3" />
+                  <span class="data-grid-topbar-action-label" :class="{ 'data-grid-topbar-action-label--compact': compactDataGridToolbar }">{{ autoRefreshEnabled ? `${autoRefreshIntervalSeconds}s` : t("tabs.autoRefreshShort") }}</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" class="w-40">
+                <DropdownMenuItem class="gap-2" @select="toggleAutoRefresh">
+                  <Check v-if="autoRefreshEnabled" class="h-3.5 w-3.5" />
+                  <span v-else class="h-3.5 w-3.5" />
+                  {{ autoRefreshEnabled ? t("tabs.stopAutoRefresh") : t("tabs.startAutoRefresh") }}
+                </DropdownMenuItem>
+                <DropdownMenuItem v-for="seconds in AUTO_REFRESH_INTERVAL_OPTIONS" :key="seconds" class="gap-2" @select="setAutoRefreshInterval(seconds)">
+                  <Check v-if="autoRefreshIntervalSeconds === seconds" class="h-3.5 w-3.5" />
+                  <span v-else class="h-3.5 w-3.5" />
+                  {{ t("tabs.autoRefreshEvery", { seconds }) }}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <Tooltip v-if="props.result.columns.length">
               <TooltipTrigger as-child>
                 <Popover v-model:open="goToColumnOpen">
@@ -9664,18 +9753,22 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   <div class="space-y-1" :class="[{ 'min-h-0 flex flex-col': sideDetailValueFillsHeight }, sideDetailValueFillsHeight && !(activeCellDetail.imagePreviewUrl && !isEditingDetail) ? 'flex-1' : '', activeCellDetail.imagePreviewUrl && !isEditingDetail ? 'shrink-0' : '']">
                     <div class="flex min-h-5 items-center justify-between gap-2">
                       <div class="text-muted-foreground">{{ t("grid.cellValue") }}</div>
-                      <div v-if="!isEditingDetail" class="flex items-center gap-1">
-                        <Button v-if="activeCellDetail.formattedJson" :variant="sideDetailJsonView ? 'secondary' : 'ghost'" size="sm" class="h-5 gap-1 px-1.5 text-xs" :title="t('grid.formattedJson')" @click="toggleCellDetailJsonFormatted">
+                      <div class="flex items-center gap-1">
+                        <Button v-if="showCompactDetailJson" variant="ghost" size="sm" class="h-5 gap-1 px-1.5 text-xs" :disabled="!canCompactDetailJson" :title="t('grid.compactJson')" @click="compactDetailJson">
+                          <Code2 class="h-3 w-3" />
+                          {{ t("grid.compactJson") }}
+                        </Button>
+                        <Button v-if="!isEditingDetail && activeCellDetail.formattedJson" :variant="sideDetailJsonView ? 'secondary' : 'ghost'" size="sm" class="h-5 gap-1 px-1.5 text-xs" :title="t('grid.formattedJson')" @click="toggleCellDetailJsonFormatted">
                           <Code2 class="h-3 w-3" />
                           {{ t("grid.formattedJson") }}
                         </Button>
-                        <Button v-if="activeCellDetail.isEditable" variant="ghost" size="icon" class="h-5 w-5" :title="t('grid.editValue')" @click="startDetailEdit">
+                        <Button v-if="!isEditingDetail && activeCellDetail.isEditable" variant="ghost" size="icon" class="h-5 w-5" :title="t('grid.editValue')" @click="startDetailEdit">
                           <Pencil class="h-3 w-3" />
                         </Button>
-                        <Button variant="ghost" size="icon" class="h-5 w-5" :title="t('grid.copyValue')" @click="copyDetailCurrentValue">
+                        <Button v-if="!isEditingDetail" variant="ghost" size="icon" class="h-5 w-5" :title="t('grid.copyValue')" @click="copyDetailCurrentValue">
                           <Copy class="h-3 w-3" />
                         </Button>
-                        <DropdownMenu v-if="canDownloadDetailBinaryValue(activeCellDetail)">
+                        <DropdownMenu v-if="!isEditingDetail && canDownloadDetailBinaryValue(activeCellDetail)">
                           <DropdownMenuTrigger as-child>
                             <Button variant="ghost" size="icon" class="h-5 w-5" :title="t('grid.downloadBinaryValue')">
                               <Download class="h-3 w-3" />
