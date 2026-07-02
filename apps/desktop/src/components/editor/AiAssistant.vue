@@ -21,7 +21,7 @@ import { buildAiContext, runAgentStream, isVectorDbType, type AiAction } from "@
 import { formatAiModelOption } from "@/lib/aiModelPresentation";
 import type { AgentEvent } from "@/lib/tauri";
 import { buildAiAgentPlan } from "@/lib/aiAgentPlan";
-import { buildAiAgentStepItems, type AiAgentStepItem, type AiAgentStepTone } from "@/lib/aiAgentStepPresentation";
+import { buildAiAgentStepItems, toolCallStepKey, upsertAgentStep, type AiAgentStepItem, type AiAgentStepTone } from "@/lib/aiAgentStepPresentation";
 import { createAiShikiCodeHighlighter, type AiCodeHighlighter } from "@/lib/aiCodeHighlighter";
 import { createAiMessageRenderer } from "@/lib/aiMessageRender";
 import { formatAiInlineMarkdown, handleAiMarkdownLinkClick } from "@/lib/aiMarkdown";
@@ -390,17 +390,18 @@ function agentStepIcon(tone: AiAgentStepTone) {
 }
 
 function agentStepClass(tone: AiAgentStepTone): string {
+  const base = "transition-colors duration-200 ease-out motion-safe:transition-colors motion-reduce:transition-none";
   switch (tone) {
     case "success":
-      return "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
+      return `border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 ${base}`;
     case "active":
-      return "border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300";
+      return `border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300 ${base}`;
     case "warning":
-      return "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300";
+      return `border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300 ${base}`;
     case "danger":
-      return "border-red-500/35 bg-red-500/10 text-red-700 dark:text-red-300";
+      return `border-red-500/35 bg-red-500/10 text-red-700 dark:text-red-300 ${base}`;
     default:
-      return "border-border bg-background/60 text-muted-foreground";
+      return `border-border bg-background/60 text-muted-foreground ${base}`;
   }
 }
 
@@ -457,21 +458,32 @@ function agentEventToStep(event: AgentEvent, index: number): AiAgentStepItem | u
 
   if (event.type !== "tool_call_start" && event.type !== "tool_call_end") return undefined;
 
+  // Use a stable key based on tool_call_id so start and end events map to the same card.
+  const toolKey = toolCallStepKey(event.tool_call_id, index, event.type);
+
+  if (event.type === "tool_call_start") {
+    return {
+      key: toolKey,
+      labelKey: "ai.agentSteps.callingTool",
+      tone: "active",
+      toolName: event.tool_name,
+      toolArgs: event.args as Record<string, unknown>,
+    };
+  }
+
+  // tool_call_end: produce a final step; toolArgs will be merged from the start step by upsert if missing.
   const isExecuteQuery = event.tool_name === "execute_query" || event.tool_name === "dbx_execute_query";
-  const labelKey = event.type === "tool_call_start" ? "ai.agentSteps.callingTool" : isExecuteQuery ? (event.is_error ? "ai.agentSteps.executeBlocked" : "ai.agentSteps.executeSafe") : event.is_error ? "ai.agentSteps.toolError" : "ai.agentSteps.toolDone";
-  const tone = (event.type === "tool_call_start" ? "active" : event.is_error ? "danger" : "success") as AiAgentStepTone;
+  const labelKey = isExecuteQuery ? (event.is_error ? "ai.agentSteps.executeBlocked" : "ai.agentSteps.executeSafe") : event.is_error ? "ai.agentSteps.toolError" : "ai.agentSteps.toolDone";
+  const tone: AiAgentStepTone = event.is_error ? "danger" : "success";
 
   return {
-    key: `${event.tool_call_id || ""}-${event.type}`,
+    key: toolKey,
     labelKey,
     tone,
-    titleKey: undefined,
-    titleParams: { tool: event.tool_name || "" },
     toolName: event.tool_name,
-    toolArgs: event.type === "tool_call_start" ? (event.args as Record<string, unknown>) : undefined,
-    toolResult: event.type === "tool_call_end" ? extractToolResultContent(event.result) : undefined,
-    explainData: event.type === "tool_call_end" ? extractExplainData(event.result) : undefined,
-    isError: event.type === "tool_call_end" ? event.is_error : undefined,
+    toolResult: extractToolResultContent(event.result),
+    explainData: extractExplainData(event.result),
+    isError: event.is_error,
   };
 }
 
@@ -783,7 +795,7 @@ async function send() {
           if (msg) {
             if (!msg.agentSteps) msg.agentSteps = [];
             const step = agentEventToStep(event, agentEvents.length - 1);
-            if (step) msg.agentSteps.push(step);
+            if (step) upsertAgentStep(msg.agentSteps, step);
           }
           pendingCompaction.value = { summary: event.summary, compactedMessages: event.compacted_messages };
         }
@@ -793,7 +805,7 @@ async function send() {
           if (msg) {
             if (!msg.agentSteps) msg.agentSteps = [];
             const step = agentEventToStep(event, agentEvents.length - 1);
-            if (step) msg.agentSteps.push(step);
+            if (step) upsertAgentStep(msg.agentSteps, step);
           }
         }
         scrollToBottom();
@@ -807,9 +819,14 @@ async function send() {
     const msg = messages.value[assistantIdx];
     if (msg) msg.isThinking = false;
     isGenerating.value = false;
-    // Render agent tool call steps from agent events
+    // Render agent tool call steps from agent events (fallback when no real-time steps)
     if (msg && agentEvents.length > 0 && !msg.agentSteps?.length) {
-      msg.agentSteps = agentEvents.map((e, index) => agentEventToStep(e, index)).filter((step): step is AiAgentStepItem => Boolean(step));
+      const steps: AiAgentStepItem[] = [];
+      agentEvents.forEach((e, index) => {
+        const step = agentEventToStep(e, index);
+        if (step) upsertAgentStep(steps, step);
+      });
+      if (steps.length) msg.agentSteps = steps;
     }
     // Fallback: use aiAgentPlan for backward compatibility
     if (msg && !msg.agentSteps?.length) {
