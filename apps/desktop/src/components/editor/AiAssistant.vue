@@ -1134,7 +1134,7 @@ async function openExternalUrl(url: string) {
           </div>
 
           <div v-else-if="msg.content || msg.reasoning || msg.isThinking" class="flex">
-            <div class="max-w-[95%] rounded-lg bg-muted px-3 py-2 text-xs leading-relaxed">
+            <div class="max-w-[95%] min-w-0 rounded-lg bg-muted px-3 py-2 text-xs leading-relaxed">
               <div v-if="msg.reasoning || msg.isThinking" class="mb-2">
                 <button class="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors" @click="toggleReasoning(i)">
                   <ChevronRight class="h-3 w-3 transition-transform duration-200" :class="{ 'rotate-90': expandedReasoning.has(i) || msg.isThinking }" />
@@ -1487,18 +1487,36 @@ async function openExternalUrl(url: string) {
 }
 .ai-markdown :deep(table) {
   border-collapse: collapse;
+  margin: 0;
+  width: max-content;
+  min-width: 100%;
+}
+.ai-markdown :deep(.ai-markdown-table-wrap) {
+  overflow-x: auto;
+  max-height: 320px;
+  overflow-y: auto;
+  max-width: 100%;
   margin: 0.3em 0;
-  width: 100%;
+  border-radius: 0.375rem;
+  border: 1px solid hsl(var(--border));
+}
+.ai-markdown :deep(.ai-markdown-table-wrap table) {
+  border: none;
+  margin: 0;
 }
 .ai-markdown :deep(th),
 .ai-markdown :deep(td) {
   border: 1px solid hsl(var(--border));
   padding: 0.25em 0.5em;
   text-align: left;
+  white-space: nowrap;
 }
 .ai-markdown :deep(th) {
   font-weight: 600;
   background: hsl(var(--muted));
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 .ai-code-block :deep(.line) {
   min-height: 1lh;
