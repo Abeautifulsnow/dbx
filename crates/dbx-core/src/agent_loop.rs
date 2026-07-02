@@ -27,6 +27,19 @@ fn take_text(m: &std::sync::Mutex<String>) -> String {
     m.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Convert a streaming AI chunk into agent events for the frontend.
+/// Pure function — no side effects, easily testable.
+fn chunk_to_events(chunk: &AiStreamChunk) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    if !chunk.delta.is_empty() {
+        events.push(AgentEvent::TextDelta { delta: chunk.delta.clone() });
+    }
+    if let Some(ref reasoning) = chunk.reasoning_delta {
+        events.push(AgentEvent::ReasoningDelta { delta: reasoning.clone() });
+    }
+    events
+}
+
 enum LoopExit {
     Completed,
     Cancelled,
@@ -198,11 +211,12 @@ pub async fn run_agent_loop(
                 if !chunk.delta.is_empty() {
                     emitted.store(true, Ordering::Relaxed);
                     acc.lock().unwrap_or_else(|e| e.into_inner()).push_str(&chunk.delta);
-                    on_event2(AgentEvent::TextDelta { delta: chunk.delta.clone() });
                 }
-                if let Some(ref reasoning) = chunk.reasoning_delta {
+                if chunk.reasoning_delta.is_some() {
                     emitted.store(true, Ordering::Relaxed);
-                    on_event2(AgentEvent::ReasoningDelta { delta: reasoning.clone() });
+                }
+                for event in chunk_to_events(&chunk) {
+                    on_event2(event);
                 }
             };
 
@@ -1201,5 +1215,81 @@ mod tests {
         assert!(wrapped.contains("INTERMEDIATE EVIDENCE"));
         assert!(wrapped.contains("continue the original user task"));
         assert!(wrapped.contains("Columns of tb_customer"));
+    }
+
+    // --- chunk_to_events tests ---
+
+    #[test]
+    fn chunk_to_events_emits_text_delta_for_text() {
+        let chunk = AiStreamChunk {
+            session_id: "test".to_string(),
+            delta: "hello".to_string(),
+            reasoning_delta: None,
+            done: false,
+        };
+        let events = chunk_to_events(&chunk);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AgentEvent::TextDelta { delta } if delta == "hello"));
+    }
+
+    #[test]
+    fn chunk_to_events_emits_reasoning_delta_for_reasoning() {
+        let chunk = AiStreamChunk {
+            session_id: "test".to_string(),
+            delta: String::new(),
+            reasoning_delta: Some("thinking...".to_string()),
+            done: false,
+        };
+        let events = chunk_to_events(&chunk);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AgentEvent::ReasoningDelta { delta } if delta == "thinking..."));
+    }
+
+    #[test]
+    fn chunk_to_events_emits_both_for_mixed_chunk() {
+        let chunk = AiStreamChunk {
+            session_id: "test".to_string(),
+            delta: "answer".to_string(),
+            reasoning_delta: Some("thinking...".to_string()),
+            done: false,
+        };
+        let events = chunk_to_events(&chunk);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], AgentEvent::TextDelta { delta } if delta == "answer"));
+        assert!(matches!(&events[1], AgentEvent::ReasoningDelta { delta } if delta == "thinking..."));
+    }
+
+    #[test]
+    fn chunk_to_events_returns_empty_for_empty_chunk() {
+        let chunk =
+            AiStreamChunk { session_id: "test".to_string(), delta: String::new(), reasoning_delta: None, done: false };
+        let events = chunk_to_events(&chunk);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn chunk_to_events_reasoning_only_no_text() {
+        let chunk = AiStreamChunk {
+            session_id: "test".to_string(),
+            delta: String::new(),
+            reasoning_delta: Some("reasoning".to_string()),
+            done: false,
+        };
+        let events = chunk_to_events(&chunk);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AgentEvent::ReasoningDelta { .. }));
+    }
+
+    #[test]
+    fn chunk_to_events_text_only_no_reasoning() {
+        let chunk = AiStreamChunk {
+            session_id: "test".to_string(),
+            delta: "text only".to_string(),
+            reasoning_delta: None,
+            done: false,
+        };
+        let events = chunk_to_events(&chunk);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AgentEvent::TextDelta { .. }));
     }
 }
