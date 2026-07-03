@@ -115,9 +115,15 @@ function submitEdit(visibleIndex: number) {
   if (!content) return;
   const actualIndex = visibleToActualIndex(messages.value, visibleIndex);
   if (actualIndex < 0) return;
+  if (!props.connection || !props.tab) return;
+  if (!settings.isConfigured()) {
+    toast(t("ai.noConfig"));
+    return;
+  }
   messages.value = messages.value.slice(0, actualIndex);
   editingMessageIndex.value = null;
   editingContent.value = "";
+  selectedMentions.value = [];
   prompt.value = content;
   send();
 }
