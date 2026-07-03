@@ -38,6 +38,7 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { formatAiTableMention, parseAiTableMentions, type AiTableMention } from "@/lib/aiTableMentions";
 import { isAiPromptImeCompositionEvent, shouldSubmitAiPromptOnKeydown } from "@/lib/aiPromptKeyboard";
 import { looksLikeActionProposal, containsChinese } from "@/lib/aiProposalDetect";
+import { visibleToActualIndex } from "@/lib/aiMessageEdit";
 
 const { t } = useI18n();
 const settings = useSettingsStore();
@@ -89,11 +90,19 @@ const draftBeforeHistory = ref("");
 
 const editingMessageIndex = ref<number | null>(null);
 const editingContent = ref("");
+const editCompositionActive = ref(false);
 
 function startEditMessage(visibleIndex: number) {
   if (isGenerating.value) return;
   editingMessageIndex.value = visibleIndex;
   editingContent.value = visibleMessages.value[visibleIndex].content;
+  nextTick(() => {
+    const el = document.querySelector<HTMLTextAreaElement>("[data-edit-textarea]");
+    if (el) {
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    }
+  });
 }
 
 function cancelEdit() {
@@ -104,17 +113,7 @@ function cancelEdit() {
 function submitEdit(visibleIndex: number) {
   const content = editingContent.value.trim();
   if (!content) return;
-  let vi = 0;
-  let actualIndex = -1;
-  for (let i = 0; i < messages.value.length; i++) {
-    if (messages.value[i].kind !== "contextSummary") {
-      if (vi === visibleIndex) {
-        actualIndex = i;
-        break;
-      }
-      vi++;
-    }
-  }
+  const actualIndex = visibleToActualIndex(messages.value, visibleIndex);
   if (actualIndex < 0) return;
   messages.value = messages.value.slice(0, actualIndex);
   editingMessageIndex.value = null;
@@ -124,6 +123,7 @@ function submitEdit(visibleIndex: number) {
 }
 
 function onEditKeydown(event: KeyboardEvent, visibleIndex: number) {
+  if (isAiPromptImeCompositionEvent(event, editCompositionActive.value)) return;
   if (event.key === "Escape") {
     cancelEdit();
     return;
@@ -1178,15 +1178,13 @@ async function openExternalUrl(url: string) {
             <div class="max-w-[85%]">
               <template v-if="editingMessageIndex === i">
                 <textarea
-                  :ref="
-                    (el) => {
-                      if (el) (el as HTMLTextAreaElement).focus();
-                    }
-                  "
+                  data-edit-textarea
                   v-model="editingContent"
                   rows="3"
                   class="w-full resize-none rounded-lg border bg-background px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-primary"
                   @keydown="onEditKeydown($event, i)"
+                  @compositionstart="editCompositionActive = true"
+                  @compositionend="editCompositionActive = false"
                 />
                 <div class="mt-1.5 flex justify-end gap-1.5">
                   <Button size="sm" variant="ghost" class="h-6 px-2 text-[11px]" @click="cancelEdit">{{ t("ai.editCancel") }}</Button>
