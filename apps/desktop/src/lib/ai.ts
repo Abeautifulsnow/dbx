@@ -550,8 +550,15 @@ function extractLastError(result?: QueryResult): string | undefined {
 
 function formatResultPreview(result?: QueryResult): string | undefined {
   if (!result || result.columns.includes("Error") || !result.rows.length) return undefined;
+  const MAX_VALUE_CHARS = 200;
   const rows = result.rows.slice(0, 5).map((row) => {
-    return result.columns.map((column, index) => `${column}=${JSON.stringify(row[index] ?? null)}`).join(", ");
+    return result.columns
+      .map((column, index) => {
+        const raw = JSON.stringify(row[index] ?? null);
+        const val = raw.length > MAX_VALUE_CHARS ? raw.slice(0, MAX_VALUE_CHARS) + "…" : raw;
+        return `${column}=${val}`;
+      })
+      .join(", ");
   });
   return rows.join("\n");
 }
