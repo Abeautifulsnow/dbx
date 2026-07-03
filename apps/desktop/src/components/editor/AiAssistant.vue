@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, type Component } from 
 import { uuid } from "@/lib/utils";
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
-import { ArrowUp, ArrowRightLeft, AlertTriangle, Bot, Check, ChevronRight, CircleSlash, Copy, Database, GitBranch, HelpCircle, History, Loader2, MessageSquarePlus, Replace, Server, ShieldCheck, Table2, Play, Square, Trash2, Terminal, Wand2, Wrench, X, Zap, TestTube } from "@lucide/vue";
+import { ArrowUp, ArrowRightLeft, AlertTriangle, Bot, Check, ChevronRight, CircleSlash, Copy, Database, GitBranch, HelpCircle, History, Loader2, MessageSquarePlus, Pencil, Replace, Server, ShieldCheck, Table2, Play, Square, Trash2, Terminal, Wand2, Wrench, X, Zap, TestTube } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -86,6 +86,53 @@ const agentTokens = ref<{ input: number; output: number } | null>(null);
 const promptHistory = ref<string[]>([]);
 const historyIndex = ref(-1);
 const draftBeforeHistory = ref("");
+
+const editingMessageIndex = ref<number | null>(null);
+const editingContent = ref("");
+
+function startEditMessage(visibleIndex: number) {
+  if (isGenerating.value) return;
+  editingMessageIndex.value = visibleIndex;
+  editingContent.value = visibleMessages.value[visibleIndex].content;
+}
+
+function cancelEdit() {
+  editingMessageIndex.value = null;
+  editingContent.value = "";
+}
+
+function submitEdit(visibleIndex: number) {
+  const content = editingContent.value.trim();
+  if (!content) return;
+  let vi = 0;
+  let actualIndex = -1;
+  for (let i = 0; i < messages.value.length; i++) {
+    if (messages.value[i].kind !== "contextSummary") {
+      if (vi === visibleIndex) {
+        actualIndex = i;
+        break;
+      }
+      vi++;
+    }
+  }
+  if (actualIndex < 0) return;
+  messages.value = messages.value.slice(0, actualIndex);
+  editingMessageIndex.value = null;
+  editingContent.value = "";
+  prompt.value = content;
+  send();
+}
+
+function onEditKeydown(event: KeyboardEvent, visibleIndex: number) {
+  if (event.key === "Escape") {
+    cancelEdit();
+    return;
+  }
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    submitEdit(visibleIndex);
+  }
+}
 
 // Inline model selector
 const modelOptions = ref<AiModelInfo[]>([]);
@@ -1127,9 +1174,35 @@ async function openExternalUrl(url: string) {
     <ScrollArea v-else ref="scrollRef" class="min-h-0 flex-1 overflow-hidden">
       <div class="flex flex-col gap-3 p-3">
         <template v-for="(msg, i) in visibleMessages" :key="i">
-          <div v-if="msg.role === 'user'" class="flex justify-end">
-            <div class="max-w-[85%] whitespace-pre-wrap rounded-lg bg-primary px-3 py-2 text-xs text-primary-foreground">
-              {{ msg.content }}
+          <div v-if="msg.role === 'user'" class="group flex justify-end">
+            <div class="max-w-[85%]">
+              <template v-if="editingMessageIndex === i">
+                <textarea
+                  :ref="
+                    (el) => {
+                      if (el) (el as HTMLTextAreaElement).focus();
+                    }
+                  "
+                  v-model="editingContent"
+                  rows="3"
+                  class="w-full resize-none rounded-lg border bg-background px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-primary"
+                  @keydown="onEditKeydown($event, i)"
+                />
+                <div class="mt-1.5 flex justify-end gap-1.5">
+                  <Button size="sm" variant="ghost" class="h-6 px-2 text-[11px]" @click="cancelEdit">{{ t("ai.editCancel") }}</Button>
+                  <Button size="sm" class="h-6 px-2 text-[11px]" @click="submitEdit(i)">{{ t("ai.editResend") }}</Button>
+                </div>
+              </template>
+              <template v-else>
+                <div class="flex items-start gap-1">
+                  <button v-if="!isGenerating" class="mt-1 hidden h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground group-hover:flex" :title="t('ai.editMessage')" @click="startEditMessage(i)">
+                    <Pencil class="h-3 w-3" />
+                  </button>
+                  <div class="whitespace-pre-wrap rounded-lg bg-primary px-3 py-2 text-xs text-primary-foreground">
+                    {{ msg.content }}
+                  </div>
+                </div>
+              </template>
             </div>
           </div>
 

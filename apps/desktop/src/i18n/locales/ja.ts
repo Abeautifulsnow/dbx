@@ -1217,6 +1217,9 @@ export default withEnglishFallback({
       convert: "例: PostgreSQL / MySQL / SQL Serverに変換",
       sampleData: "生成するサンプルデータやテスト文を説明してください",
     },
+    editMessage: "メッセージを編集",
+    editResend: "再送信",
+    editCancel: "キャンセル",
   },
   contextMenu: {
     openConnection: "接続を開く",

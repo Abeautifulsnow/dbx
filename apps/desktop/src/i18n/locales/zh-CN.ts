@@ -1218,6 +1218,9 @@ export default withEnglishFallback({
       convert: "例如：转换成 PostgreSQL / MySQL / SQL Server",
       sampleData: "描述要生成的样例数据或测试语句",
     },
+    editMessage: "编辑消息",
+    editResend: "重新发送",
+    editCancel: "取消",
   },
   contextMenu: {
     openConnection: "打开连接",

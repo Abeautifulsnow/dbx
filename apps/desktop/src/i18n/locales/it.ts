@@ -1217,6 +1217,9 @@ export default withEnglishFallback({
       convert: "es. converti in PostgreSQL / MySQL / SQL Server",
       sampleData: "Descrivi i dati di esempio o le istruzioni di test da generare",
     },
+    editMessage: "Modifica messaggio",
+    editResend: "Invia di nuovo",
+    editCancel: "Annulla",
   },
   contextMenu: {
     openConnection: "Apri Connessione",
