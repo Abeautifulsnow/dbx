@@ -1292,4 +1292,67 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], AgentEvent::TextDelta { .. }));
     }
+
+    // --- Agent task-action contract tests (query / exploreSchema / executeAndExplain) ---
+
+    fn contract_for(action: &str, user_request: &str, mode: &str) -> AiTaskContract {
+        AiTaskContract {
+            action: Some(action.to_string()),
+            mode: Some(mode.to_string()),
+            user_request: Some(user_request.to_string()),
+        }
+    }
+
+    #[test]
+    fn query_action_contract_requires_execute_query() {
+        let contract = contract_for("query", "统计今天订单数", "agent");
+        let prompt = augment_system_prompt_with_task_contract("base", Some(&contract), true);
+
+        assert!(prompt.contains("data-query task"), "prompt should mark this as a data-query task");
+        assert!(prompt.contains("call execute_query"), "prompt should instruct the LLM to call execute_query");
+        assert!(!prompt.contains("SQL-producing action"), "query must not be treated as a SQL-producing action");
+    }
+
+    #[test]
+    fn explore_schema_contract_uses_metadata_tools_not_execute_query() {
+        let contract = contract_for("exploreSchema", "看一下 orders 表的结构", "agent");
+        let prompt = augment_system_prompt_with_task_contract("base", Some(&contract), true);
+
+        assert!(prompt.contains("schema-inspection task"));
+        assert!(prompt.contains("list_tables/get_columns"));
+        assert!(prompt.contains("Do not execute data queries"));
+    }
+
+    #[test]
+    fn execute_and_explain_contract_runs_current_sql() {
+        let contract = contract_for("executeAndExplain", "执行并解释当前 SQL", "agent");
+        let prompt = augment_system_prompt_with_task_contract("base", Some(&contract), true);
+
+        assert!(prompt.contains("execute-and-explain task"));
+        assert!(prompt.contains("run the current SQL"));
+    }
+
+    #[test]
+    fn task_actions_do_not_require_sql_deliverable() {
+        // query / exploreSchema / executeAndExplain are task-oriented, not SQL-producing:
+        // a final answer without a fenced SQL block must still satisfy the contract.
+        let answer_without_sql = "今天共有 42 笔订单。";
+        for action in ["query", "exploreSchema", "executeAndExplain"] {
+            let contract = contract_for(action, "统计今天订单数", "agent");
+            assert_eq!(
+                validate_final_answer(Some(&contract), answer_without_sql),
+                FinalAnswerCheck::Satisfied,
+                "action {action} should not require a SQL deliverable",
+            );
+        }
+    }
+
+    #[test]
+    fn query_action_repair_prompt_targets_execute_query() {
+        let contract = contract_for("query", "统计今天订单数", "agent");
+        let repair = build_contract_repair_prompt(Some(&contract), true, "previous answer did not execute");
+
+        assert!(repair.contains("data-query task"));
+        assert!(repair.contains("call execute_query"));
+    }
 }
