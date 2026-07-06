@@ -470,10 +470,14 @@ fn augment_system_prompt_with_task_contract(
     let user_request = contract.user_request.as_deref().unwrap_or("(not provided)");
     let mode_rule = if action_requires_sql_deliverable(action) {
         "This is a SQL-producing action: produce the final SQL in a fenced ```sql code block. Use tools only as intermediate evidence for schema/dialect; do not stop at a tool-result summary. In Agent mode, execute a query only when the original request explicitly asks for real data/results, not when it merely asks to generate SQL."
-    } else if is_agent_mode {
-        "For data-query intents, obtain real results with execute_query when safe; otherwise state the blocker."
     } else {
-        "In Ask mode, produce SQL/explanation only and do not claim execution."
+        match action.to_ascii_lowercase().as_str() {
+            "query" => "This is a data-query task: call execute_query to obtain real results, then answer based on the actual data. Do not stop after merely outputting SQL text.",
+            "exploreschema" => "This is a schema-inspection task: use list_tables/get_columns to obtain authoritative structure, then summarize. Do not execute data queries unless the user explicitly asks for data.",
+            "executeandexplain" => "This is an execute-and-explain task: call execute_query to run the current SQL, then explain the real results.",
+            _ if is_agent_mode => "For data-query intents, obtain real results with execute_query when safe; otherwise state the blocker.",
+            _ => "In Ask mode, produce SQL/explanation only and do not claim execution.",
+        }
     };
 
     format!(
@@ -517,10 +521,14 @@ fn build_contract_repair_prompt(task_contract: Option<&AiTaskContract>, is_agent
     let user_request = task_contract.and_then(|c| c.user_request.as_deref()).unwrap_or("(not provided)");
     let mode_rule = if action_requires_sql_deliverable(action) {
         "For this SQL-producing action, produce SQL in a fenced ```sql code block. Tool results are evidence only; do not answer by summarizing schema/tool output. Execute a query only when the original request explicitly asks for real data/results."
-    } else if is_agent_mode {
-        "If the original request asks for real data and it can be answered safely, call execute_query before the final answer."
     } else {
-        "In Ask mode, generate SQL and concise explanation only; do not claim the SQL was executed."
+        match action.to_ascii_lowercase().as_str() {
+            "query" => "For this data-query task, call execute_query and answer based on real data; do not stop at SQL text or a schema summary.",
+            "exploreschema" => "For this schema-inspection task, summarize real structure from list_tables/get_columns; do not invent columns.",
+            "executeandexplain" => "For this execute-and-explain task, run the current SQL via execute_query and explain the real results.",
+            _ if is_agent_mode => "If the original request asks for real data and it can be answered safely, call execute_query before the final answer.",
+            _ => "In Ask mode, generate SQL and concise explanation only; do not claim the SQL was executed.",
+        }
     };
 
     format!(

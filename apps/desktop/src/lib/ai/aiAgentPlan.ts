@@ -48,8 +48,11 @@ export function buildAiAgentPlan(input: AiAgentPlanInput): AiAgentPlan {
     return { steps };
   }
 
+  // Task-oriented Agent actions (query / exploreSchema / executeAndExplain) execute via the
+  // execute_query tool, surfaced through real-time tool-call events — not via this legacy
+  // client-side auto-execute path. Only render the generated SQL; do not emit a misleading
+  // "unsupported_action" step or drive client-side execution for these actions.
   if (input.action !== "generate") {
-    steps.push({ kind: "execute_sql", status: "skipped", reason: "unsupported_action" });
     return { steps };
   }
 
