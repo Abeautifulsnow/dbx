@@ -13,7 +13,7 @@ export type AiAgentStep =
   | {
       kind: "execute_sql";
       status: "skipped";
-      reason: "ask_mode" | "no_sql" | "no_execution_intent" | "unsupported_action" | "blocked_by_policy" | "requires_confirmation";
+      reason: "ask_mode" | "no_sql" | "no_execution_intent" | "blocked_by_policy" | "requires_confirmation";
     };
 
 export interface AiAgentPlanInput {
@@ -50,8 +50,8 @@ export function buildAiAgentPlan(input: AiAgentPlanInput): AiAgentPlan {
 
   // Task-oriented Agent actions (query / exploreSchema / executeAndExplain) execute via the
   // execute_query tool, surfaced through real-time tool-call events — not via this legacy
-  // client-side auto-execute path. Only render the generated SQL; do not emit a misleading
-  // "unsupported_action" step or drive client-side execution for these actions.
+  // client-side auto-execute path. Only render the generated SQL; do not drive client-side
+  // execution for these actions.
   if (input.action !== "generate") {
     return { steps };
   }

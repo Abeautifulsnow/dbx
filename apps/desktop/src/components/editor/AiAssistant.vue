@@ -312,7 +312,16 @@ function resolveDefaultAction(mode: AiAssistantMode): AiAction {
 // menu and behavior match the new intent (Ask → generate, Agent → query). The shared
 // `generate` action is not carried across because its label/semantics differ per mode
 // ("生成 SQL" vs "生成但不执行").
+//
+// `triggerAction` may set the action itself after programmatically switching mode (e.g. "Fix
+// with AI" invoked from Agent mode); `suppressModeActionReset` tells this watch to skip the
+// default reset so the menu keeps reflecting the action actually being run.
+let suppressModeActionReset = false;
 watch(assistantMode, (mode) => {
+  if (suppressModeActionReset) {
+    suppressModeActionReset = false;
+    return;
+  }
   activeAction.value = resolveDefaultAction(mode);
 });
 
@@ -1197,6 +1206,9 @@ function triggerAction(action: AiAction, instruction?: string) {
   // If the assistant is currently in Agent mode where those actions aren't offered, switch to
   // Ask mode so the action is valid and the menu reflects what actually runs.
   if (!isValidActionForMode(action, assistantMode.value)) {
+    // Suppress the mode-switch watch so it doesn't overwrite `action` (set below) with the
+    // Ask default — the menu must reflect the action actually being run.
+    suppressModeActionReset = true;
     assistantMode.value = "ask";
   }
   activeAction.value = action;
