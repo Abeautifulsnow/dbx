@@ -403,6 +403,15 @@ function iconClass(type: ObjectBrowserRow["type"]) {
   return "text-green-500";
 }
 
+function iconBgClass(type: ObjectBrowserRow["type"]) {
+  if (type === "VIEW" || type === "MATERIALIZED_VIEW") return "bg-purple-500/10";
+  if (type === "PROCEDURE") return "bg-blue-500/10";
+  if (type === "FUNCTION") return "bg-amber-500/10";
+  if (type === "SEQUENCE") return "bg-emerald-500/10";
+  if (type === "PACKAGE" || type === "PACKAGE_BODY") return "bg-cyan-500/10";
+  return "bg-green-500/10";
+}
+
 function isPartitionParentExpanded(row: ObjectBrowserRow) {
   return expandedPartitionParentIds.value.has(row.id);
 }
@@ -1883,11 +1892,14 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               <CheckSquare v-if="selectedTableIds.has(item.id)" class="h-3.5 w-3.5 text-primary" />
               <Square v-else class="h-3.5 w-3.5" />
             </button>
-            <component :is="iconFor(item)" class="h-7 w-7 shrink-0" :class="iconClass(item.type)" />
-            <span class="w-full truncate text-xs font-medium text-foreground">{{ item.displayName }}</span>
-            <span class="text-[11px] text-muted-foreground"
-              >{{ typeLabel(item.type) }}<template v-if="item.estimatedRows != null"> · {{ formatObjectBrowserCount(item.estimatedRows) }}</template></span
-            >
+            <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full" :class="iconBgClass(item.type)">
+              <component :is="iconFor(item)" class="h-6 w-6" :class="iconClass(item.type)" />
+            </div>
+            <span class="w-full truncate text-sm font-medium leading-tight text-foreground">{{ item.displayName }}</span>
+            <div class="flex items-center gap-1.5">
+              <span class="text-[11px] text-muted-foreground">{{ typeLabel(item.type) }}</span>
+              <span v-if="item.estimatedRows != null && item.estimatedRows > 0" class="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-primary">{{ formatObjectBrowserCount(item.estimatedRows) }}</span>
+            </div>
           </div>
         </CustomContextMenu>
         <div v-if="filteredRows.length === 0" class="col-span-full flex h-full items-center justify-center text-sm text-muted-foreground">
