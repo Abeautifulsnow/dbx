@@ -1892,12 +1892,12 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               <CheckSquare v-if="selectedTableIds.has(item.id)" class="h-3.5 w-3.5 text-primary" />
               <Square v-else class="h-3.5 w-3.5" />
             </button>
-            <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full" :class="iconBgClass(item.type)">
+            <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full shadow-sm" :class="iconBgClass(item.type)">
               <component :is="iconFor(item)" class="h-6 w-6" :class="iconClass(item.type)" />
             </div>
             <span class="w-full truncate text-sm font-medium leading-tight text-foreground">{{ item.displayName }}</span>
             <div class="flex items-center gap-1.5">
-              <span class="text-[11px] text-muted-foreground">{{ typeLabel(item.type) }}</span>
+              <span class="text-xs text-muted-foreground">{{ typeLabel(item.type) }}</span>
               <span v-if="item.estimatedRows != null && item.estimatedRows > 0" class="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-primary">{{ formatObjectBrowserCount(item.estimatedRows) }}</span>
             </div>
           </div>
@@ -2132,7 +2132,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 
 .object-browser-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   align-content: start;
   gap: 0.75rem;
   scrollbar-width: thin;
