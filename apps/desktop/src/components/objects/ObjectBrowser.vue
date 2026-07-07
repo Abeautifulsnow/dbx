@@ -1870,7 +1870,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       <div v-else class="object-browser-grid min-h-0 flex-1 overflow-y-auto p-2">
         <CustomContextMenu v-for="item in filteredRows" :key="item.id" :items="getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
           <div
-            class="relative flex cursor-pointer flex-col gap-2 rounded-md border bg-card p-3 text-left transition-colors hover:bg-accent/50"
+            class="relative flex cursor-pointer flex-col items-center gap-1.5 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
             :class="{
               'border-primary bg-primary/5': selectedTableIds.has(item.id),
               'border-primary/60': sourceRow?.id === item.id && !selectedTableIds.has(item.id),
@@ -1879,18 +1879,15 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             @click="onRowClick(item, $event)"
             @contextmenu="onContextMenu"
           >
-            <button v-if="showCheckboxColumn" class="absolute right-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground" type="button" :class="{ invisible: item.type !== 'TABLE' }" @click.stop="toggleTableSelection(item)">
+            <button v-if="showCheckboxColumn" class="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground" type="button" :class="{ invisible: item.type !== 'TABLE' }" @click.stop="toggleTableSelection(item)">
               <CheckSquare v-if="selectedTableIds.has(item.id)" class="h-3.5 w-3.5 text-primary" />
               <Square v-else class="h-3.5 w-3.5" />
             </button>
-            <div class="flex min-w-0 items-center gap-2 pr-6">
-              <component :is="iconFor(item)" class="h-4 w-4 shrink-0" :class="iconClass(item.type)" />
-              <span class="truncate text-[13px] font-medium text-foreground">{{ item.displayName }}</span>
-            </div>
-            <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-              <span class="truncate">{{ typeLabel(item.type) }}</span>
-              <span v-if="item.estimatedRows != null" class="shrink-0 tabular-nums">{{ formatObjectBrowserCount(item.estimatedRows) }}</span>
-            </div>
+            <component :is="iconFor(item)" class="h-7 w-7 shrink-0" :class="iconClass(item.type)" />
+            <span class="w-full truncate text-xs font-medium text-foreground">{{ item.displayName }}</span>
+            <span class="text-[11px] text-muted-foreground"
+              >{{ typeLabel(item.type) }}<template v-if="item.estimatedRows != null"> · {{ formatObjectBrowserCount(item.estimatedRows) }}</template></span
+            >
           </div>
         </CustomContextMenu>
         <div v-if="filteredRows.length === 0" class="col-span-full flex h-full items-center justify-center text-sm text-muted-foreground">
@@ -2123,8 +2120,9 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 
 .object-browser-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 0.5rem;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  align-content: start;
+  gap: 0.75rem;
   scrollbar-width: thin;
 }
 </style>
