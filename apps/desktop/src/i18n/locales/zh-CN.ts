@@ -1704,6 +1704,7 @@ export default withEnglishFallback({
     batchTruncateSuccess: "已截断 {count} 张表",
     copyTableSelected: "复制",
     pasteTableSelected: "粘贴",
+    toggleCheckbox: "切换多选模式",
   },
   structureEditor: {
     title: "编辑表结构",

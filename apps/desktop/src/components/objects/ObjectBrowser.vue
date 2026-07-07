@@ -217,8 +217,18 @@ const objectFilters = computed<ObjectFilter[]>(() =>
 const showObjectFilter = computed(() => objectFilters.value.length > 2);
 const hasCreatedAt = computed(() => rows.value.some((row) => row.created_at?.trim()));
 const hasUpdatedAt = computed(() => rows.value.some((row) => row.updated_at?.trim()));
+const showCheckboxColumn = computed(() => settingsStore.editorSettings.objectBrowserShowCheckbox || selectedTableCount.value > 0);
+
+function toggleCheckboxColumn() {
+  const next = !settingsStore.editorSettings.objectBrowserShowCheckbox;
+  settingsStore.updateEditorSettings({ objectBrowserShowCheckbox: next });
+  if (!next) clearTableSelection();
+}
+
 const objectBrowserColumns = computed<ObjectBrowserColumnKey[]>(() => {
-  const columns: ObjectBrowserColumnKey[] = ["select", "name", "type", "estimatedRows", "totalBytes"];
+  const columns: ObjectBrowserColumnKey[] = [];
+  if (showCheckboxColumn.value) columns.push("select");
+  columns.push("name", "type", "estimatedRows", "totalBytes");
   if (hasCreatedAt.value) columns.push("created_at");
   if (hasUpdatedAt.value) columns.push("updated_at");
   columns.push("comment");
@@ -1645,6 +1655,10 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         content-class="w-56"
         @update:model-value="onSchemaChange"
       />
+      <Button variant="ghost" size="icon" class="h-7 w-7" :class="{ 'text-primary': settingsStore.editorSettings.objectBrowserShowCheckbox }" :title="t('objects.toggleCheckbox')" @click="toggleCheckboxColumn">
+        <CheckSquare v-if="settingsStore.editorSettings.objectBrowserShowCheckbox" class="h-3.5 w-3.5" />
+        <Square v-else class="h-3.5 w-3.5" />
+      </Button>
       <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="loadingObjects" @click="reload">
         <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': loadingObjects }" />
       </Button>
@@ -1692,7 +1706,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     <div v-else class="flex min-h-0 min-w-0 flex-1 flex-col">
       <div class="object-browser-table flex min-h-0 min-w-0 flex-1 flex-col overflow-x-auto overflow-y-hidden">
         <div class="grid h-7 shrink-0 items-center gap-3 border-b bg-muted/40 px-3 text-xs font-medium text-muted-foreground" :style="{ gridTemplateColumns, minWidth: `${objectGridMinWidth}px` }">
-          <div class="relative flex min-w-0 items-center">
+          <div v-if="showCheckboxColumn" class="relative flex min-w-0 items-center">
             <button class="flex h-6 w-6 items-center justify-center rounded-sm hover:bg-accent" type="button" :disabled="visibleSelectableRows.length === 0" @click="toggleVisibleTableSelection">
               <CheckSquare v-if="allVisibleTablesSelected" class="h-3.5 w-3.5 text-primary" />
               <Square v-else class="h-3.5 w-3.5" />
@@ -1794,7 +1808,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                 @click="onRowClick(item, $event)"
                 @contextmenu="onContextMenu"
               >
-                <button class="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground" type="button" :class="{ invisible: item.type !== 'TABLE' }" @click.stop="toggleTableSelection(item)">
+                <button v-if="showCheckboxColumn" class="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground" type="button" :class="{ invisible: item.type !== 'TABLE' }" @click.stop="toggleTableSelection(item)">
                   <CheckSquare v-if="selectedTableIds.has(item.id)" class="h-3.5 w-3.5 text-primary" />
                   <Square v-else class="h-3.5 w-3.5" />
                 </button>

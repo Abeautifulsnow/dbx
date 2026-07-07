@@ -1704,6 +1704,7 @@ export default {
     batchTruncateSuccess: "Truncated {count} tables",
     copyTableSelected: "Copy",
     pasteTableSelected: "Paste",
+    toggleCheckbox: "Toggle multi-select",
   },
   structureEditor: {
     title: "Edit Table Structure",
