@@ -1705,6 +1705,8 @@ export default {
     copyTableSelected: "Copy",
     pasteTableSelected: "Paste",
     toggleCheckbox: "Toggle multi-select",
+    viewList: "List view",
+    viewGrid: "Grid view",
   },
   structureEditor: {
     title: "Edit Table Structure",

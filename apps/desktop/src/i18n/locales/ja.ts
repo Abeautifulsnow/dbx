@@ -1676,6 +1676,9 @@ export default withEnglishFallback({
     batchTruncateSuccess: "{count}テーブルをトランケートしました",
     copyTableSelected: "コピー",
     pasteTableSelected: "貼り付け",
+    toggleCheckbox: "複数選択の切り替え",
+    viewList: "リスト表示",
+    viewGrid: "グリッド表示",
     sourceReadOnly: "このソースは読み取り専用で、編集できません。",
   },
   structureEditor: {

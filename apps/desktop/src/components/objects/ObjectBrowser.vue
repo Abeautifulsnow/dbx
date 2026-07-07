@@ -19,6 +19,8 @@ import {
   Eye,
   FileCode,
   GripVertical,
+  LayoutGrid,
+  List,
   ListTree,
   Upload,
   Loader2,
@@ -217,6 +219,12 @@ const objectFilters = computed<ObjectFilter[]>(() =>
 const showObjectFilter = computed(() => objectFilters.value.length > 2);
 const hasCreatedAt = computed(() => rows.value.some((row) => row.created_at?.trim()));
 const hasUpdatedAt = computed(() => rows.value.some((row) => row.updated_at?.trim()));
+const isListView = computed(() => settingsStore.editorSettings.objectBrowserViewMode !== "grid");
+
+function setViewMode(mode: "list" | "grid") {
+  settingsStore.updateEditorSettings({ objectBrowserViewMode: mode });
+}
+
 const showCheckboxColumn = computed(() => settingsStore.editorSettings.objectBrowserShowCheckbox || selectedTableCount.value > 0);
 
 function toggleCheckboxColumn() {
@@ -1655,6 +1663,14 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         content-class="w-56"
         @update:model-value="onSchemaChange"
       />
+      <div class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
+        <button type="button" class="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground" :class="{ 'bg-background text-foreground shadow-sm': isListView }" :title="t('objects.viewList')" @click="setViewMode('list')">
+          <List class="h-3.5 w-3.5" />
+        </button>
+        <button type="button" class="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground" :class="{ 'bg-background text-foreground shadow-sm': !isListView }" :title="t('objects.viewGrid')" @click="setViewMode('grid')">
+          <LayoutGrid class="h-3.5 w-3.5" />
+        </button>
+      </div>
       <Button variant="ghost" size="icon" class="h-7 w-7" :class="{ 'text-primary': settingsStore.editorSettings.objectBrowserShowCheckbox }" :title="t('objects.toggleCheckbox')" @click="toggleCheckboxColumn">
         <CheckSquare v-if="settingsStore.editorSettings.objectBrowserShowCheckbox" class="h-3.5 w-3.5" />
         <Square v-else class="h-3.5 w-3.5" />
@@ -1704,7 +1720,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       {{ t("objects.empty") }}
     </div>
     <div v-else class="flex min-h-0 min-w-0 flex-1 flex-col">
-      <div class="object-browser-table flex min-h-0 min-w-0 flex-1 flex-col overflow-x-auto overflow-y-hidden">
+      <div v-if="isListView" class="object-browser-table flex min-h-0 min-w-0 flex-1 flex-col overflow-x-auto overflow-y-hidden">
         <div class="grid h-7 shrink-0 items-center gap-3 border-b bg-muted/40 px-3 text-xs font-medium text-muted-foreground" :style="{ gridTemplateColumns, minWidth: `${objectGridMinWidth}px` }">
           <div v-if="showCheckboxColumn" class="relative flex min-w-0 items-center">
             <button class="flex h-6 w-6 items-center justify-center rounded-sm hover:bg-accent" type="button" :disabled="visibleSelectableRows.length === 0" @click="toggleVisibleTableSelection">
@@ -1850,6 +1866,36 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             </CustomContextMenu>
           </template>
         </RecycleScroller>
+      </div>
+      <div v-else class="object-browser-grid min-h-0 flex-1 overflow-y-auto p-2">
+        <CustomContextMenu v-for="item in filteredRows" :key="item.id" :items="getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
+          <div
+            class="relative flex cursor-pointer flex-col gap-2 rounded-md border bg-card p-3 text-left transition-colors hover:bg-accent/50"
+            :class="{
+              'border-primary bg-primary/5': selectedTableIds.has(item.id),
+              'border-primary/60': sourceRow?.id === item.id && !selectedTableIds.has(item.id),
+            }"
+            :title="item.displayName"
+            @click="onRowClick(item, $event)"
+            @contextmenu="onContextMenu"
+          >
+            <button v-if="showCheckboxColumn" class="absolute right-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground" type="button" :class="{ invisible: item.type !== 'TABLE' }" @click.stop="toggleTableSelection(item)">
+              <CheckSquare v-if="selectedTableIds.has(item.id)" class="h-3.5 w-3.5 text-primary" />
+              <Square v-else class="h-3.5 w-3.5" />
+            </button>
+            <div class="flex min-w-0 items-center gap-2 pr-6">
+              <component :is="iconFor(item)" class="h-4 w-4 shrink-0" :class="iconClass(item.type)" />
+              <span class="truncate text-[13px] font-medium text-foreground">{{ item.displayName }}</span>
+            </div>
+            <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+              <span class="truncate">{{ typeLabel(item.type) }}</span>
+              <span v-if="item.estimatedRows != null" class="shrink-0 tabular-nums">{{ formatObjectBrowserCount(item.estimatedRows) }}</span>
+            </div>
+          </div>
+        </CustomContextMenu>
+        <div v-if="filteredRows.length === 0" class="col-span-full flex h-full items-center justify-center text-sm text-muted-foreground">
+          {{ t("objects.empty") }}
+        </div>
       </div>
       <div v-if="sourceRow" class="flex h-[42%] min-h-44 shrink-0 flex-col border-t bg-background">
         <div class="flex h-8 shrink-0 items-center gap-2 border-b bg-muted/20 px-3">
@@ -2073,5 +2119,12 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 
 .object-browser-scroller :deep(.vue-recycle-scroller__item-view) {
   contain: layout style paint;
+}
+
+.object-browser-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.5rem;
+  scrollbar-width: thin;
 }
 </style>

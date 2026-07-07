@@ -421,6 +421,7 @@ export interface EditorSettings {
   updateDownloadSource: UpdateDownloadSource;
   toolbarItems: ToolbarItems;
   objectBrowserShowCheckbox: boolean;
+  objectBrowserViewMode: "list" | "grid";
 }
 
 export interface ToolbarItems {
@@ -550,6 +551,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   updateDownloadSource: "official",
   toolbarItems: { ...DEFAULT_TOOLBAR_ITEMS },
   objectBrowserShowCheckbox: false,
+  objectBrowserViewMode: "list",
 };
 
 export const STORAGE_KEY = "dbx-editor-settings";
@@ -776,6 +778,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     updateDownloadSource: normalizeUpdateDownloadSource(settings.updateDownloadSource),
     toolbarItems: normalizeToolbarItems(settings.toolbarItems),
     objectBrowserShowCheckbox: typeof settings.objectBrowserShowCheckbox === "boolean" ? settings.objectBrowserShowCheckbox : DEFAULT_EDITOR_SETTINGS.objectBrowserShowCheckbox,
+    objectBrowserViewMode: settings.objectBrowserViewMode === "grid" ? "grid" : DEFAULT_EDITOR_SETTINGS.objectBrowserViewMode,
   };
 }
 
@@ -1016,6 +1019,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.updateDownloadSource !== undefined) editorSettings.value.updateDownloadSource = normalizeUpdateDownloadSource(partial.updateDownloadSource);
     if (partial.toolbarItems !== undefined) editorSettings.value.toolbarItems = normalizeToolbarItems(partial.toolbarItems);
     if (partial.objectBrowserShowCheckbox !== undefined) editorSettings.value.objectBrowserShowCheckbox = partial.objectBrowserShowCheckbox === true;
+    if (partial.objectBrowserViewMode !== undefined) editorSettings.value.objectBrowserViewMode = partial.objectBrowserViewMode === "grid" ? "grid" : "list";
     saveEditorSettings(editorSettings.value);
   }
 
