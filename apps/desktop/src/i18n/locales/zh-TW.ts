@@ -1612,6 +1612,9 @@ export default withEnglishFallback({
     toggleCheckbox: "切換多選模式",
     viewList: "列表檢視",
     viewGrid: "平鋪檢視",
+    sortAsc: "升序",
+    sortDesc: "降序",
+    sortBy: "排序方式",
   },
   structureEditor: {
     title: "編輯資料表結構",
