@@ -1726,6 +1726,9 @@ export default {
     toggleCheckbox: "Toggle multi-select",
     viewList: "List view",
     viewGrid: "Grid view",
+    sortAsc: "Ascending",
+    sortDesc: "Descending",
+    sortBy: "Sort by",
   },
   structureEditor: {
     title: "Edit Table Structure",

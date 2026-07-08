@@ -1726,6 +1726,9 @@ export default withEnglishFallback({
     toggleCheckbox: "切换多选模式",
     viewList: "列表视图",
     viewGrid: "平铺视图",
+    sortAsc: "升序",
+    sortDesc: "降序",
+    sortBy: "排序方式",
   },
   structureEditor: {
     title: "编辑表结构",

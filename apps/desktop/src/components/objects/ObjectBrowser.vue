@@ -311,6 +311,23 @@ function toggleSort(key: ObjectBrowserSortKey) {
   sortDirection.value = initialObjectBrowserSortDirection(key);
 }
 
+const sortKeyOptions: ObjectBrowserSortKey[] = ["name", "type", "estimatedRows", "totalBytes", "created_at", "updated_at", "comment"];
+
+function sortKeyLabel(key: ObjectBrowserSortKey): string {
+  if (key === "name") return t("objects.name");
+  if (key === "type") return t("objects.type");
+  if (key === "estimatedRows") return t("objects.rows");
+  if (key === "totalBytes") return t("objects.size");
+  if (key === "created_at") return t("objects.createdAt");
+  if (key === "updated_at") return t("objects.updatedAt");
+  if (key === "comment") return t("objects.comment");
+  return key;
+}
+
+function onSortKeyChange(key: ObjectBrowserSortKey) {
+  toggleSort(key);
+}
+
 function minimumColumnWidth(key: ObjectBrowserColumnKey) {
   if (key === "select") return 34;
   if (key === "name" || key === "comment") return 120;
@@ -1672,6 +1689,23 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         content-class="w-56"
         @update:model-value="onSchemaChange"
       />
+      <!-- Sort selector -->
+      <div class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
+        <select
+          class="h-6 cursor-pointer appearance-none rounded-sm bg-transparent px-1.5 text-xs text-muted-foreground outline-none hover:text-foreground focus:text-foreground"
+          :value="sortKey"
+          :aria-label="t('objects.sortBy')"
+          @change="onSortKeyChange(($event.target as HTMLSelectElement).value as ObjectBrowserSortKey)"
+        >
+          <option v-for="key in sortKeyOptions" :key="key" :value="key" class="bg-background text-foreground">
+            {{ sortKeyLabel(key) }}
+          </option>
+        </select>
+        <button type="button" class="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground" :title="sortDirection === 'asc' ? t('objects.sortAsc') : t('objects.sortDesc')" @click="sortDirection = sortDirection === 'asc' ? 'desc' : 'asc'">
+          <ArrowUp v-if="sortDirection === 'asc'" class="h-3 w-3" />
+          <ArrowDown v-else class="h-3 w-3" />
+        </button>
+      </div>
       <div class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
         <button type="button" class="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground" :class="{ 'bg-background text-foreground shadow-sm': isListView }" :title="t('objects.viewList')" @click="setViewMode('list')">
           <List class="h-3.5 w-3.5" />
