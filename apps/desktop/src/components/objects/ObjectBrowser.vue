@@ -319,6 +319,13 @@ const sortKeyOptions = computed<ObjectBrowserSortKey[]>(() => {
   return options;
 });
 
+watch(sortKeyOptions, (options) => {
+  if (!options.includes(sortKey.value)) {
+    sortKey.value = "name";
+    sortDirection.value = "asc";
+  }
+});
+
 function sortKeyLabel(key: ObjectBrowserSortKey): string {
   if (key === "name") return t("objects.name");
   if (key === "type") return t("objects.type");
