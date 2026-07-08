@@ -168,6 +168,55 @@ func TestIsQuerySQLRequiresKeywordBoundary(t *testing.T) {
 	}
 }
 
+func TestTrimStatementSQLPreservesAnonymousPLSQLBlockTerminator(t *testing.T) {
+	sqlText := `DECLARE
+   PRE_TRD_DATE   INTEGER ;
+BEGIN
+   SELECT 1 + 2 INTO PRE_TRD_DATE FROM DUAL;
+END;`
+
+	if got := trimStatementSQL(sqlText); got != sqlText {
+		t.Fatalf("trimStatementSQL() = %q, want full PL/SQL block %q", got, sqlText)
+	}
+}
+
+func TestTrimStatementSQLStripsSlashDelimiterAfterPLSQLBlock(t *testing.T) {
+	sqlText := "BEGIN\n  NULL;\nEND;\n/"
+	want := "BEGIN\n  NULL;\nEND;"
+
+	if got := trimStatementSQL(sqlText); got != want {
+		t.Fatalf("trimStatementSQL() = %q, want %q", got, want)
+	}
+}
+
+func TestTrimStatementSQLPreservesCreatePLSQLObjectTerminator(t *testing.T) {
+	tests := []string{
+		"CREATE OR REPLACE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;",
+		"CREATE OR REPLACE FUNCTION f RETURN NUMBER AS\nBEGIN\n  RETURN 1;\nEND;",
+		"CREATE OR REPLACE PACKAGE pkg_utils AS\n  FUNCTION get_version RETURN VARCHAR2;\nEND pkg_utils;",
+	}
+	for _, sqlText := range tests {
+		if got := trimStatementSQL(sqlText); got != sqlText {
+			t.Fatalf("trimStatementSQL() = %q, want full PL/SQL object %q", got, sqlText)
+		}
+	}
+}
+
+func TestTrimStatementSQLStripsSlashDelimiterAfterCreatePLSQLObject(t *testing.T) {
+	sqlText := "CREATE OR REPLACE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;\n/"
+	want := "CREATE OR REPLACE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;"
+
+	if got := trimStatementSQL(sqlText); got != want {
+		t.Fatalf("trimStatementSQL() = %q, want %q", got, want)
+	}
+}
+
+func TestTrimStatementSQLRemovesRegularStatementSemicolon(t *testing.T) {
+	if got := trimStatementSQL("SELECT 1 FROM DUAL;"); got != "SELECT 1 FROM DUAL" {
+		t.Fatalf("trimStatementSQL() = %q, want regular statement without semicolon", got)
+	}
+}
+
 func protocolContract(t *testing.T) struct {
 	ProtocolVersion int      `json:"protocolVersion"`
 	AllCapabilities []string `json:"allCapabilities"`
@@ -312,6 +361,47 @@ func TestBuildDSNAddsSysDbaOption(t *testing.T) {
 		!strings.Contains(upperDSN, "AUTH+TYPE=SYSDBA") &&
 		!strings.Contains(upperDSN, "AUTH%20TYPE=SYSDBA") {
 		t.Fatalf("dsn should include SYSDBA auth option: %s", dsn)
+	}
+}
+
+func TestOracleGB18030ConverterRoundTrip(t *testing.T) {
+	converter := oracleGB18030Converter{}
+	input := "DBX \u4e2d\u6587 \U00020000"
+
+	encoded := converter.Encode(input)
+	if string(encoded) == input {
+		t.Fatalf("GB18030 converter should encode non-ASCII text away from UTF-8 bytes")
+	}
+	if decoded := converter.Decode(encoded); decoded != input {
+		t.Fatalf("GB18030 round trip = %q, want %q", decoded, input)
+	}
+	if converter.GetLangID() != oracleCharsetZHS32GB18030 {
+		t.Fatalf("GB18030 converter lang id = %d, want %d", converter.GetLangID(), oracleCharsetZHS32GB18030)
+	}
+	if clone := converter.Clone(); clone.GetLangID() != oracleCharsetZHS32GB18030 {
+		t.Fatalf("GB18030 converter clone lang id = %d, want %d", clone.GetLangID(), oracleCharsetZHS32GB18030)
+	}
+}
+
+func TestOracleStringConverterForUnsupportedCharsetError(t *testing.T) {
+	err := errors.New("the server use charset with id: 854 which is not supported by the driver")
+	converter, ok := oracleStringConverterForUnsupportedCharsetError(err)
+	if !ok {
+		t.Fatalf("expected GB18030 server charset error to have a converter")
+	}
+	if converter.GetLangID() != oracleCharsetZHS32GB18030 {
+		t.Fatalf("converter lang id = %d, want %d", converter.GetLangID(), oracleCharsetZHS32GB18030)
+	}
+	ncharsetErr := errors.New("the server use ncharset with id: 854 which is not supported by the driver")
+	if _, ok := oracleStringConverterForUnsupportedCharsetError(ncharsetErr); ok {
+		t.Fatalf("ncharset errors should not have a server charset converter")
+	}
+	otherCharsetErr := errors.New("the server use charset with id: 852 which is not supported by the driver")
+	if charsetID, ok := unsupportedOracleServerCharsetID(otherCharsetErr); !ok || charsetID != 852 {
+		t.Fatalf("other server charset should still be parsed, got id=%d ok=%v", charsetID, ok)
+	}
+	if _, ok := oracleStringConverterForUnsupportedCharsetError(otherCharsetErr); ok {
+		t.Fatalf("unknown charset ids should not get a guessed converter")
 	}
 }
 

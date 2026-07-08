@@ -18,10 +18,25 @@ import (
 
 	_ "github.com/sijms/go-ora/v2"
 	go_ora "github.com/sijms/go-ora/v2"
+	"github.com/sijms/go-ora/v2/converters"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 const protocolVersion = 1
 const defaultMaxRows = 1000
+const oracleCharsetZHS32GB18030 = 854
+
+var (
+	oraclePlSQLBlockStartRegexp          = regexp.MustCompile(`(?is)^\s*(?:DECLARE|BEGIN|CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:EDITIONABLE|NONEDITIONABLE)\s+)?(?:FUNCTION|PROCEDURE|TRIGGER|PACKAGE(?:\s+BODY)?|TYPE(?:\s+BODY)?))\b`)
+	oraclePlSQLBlockEndRegexp            = regexp.MustCompile(`(?is)\bEND\s*;\s*$`)
+	oracleNamedPlSQLBlockEndRegexp       = regexp.MustCompile(`(?is)\bEND\s+([A-Z0-9_$#]+)\s*;\s*$`)
+	oracleUnsupportedServerCharsetRegexp = regexp.MustCompile(`server use charset with id: ([0-9]+).*not supported by the driver`)
+	oracleStringConverters               = map[int]converters.IStringConverter{
+		oracleCharsetZHS32GB18030: oracleGB18030Converter{},
+	}
+)
+
 const oracleListDatabasesSQL = `
 SELECT username AS owner
 FROM all_users
@@ -328,16 +343,11 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		if err := decodeParams(params, &cp); err != nil {
 			return nil, false, err
 		}
-		db, err := openDB(cp)
+		db, err := openAndPingDB(cp, 5*time.Second)
 		if err != nil {
 			return nil, false, err
 		}
 		defer db.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := db.PingContext(ctx); err != nil {
-			return nil, false, err
-		}
 		return map[string]bool{"ok": true}, false, nil
 	case "list_databases":
 		result, err := s.listDatabases()
@@ -435,16 +445,12 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 
 func (s *server) connect(params connectParams) error {
 	_ = s.disconnect()
-	db, err := openDB(params)
+	db, err := openAndPingDB(params, 15*time.Second)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return err
-	}
 	if _, err := db.ExecContext(ctx, "ALTER SESSION SET NLS_LANGUAGE='AMERICAN'"); err != nil {
 		db.Close()
 		return err
@@ -465,15 +471,108 @@ func (s *server) disconnect() error {
 }
 
 func openDB(params connectParams) (*sql.DB, error) {
+	return openDBWithStringConverter(params, nil)
+}
+
+func openDBWithStringConverter(params connectParams, stringConverter converters.IStringConverter) (*sql.DB, error) {
 	dsn := buildDSN(params)
-	db, err := sql.Open("oracle", dsn)
-	if err != nil {
-		return nil, err
+	var db *sql.DB
+	if stringConverter == nil {
+		var err error
+		db, err = sql.Open("oracle", dsn)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		connector := go_ora.NewConnector(dsn)
+		go_ora.SetStringConverter(connector, stringConverter, nil)
+		db = sql.OpenDB(connector)
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(30 * time.Minute)
 	return db, nil
+}
+
+func openAndPingDB(params connectParams, timeout time.Duration) (*sql.DB, error) {
+	db, err := openDB(params)
+	if err != nil {
+		return nil, err
+	}
+	if err := pingDB(db, timeout); err != nil {
+		db.Close()
+		stringConverter, ok := oracleStringConverterForUnsupportedCharsetError(err)
+		if !ok {
+			return nil, err
+		}
+		// Retry only charsets with explicit converters. Guessing a converter
+		// can make the connection succeed while silently corrupting text.
+		db, err = openDBWithStringConverter(params, stringConverter)
+		if err != nil {
+			return nil, err
+		}
+		if retryErr := pingDB(db, timeout); retryErr != nil {
+			db.Close()
+			return nil, retryErr
+		}
+	}
+	return db, nil
+}
+
+func pingDB(db *sql.DB, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return db.PingContext(ctx)
+}
+
+func oracleStringConverterForUnsupportedCharsetError(err error) (converters.IStringConverter, bool) {
+	charsetID, ok := unsupportedOracleServerCharsetID(err)
+	if !ok {
+		return nil, false
+	}
+	stringConverter, ok := oracleStringConverters[charsetID]
+	return stringConverter, ok
+}
+
+func unsupportedOracleServerCharsetID(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	match := oracleUnsupportedServerCharsetRegexp.FindStringSubmatch(err.Error())
+	if len(match) != 2 {
+		return 0, false
+	}
+	charsetID, parseErr := strconv.Atoi(match[1])
+	if parseErr != nil {
+		return 0, false
+	}
+	return charsetID, true
+}
+
+type oracleGB18030Converter struct{}
+
+func (oracleGB18030Converter) Encode(input string) []byte {
+	output, _, err := transform.String(simplifiedchinese.GB18030.NewEncoder(), input)
+	if err != nil {
+		return []byte(input)
+	}
+	return []byte(output)
+}
+
+func (oracleGB18030Converter) Decode(input []byte) string {
+	output, _, err := transform.Bytes(simplifiedchinese.GB18030.NewDecoder(), input)
+	if err != nil {
+		return string(input)
+	}
+	return string(output)
+}
+
+func (oracleGB18030Converter) GetLangID() int {
+	return oracleCharsetZHS32GB18030
+}
+
+func (oracleGB18030Converter) Clone() converters.IStringConverter {
+	return oracleGB18030Converter{}
 }
 
 func buildDSN(params connectParams) string {
@@ -2327,7 +2426,52 @@ func parseURLParams(raw string) map[string]string {
 }
 
 func trimStatementSQL(sqlText string) string {
-	return strings.TrimRight(strings.TrimSpace(sqlText), "; \t\r\n")
+	trimmed := stripTrailingSlashDelimiter(strings.TrimSpace(sqlText))
+	if isOraclePlSQLBlock(trimmed) {
+		return trimmed
+	}
+	return strings.TrimRight(trimmed, "; \t\r\n")
+}
+
+func stripTrailingSlashDelimiter(sqlText string) string {
+	trimmed := strings.TrimSpace(sqlText)
+	if !strings.HasSuffix(trimmed, "/") {
+		return trimmed
+	}
+	slashStart := len(trimmed) - 1
+	lineStart := strings.LastIndex(trimmed[:slashStart], "\n") + 1
+	if strings.TrimSpace(trimmed[lineStart:slashStart]) != "" {
+		return trimmed
+	}
+	beforeSlash := strings.TrimSpace(trimmed[:lineStart])
+	// SQL*Plus uses a standalone slash to execute PL/SQL blocks; go-ora needs
+	// only the block text and not that client-side delimiter.
+	if isOraclePlSQLBlock(beforeSlash) {
+		return beforeSlash
+	}
+	return trimmed
+}
+
+func isOraclePlSQLBlock(sqlText string) bool {
+	trimmed := strings.TrimSpace(sqlText)
+	start := trimLeadingSQLComments(trimmed)
+	if !oraclePlSQLBlockStartRegexp.MatchString(start) {
+		return false
+	}
+	upper := strings.ToUpper(trimmed)
+	if oraclePlSQLBlockEndRegexp.MatchString(upper) {
+		return true
+	}
+	matches := oracleNamedPlSQLBlockEndRegexp.FindStringSubmatch(upper)
+	if len(matches) != 2 {
+		return false
+	}
+	switch matches[1] {
+	case "IF", "LOOP", "CASE":
+		return false
+	default:
+		return true
+	}
 }
 
 func isQuerySQL(sqlText string) bool {
