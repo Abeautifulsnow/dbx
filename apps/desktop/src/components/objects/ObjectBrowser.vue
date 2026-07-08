@@ -311,7 +311,13 @@ function toggleSort(key: ObjectBrowserSortKey) {
   sortDirection.value = initialObjectBrowserSortDirection(key);
 }
 
-const sortKeyOptions: ObjectBrowserSortKey[] = ["name", "type", "estimatedRows", "totalBytes", "created_at", "updated_at", "comment"];
+const sortKeyOptions = computed<ObjectBrowserSortKey[]>(() => {
+  const options: ObjectBrowserSortKey[] = ["name", "type", "estimatedRows", "totalBytes"];
+  if (hasCreatedAt.value) options.push("created_at");
+  if (hasUpdatedAt.value) options.push("updated_at");
+  options.push("comment");
+  return options;
+});
 
 function sortKeyLabel(key: ObjectBrowserSortKey): string {
   if (key === "name") return t("objects.name");
