@@ -19,6 +19,7 @@ import { useEditorFontFamilyStyle } from "@/composables/useEditorFontFamilyStyle
 import { createRedisShikiJsonHighlighter, type RedisJsonHighlighter } from "@/lib/redis/redisJsonHighlighter";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { formatTtl } from "@/lib/common/ttlFormat";
+import { computeAutoRefreshTick, computeDisplayTtl, shouldStopAutoRefresh } from "@/lib/redis/redisAutoRefresh";
 import {
   canRenderRedisValueFormat,
   canEditRedisMemberDetail,
@@ -120,15 +121,16 @@ function startAutoRefresh() {
     countdownTtl.value = data.value.ttl;
   }
   autoRefreshTimer = setInterval(() => {
-    if (!autoRefreshEnabled.value) return;
-    if (countdownTtl.value > 0) {
+    const action = computeAutoRefreshTick(autoRefreshEnabled.value, countdownTtl.value, loading.value);
+    if (action.type === "decrement") {
       countdownTtl.value--;
+      return;
     }
-    if (countdownTtl.value <= 0 && !loading.value) {
+    if (action.type === "refresh") {
       load()
         .then(() => {
           if (!autoRefreshEnabled.value) return;
-          if (data.value && data.value.ttl > 0) {
+          if (data.value && !shouldStopAutoRefresh(data.value.ttl)) {
             countdownTtl.value = data.value.ttl;
           } else {
             // Key expired or has no TTL — stop auto-refresh to avoid infinite loop
@@ -489,7 +491,7 @@ async function load(options: { selectDefaultMember?: boolean } = {}) {
     data.value = loadedValue;
     // Reset auto-refresh countdown if active
     if (autoRefreshEnabled.value) {
-      countdownTtl.value = loadedValue.ttl > 0 ? loadedValue.ttl : 0;
+      countdownTtl.value = shouldStopAutoRefresh(loadedValue.ttl) ? 0 : loadedValue.ttl;
     }
     emit("loaded", loadedValue);
     scanCursor.value = redisValueCollectionScanCursor(loadedValue);
@@ -1152,7 +1154,7 @@ onBeforeUnmount(() => {
           <Badge variant="secondary" class="dbx-editor-font-family text-xs uppercase">{{ data.redis_type }}</Badge>
           <Badge v-if="metadataSizeLabel" variant="outline" class="text-xs text-muted-foreground"> {{ t("redis.columnSize") }}: {{ metadataSizeLabel }} </Badge>
           <template v-if="!editingTtl">
-            <Badge v-if="data.ttl > 0" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">TTL: {{ autoRefreshEnabled ? formatTtl(countdownTtl, t) : formatTtl(data.ttl, t) }}</Badge>
+            <Badge v-if="data.ttl > 0" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">TTL: {{ formatTtl(computeDisplayTtl(autoRefreshEnabled, countdownTtl, data.ttl), t) }}</Badge>
             <Badge v-else-if="data.ttl === -1" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">{{ t("redis.noExpiry") }}</Badge>
           </template>
           <div ref="editTtlWrapper" v-else class="flex items-center gap-1">
