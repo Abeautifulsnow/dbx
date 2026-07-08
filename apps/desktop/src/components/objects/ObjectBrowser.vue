@@ -1859,7 +1859,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                 <div class="truncate text-xs tabular-nums text-muted-foreground" :title="item.estimatedRows == null ? '' : formatObjectBrowserCount(item.estimatedRows)">
                   {{ formatObjectBrowserCount(item.estimatedRows) }}
                 </div>
-                <div class="truncate text-xs tabular-nums text-muted-foreground" :title="item.totalBytes == null ? '' : formatObjectBrowserCount(item.totalBytes)">
+                <div class="truncate text-xs tabular-nums text-muted-foreground" :title="item.totalBytes == null ? '' : formatObjectBrowserBytes(item.totalBytes)">
                   {{ formatObjectBrowserBytes(item.totalBytes) }}
                 </div>
                 <div v-if="hasCreatedAt" class="truncate text-xs tabular-nums text-muted-foreground" :title="formatObjectBrowserTimestamp(item.created_at)">
@@ -1879,7 +1879,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       <div v-else class="object-browser-grid min-h-0 flex-1 overflow-y-auto p-2">
         <CustomContextMenu v-for="item in filteredRows" :key="item.id" :items="getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
           <div
-            class="relative flex cursor-pointer flex-col items-center gap-1.5 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
+            class="relative flex cursor-pointer flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
             :class="{
               'border-primary bg-primary/5': selectedTableIds.has(item.id),
               'border-primary/60': sourceRow?.id === item.id && !selectedTableIds.has(item.id),
@@ -1899,6 +1899,15 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             <div class="flex items-center gap-1.5">
               <span class="text-xs text-muted-foreground">{{ typeLabel(item.type) }}</span>
               <span v-if="item.estimatedRows != null && item.estimatedRows > 0" class="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-primary">{{ formatObjectBrowserCount(item.estimatedRows) }}</span>
+              <span v-if="item.totalBytes != null && item.totalBytes > 0" class="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">{{ formatObjectBrowserBytes(item.totalBytes) }}</span>
+            </div>
+            <div v-if="item.created_at?.trim() || item.updated_at?.trim()" class="flex items-center gap-1 text-[10px] text-muted-foreground/70">
+              <span v-if="item.created_at?.trim()">{{ formatObjectBrowserTimestamp(item.created_at) }}</span>
+              <span v-if="item.created_at?.trim() && item.updated_at?.trim()">·</span>
+              <span v-if="item.updated_at?.trim()">{{ formatObjectBrowserTimestamp(item.updated_at) }}</span>
+            </div>
+            <div v-if="item.comment?.trim()" class="w-full truncate text-[10px] text-muted-foreground/60" :title="item.comment">
+              {{ item.comment }}
             </div>
           </div>
         </CustomContextMenu>
