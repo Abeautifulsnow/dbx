@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { RecycleScroller } from "vue-virtual-scroller";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import {
@@ -219,11 +219,39 @@ const objectFilters = computed<ObjectFilter[]>(() =>
 const showObjectFilter = computed(() => objectFilters.value.length > 2);
 const hasCreatedAt = computed(() => rows.value.some((row) => row.created_at?.trim()));
 const hasUpdatedAt = computed(() => rows.value.some((row) => row.updated_at?.trim()));
+const hasAnyComment = computed(() => rows.value.some((row) => row.comment?.trim()));
 const isListView = computed(() => settingsStore.editorSettings.objectBrowserViewMode !== "grid");
+
+// RecycleScroller exposes scrollToItem on its component instance (see
+// vue-virtual-scroller). Typed loosely to match the DataGrid usage pattern.
+const listScrollerRef = ref<{ scrollToItem?: (index: number) => void } | null>(null);
+const gridScrollerRef = ref<{ scrollToItem?: (index: number) => void } | null>(null);
+
+function scrollObjectsToTop() {
+  // Read the active scroller inside nextTick so that after a list <-> grid
+  // switch the (re)mounted scroller is the one we reset.
+  nextTick(() => {
+    const scroller = isListView.value ? listScrollerRef.value : gridScrollerRef.value;
+    scroller?.scrollToItem?.(0);
+  });
+}
 
 function setViewMode(mode: "list" | "grid") {
   settingsStore.updateEditorSettings({ objectBrowserViewMode: mode });
+  scrollObjectsToTop();
 }
+
+// Re-sorting reorders the rows; jump to the top so the new head is visible
+// instead of leaving the view parked at a stale mid-scroll position.
+// Note: watch(sortKeyOptions) may reset sortKey during setup when the persisted key
+// is no longer valid, triggering this watcher before any scroller is mounted —
+// scrollObjectsToTop() handles that safely via optional chaining.
+watch([sortKey, sortDirection], () => scrollObjectsToTop());
+
+// Also jump to the top when the search query or object-type filter changes —
+// filtered results bear no relation to the previous scroll position.
+watch(search, () => scrollObjectsToTop());
+watch(objectFilter, () => scrollObjectsToTop());
 
 const showCheckboxColumn = computed(() => settingsStore.editorSettings.objectBrowserShowCheckbox || selectedTableCount.value > 0);
 
@@ -267,6 +295,78 @@ const partitionRowsByParentId = computed(() => {
 });
 const filteredRows = computed(() => groupedFilteredRows());
 const selectableRows = computed(() => rows.value.filter((row) => row.type === "TABLE"));
+
+// ---- Grid (tile) view virtualization ----
+// The grid view chunks filteredRows into fixed-height rows and hands them to
+// RecycleScroller, mirroring the list view so only visible rows are mounted.
+// The previous flat `v-for` rendered every card (plus its CustomContextMenu)
+// at once, which stalls the UI on schemas with thousands of objects.
+const OBJECT_GRID_MIN_CARD_WIDTH = 160; // former `minmax(160px, 1fr)` floor
+const OBJECT_GRID_GAP = 12; // 0.75rem, former grid gap (both axes)
+// Card height is variable: only timestamp/comment rows that actually appear in
+// the current dataset contribute. objectGridRowHeight (below) adapts accordingly
+// so the row slot is as tight as possible instead of always using the worst case.
+//   Base: p-3 top+bottom(24) + icon h-11(44) + name(18) + type/bytes(18) + gap-1×2(8) = 112
+//   + optional timestamp row: text-[10px](15) + gap-1(4) = 19
+//   + optional comment row:   text-[10px](15) + gap-1(4) = 19
+// If the card gains a new metadata row, add a matching constant and include it below.
+const OBJECT_GRID_CARD_BASE_H = 112;
+const OBJECT_GRID_CARD_TIMESTAMP_H = 19;
+const OBJECT_GRID_CARD_COMMENT_H = 19;
+const OBJECT_GRID_CARD_SAFETY = 6; // buffer for sub-pixel font differences
+
+const objectGridRowHeight = computed(() => {
+  let cardH = OBJECT_GRID_CARD_BASE_H;
+  if (hasCreatedAt.value || hasUpdatedAt.value) cardH += OBJECT_GRID_CARD_TIMESTAMP_H;
+  if (hasAnyComment.value) cardH += OBJECT_GRID_CARD_COMMENT_H;
+  return cardH + OBJECT_GRID_GAP + OBJECT_GRID_CARD_SAFETY;
+});
+const gridContainerRef = ref<HTMLElement | null>(null);
+const gridColumns = ref(1);
+let gridResizeObserver: ResizeObserver | null = null;
+
+function recomputeGridColumns(width: number) {
+  gridColumns.value = Math.max(1, Math.floor((width + OBJECT_GRID_GAP) / (OBJECT_GRID_MIN_CARD_WIDTH + OBJECT_GRID_GAP)));
+}
+
+// The grid container lives inside a v-else, so it mounts/unmounts when the user
+// toggles list <-> grid. Watch the template ref to (re)attach the observer each
+// time the node appears, instead of once in onMounted (which would miss the
+// case where the browser starts in list mode).
+watch(
+  gridContainerRef,
+  (el, prevEl) => {
+    if (prevEl) {
+      gridResizeObserver?.disconnect();
+      gridResizeObserver = null;
+    }
+    if (!el) return;
+    // Use the content-box width (excluding padding) to match what ResizeObserver
+    // delivers via entry.contentRect.width, avoiding a 1-frame column jump on mount.
+    const style = getComputedStyle(el);
+    recomputeGridColumns(el.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
+    gridResizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) recomputeGridColumns(entry.contentRect.width);
+    });
+    gridResizeObserver.observe(el);
+  },
+  { flush: "post" },
+);
+
+onBeforeUnmount(() => {
+  gridResizeObserver?.disconnect();
+  gridResizeObserver = null;
+});
+
+const gridRows = computed(() => {
+  const cols = gridColumns.value;
+  const cards = filteredRows.value;
+  const rows: Array<{ key: string; cards: ObjectBrowserRow[] }> = [];
+  for (let i = 0; i < cards.length; i += cols) {
+    rows.push({ key: `row-${i}`, cards: cards.slice(i, i + cols) });
+  }
+  return rows;
+});
 const visibleSelectableRows = computed(() => filteredRows.value.filter((row) => row.type === "TABLE"));
 const selectedTableRows = computed(() => {
   const ids = selectedTableIds.value;
@@ -1867,7 +1967,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             </div>
           </div>
         </div>
-        <RecycleScroller class="object-browser-scroller min-h-0 flex-1" :style="{ minWidth: `${objectGridMinWidth}px` }" :items="filteredRows" :item-size="34" :buffer="600" :skip-hover="true" key-field="id">
+        <RecycleScroller ref="listScrollerRef" class="object-browser-scroller min-h-0 flex-1" :style="{ minWidth: `${objectGridMinWidth}px` }" :items="filteredRows" :item-size="34" :buffer="600" :skip-hover="true" key-field="id">
           <template #default="{ item }">
             <CustomContextMenu :items="getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
               <div
@@ -1923,44 +2023,47 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           </template>
         </RecycleScroller>
       </div>
-      <div v-else class="object-browser-grid min-h-0 flex-1 overflow-y-auto p-2">
-        <CustomContextMenu v-for="item in filteredRows" :key="item.id" :items="getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
-          <div
-            class="relative flex cursor-pointer flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
-            :class="{
-              'border-primary bg-primary/5': selectedTableIds.has(item.id),
-              'border-primary/60': sourceRow?.id === item.id && !selectedTableIds.has(item.id),
-            }"
-            :title="item.displayName"
-            @click="onRowClick(item, $event)"
-            @contextmenu="onContextMenu"
-          >
-            <button v-if="showCheckboxColumn" class="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground" type="button" :class="{ invisible: item.type !== 'TABLE' }" @click.stop="toggleTableSelection(item)">
-              <CheckSquare v-if="selectedTableIds.has(item.id)" class="h-3.5 w-3.5 text-primary" />
-              <Square v-else class="h-3.5 w-3.5" />
-            </button>
-            <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full shadow-sm" :class="iconBgClass(item.type)">
-              <component :is="iconFor(item)" class="h-6 w-6" :class="iconClass(item.type)" />
+      <div v-else ref="gridContainerRef" class="object-browser-grid-wrapper min-h-0 flex-1 p-2">
+        <RecycleScroller ref="gridScrollerRef" v-if="gridRows.length > 0" class="object-browser-grid-scroller h-full" :items="gridRows" :item-size="objectGridRowHeight" :buffer="600" :skip-hover="true" key-field="key">
+          <template #default="{ item: row }">
+            <div class="object-browser-grid-row" :style="{ gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, height: `${objectGridRowHeight - OBJECT_GRID_GAP}px` }">
+              <CustomContextMenu v-for="item in row.cards" :key="item.id" :items="getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
+                <div
+                  class="relative flex cursor-pointer flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
+                  :class="{
+                    'border-primary bg-primary/5': selectedTableIds.has(item.id),
+                    'border-primary/60': sourceRow?.id === item.id && !selectedTableIds.has(item.id),
+                  }"
+                  :title="item.displayName"
+                  @click="onRowClick(item, $event)"
+                  @contextmenu="onContextMenu"
+                >
+                  <button v-if="showCheckboxColumn" class="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground" type="button" :class="{ invisible: item.type !== 'TABLE' }" @click.stop="toggleTableSelection(item)">
+                    <CheckSquare v-if="selectedTableIds.has(item.id)" class="h-3.5 w-3.5 text-primary" />
+                    <Square v-else class="h-3.5 w-3.5" />
+                  </button>
+                  <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full shadow-sm" :class="iconBgClass(item.type)">
+                    <component :is="iconFor(item)" class="h-6 w-6" :class="iconClass(item.type)" />
+                  </div>
+                  <span class="w-full truncate text-sm font-medium leading-tight text-foreground">{{ item.displayName }}</span>
+                  <div class="flex items-center gap-1.5">
+                    <span class="text-xs text-muted-foreground">{{ typeLabel(item.type) }}</span>
+                    <span v-if="item.estimatedRows != null && item.estimatedRows > 0" class="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-primary">{{ formatObjectBrowserCount(item.estimatedRows) }}</span>
+                    <span v-if="item.totalBytes != null && item.totalBytes > 0" class="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">{{ formatObjectBrowserBytes(item.totalBytes) }}</span>
+                  </div>
+                  <div v-if="item.created_at?.trim() || item.updated_at?.trim()" class="flex items-center gap-1 text-[10px] text-muted-foreground/70">
+                    <span v-if="item.created_at?.trim()">{{ formatObjectBrowserTimestamp(item.created_at) }}</span>
+                    <span v-if="item.created_at?.trim() && item.updated_at?.trim()">·</span>
+                    <span v-if="item.updated_at?.trim()">{{ formatObjectBrowserTimestamp(item.updated_at) }}</span>
+                  </div>
+                  <div v-if="item.comment?.trim()" class="w-full truncate text-[10px] text-muted-foreground/60" :title="item.comment">
+                    {{ item.comment }}
+                  </div>
+                </div>
+              </CustomContextMenu>
             </div>
-            <span class="w-full truncate text-sm font-medium leading-tight text-foreground">{{ item.displayName }}</span>
-            <div class="flex items-center gap-1.5">
-              <span class="text-xs text-muted-foreground">{{ typeLabel(item.type) }}</span>
-              <span v-if="item.estimatedRows != null && item.estimatedRows > 0" class="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-primary">{{ formatObjectBrowserCount(item.estimatedRows) }}</span>
-              <span v-if="item.totalBytes != null && item.totalBytes > 0" class="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">{{ formatObjectBrowserBytes(item.totalBytes) }}</span>
-            </div>
-            <div v-if="item.created_at?.trim() || item.updated_at?.trim()" class="flex items-center gap-1 text-[10px] text-muted-foreground/70">
-              <span v-if="item.created_at?.trim()">{{ formatObjectBrowserTimestamp(item.created_at) }}</span>
-              <span v-if="item.created_at?.trim() && item.updated_at?.trim()">·</span>
-              <span v-if="item.updated_at?.trim()">{{ formatObjectBrowserTimestamp(item.updated_at) }}</span>
-            </div>
-            <div v-if="item.comment?.trim()" class="w-full truncate text-[10px] text-muted-foreground/60" :title="item.comment">
-              {{ item.comment }}
-            </div>
-          </div>
-        </CustomContextMenu>
-        <div v-if="filteredRows.length === 0" class="col-span-full flex h-full items-center justify-center text-sm text-muted-foreground">
-          {{ t("objects.empty") }}
-        </div>
+          </template>
+        </RecycleScroller>
       </div>
       <div v-if="sourceRow" class="flex h-[42%] min-h-44 shrink-0 flex-col border-t bg-background">
         <div class="flex h-8 shrink-0 items-center gap-2 border-b bg-muted/20 px-3">
@@ -2186,11 +2289,23 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   contain: layout style paint;
 }
 
-.object-browser-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  align-content: start;
-  gap: 0.75rem;
+.object-browser-grid-wrapper {
   scrollbar-width: thin;
+}
+
+.object-browser-grid-scroller {
+  will-change: scroll-position;
+  contain: content;
+  scrollbar-width: thin;
+}
+
+.object-browser-grid-scroller :deep(.vue-recycle-scroller__item-view) {
+  contain: layout style paint;
+}
+
+.object-browser-grid-row {
+  display: grid;
+  column-gap: 12px;
+  align-items: start;
 }
 </style>
