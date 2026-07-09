@@ -104,11 +104,39 @@ async function loadScopedConnections(backend: Backend, scope: McpScope): Promise
   return connections.filter((config) => connectionMatchesScope(config, scope));
 }
 
-async function resolveConnection(backend: Backend, scope: McpScope, requestedName?: string): Promise<{ config?: ConnectionConfig; error?: ReturnType<typeof toolError> }> {
+async function resolveConnection(
+  backend: Backend,
+  scope: McpScope,
+  requestedId?: string,
+  requestedName?: string,
+): Promise<{ config?: ConnectionConfig; error?: ReturnType<typeof toolError> }> {
+  // connection_id takes priority over connection_name when both are provided.
+  if (requestedId?.trim()) {
+    const connections = await backend.loadConnections();
+    const config = connections.find((c) => c.id === requestedId.trim());
+    if (!config) return { error: toolError("CONNECTION_NOT_FOUND", `Connection with id "${requestedId}" not found.`) };
+    // In scoped mode, verify the resolved connection is within the scope.
+    if (scopeEnabled(scope) && !connectionMatchesScope(config, scope)) {
+      return { error: toolError("CONNECTION_OUT_OF_SCOPE", `Connection "${requestedId}" is outside this DBX AI session scope.`) };
+    }
+    return { config };
+  }
+
   if (!scopeEnabled(scope)) {
     if (!requestedName?.trim()) return { error: toolError("CONNECTION_NOT_FOUND", "Connection name is required.") };
-    const config = await backend.findConnection(requestedName);
-    return config ? { config } : { error: toolError("CONNECTION_NOT_FOUND", `Connection "${requestedName}" not found.`) };
+    const connections = await backend.loadConnections();
+    const matching = connections.filter((c) => c.name.toLowerCase() === requestedName.trim().toLowerCase());
+    if (matching.length === 0) return { error: toolError("CONNECTION_NOT_FOUND", `Connection "${requestedName}" not found.`) };
+    if (matching.length > 1) {
+      const lines = matching.map((c) => `- ${c.id}: ${c.db_type} @ ${c.host}:${c.port}`);
+      return {
+        error: toolError(
+          "AMBIGUOUS_CONNECTION",
+          `Multiple connections found with name "${requestedName}". Please specify connection_id:\n${lines.join("\n")}`,
+        ),
+      };
+    }
+    return { config: matching[0] };
   }
 
   const [scopedConfig] = await loadScopedConnections(backend, scope);
@@ -131,20 +159,21 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
   server.tool("dbx_list_connections", "List all database connections configured in DBX", {}, async () => {
     const connections = await loadScopedConnections(backend, scope);
     if (connections.length === 0) return text("No connections configured in DBX.");
-    const rows = connections.map((c) => [c.name, c.db_type, c.host, String(c.port), c.database || ""]);
-    return text(mdTable(["Name", "Type", "Host", "Port", "Database"], rows));
+    const rows = connections.map((c) => [c.id, c.name, c.db_type, c.host, String(c.port), c.database || ""]);
+    return text(mdTable(["ID", "Name", "Type", "Host", "Port", "Database"], rows));
   });
 
   server.tool(
     "dbx_list_tables",
     "List tables and views for a database connection",
     {
+      connection_id: z.string().optional().describe("Unique ID of the DBX connection (use this to disambiguate when multiple connections share the same name)"),
       connection_name: z.string().optional().describe("Name of the DBX connection"),
       database: z.string().optional().describe("Database name"),
       schema: z.string().optional().describe("Schema name (default: public for PostgreSQL)"),
     },
-    async ({ connection_name, database, schema }) => {
-      const { config, error } = await resolveConnection(backend, scope, connection_name);
+    async ({ connection_id, connection_name, database, schema }) => {
+      const { config, error } = await resolveConnection(backend, scope, connection_id, connection_name);
       if (error) return error;
       const tables = await backend.listTables(withDatabase(config!, database ?? scope.database), schema);
       if (tables.length === 0) return text("No tables found.");
@@ -157,13 +186,14 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
     "dbx_describe_table",
     "Get column definitions for a table",
     {
+      connection_id: z.string().optional().describe("Unique ID of the DBX connection (use this to disambiguate when multiple connections share the same name)"),
       connection_name: z.string().optional().describe("Name of the DBX connection"),
       table: z.string().describe("Table name"),
       database: z.string().optional().describe("Database name"),
       schema: z.string().optional().describe("Schema name (default: public for PostgreSQL)"),
     },
-    async ({ connection_name, table, database, schema }) => {
-      const { config, error } = await resolveConnection(backend, scope, connection_name);
+    async ({ connection_id, connection_name, table, database, schema }) => {
+      const { config, error } = await resolveConnection(backend, scope, connection_id, connection_name);
       if (error) return error;
       const columns = await backend.describeTable(withDatabase(config!, database ?? scope.database), table, schema);
       if (columns.length === 0) return text("No columns found.");
@@ -176,12 +206,13 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
     "dbx_execute_query",
     "Execute a SQL query on a database connection (max 100 rows returned)",
     {
+      connection_id: z.string().optional().describe("Unique ID of the DBX connection (use this to disambiguate when multiple connections share the same name)"),
       connection_name: z.string().optional().describe("Name of the DBX connection"),
       database: z.string().optional().describe("Database name"),
       sql: z.string().describe("SQL query to execute"),
     },
-    async ({ connection_name, database, sql }) => {
-      const { config, error } = await resolveConnection(backend, scope, connection_name);
+    async ({ connection_id, connection_name, database, sql }) => {
+      const { config, error } = await resolveConnection(backend, scope, connection_id, connection_name);
       if (error) return error;
       const scopedConfig = config!;
       if (scopedConfig.db_type === "redis") {
@@ -212,12 +243,13 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
     "dbx_execute_redis_command",
     "Execute a Redis command on a Redis connection",
     {
+      connection_id: z.string().optional().describe("Unique ID of the DBX connection (use this to disambiguate when multiple connections share the same name)"),
       connection_name: z.string().optional().describe("Name of the DBX Redis connection"),
       db: z.number().int().min(0).optional().describe("Redis logical database number (default: scoped/default database or 0)"),
       command: z.string().describe("Redis command to execute, for example: GET mykey, INFO, or DBSIZE"),
     },
-    async ({ connection_name, db, command }) => {
-      const { config, error } = await resolveConnection(backend, scope, connection_name);
+    async ({ connection_id, connection_name, db, command }) => {
+      const { config, error } = await resolveConnection(backend, scope, connection_id, connection_name);
       if (error) return error;
       const scopedConfig = config!;
       if (scopedConfig.db_type !== "redis") {
@@ -244,14 +276,15 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
     "dbx_get_schema_context",
     "Get compact table and column context for writing SQL",
     {
+      connection_id: z.string().optional().describe("Unique ID of the DBX connection (use this to disambiguate when multiple connections share the same name)"),
       connection_name: z.string().optional().describe("Name of the DBX connection"),
       database: z.string().optional().describe("Database name"),
       schema: z.string().optional().describe("Schema name (default: public for PostgreSQL)"),
       tables: z.array(z.string()).optional().describe("Specific table names to include"),
       max_tables: z.number().int().min(1).max(20).default(8).describe("Maximum number of tables to include"),
     },
-    async ({ connection_name, database, schema, tables, max_tables }) => {
-      const { config, error } = await resolveConnection(backend, scope, connection_name);
+    async ({ connection_id, connection_name, database, schema, tables, max_tables }) => {
+      const { config, error } = await resolveConnection(backend, scope, connection_id, connection_name);
       if (error) return error;
       const context = await buildSchemaContext(backend, withDatabase(config!, database ?? scope.database), {
         schema,
@@ -313,8 +346,25 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
       "Remove a database connection from DBX",
       {
         connection_name: z.string().describe("Name of the connection to remove"),
+        connection_id: z.string().optional().describe("Unique ID of the DBX connection (use this to remove by id instead of name)"),
       },
-      async ({ connection_name }) => {
+      async ({ connection_name, connection_id }) => {
+        if (connection_id?.trim()) {
+          if (backend.removeConnectionById) {
+            const removed = await backend.removeConnectionById(connection_id.trim());
+            if (!removed) return toolError("CONNECTION_NOT_FOUND", `Connection with id "${connection_id}" not found.`);
+            await notifyReload();
+            return text(`Connection with id "${connection_id}" removed.`);
+          }
+          // Fallback: resolve by id then remove by name
+          const connections = await backend.loadConnections();
+          const config = connections.find((c) => c.id === connection_id.trim());
+          if (!config) return toolError("CONNECTION_NOT_FOUND", `Connection with id "${connection_id}" not found.`);
+          const removed = await backend.removeConnection(config.name);
+          if (!removed) return toolError("CONNECTION_NOT_FOUND", `Connection "${config.name}" could not be removed.`);
+          await notifyReload();
+          return text(`Connection "${config.name}" (id: ${config.id}) removed.`);
+        }
         const removed = await backend.removeConnection(connection_name);
         if (!removed) return toolError("CONNECTION_NOT_FOUND", `Connection "${connection_name}" not found.`);
         await notifyReload();
@@ -329,15 +379,31 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
       "dbx_open_table",
       "Open a table in DBX desktop app UI. Requires DBX to be running.",
       {
-        connection_name: z.string().describe("Name of the DBX connection"),
+        connection_id: z.string().optional().describe("Unique ID of the DBX connection (use this to disambiguate when multiple connections share the same name)"),
+        connection_name: z.string().optional().describe("Name of the DBX connection"),
         table: z.string().describe("Table name to open"),
         database: z.string().optional().describe("Database name"),
         schema: z.string().optional().describe("Schema name"),
       },
-      async ({ connection_name, table, database, schema }) => {
-        const config = await backend.findConnection(connection_name);
-        if (!config) return toolError("CONNECTION_NOT_FOUND", `Connection "${connection_name}" not found.`);
-        return bridgeRequest("/open-table", { connection_name, table, database, schema }, `Opened ${table} in DBX`);
+      async ({ connection_id, connection_name, table, database, schema }) => {
+        let config: ConnectionConfig | undefined;
+        if (connection_id?.trim()) {
+          const connections = await backend.loadConnections();
+          config = connections.find((c) => c.id === connection_id.trim());
+          if (!config) return toolError("CONNECTION_NOT_FOUND", `Connection with id "${connection_id}" not found.`);
+        } else if (connection_name?.trim()) {
+          const connections = await backend.loadConnections();
+          const matching = connections.filter((c) => c.name.toLowerCase() === connection_name.toLowerCase());
+          if (matching.length === 0) return toolError("CONNECTION_NOT_FOUND", `Connection "${connection_name}" not found.`);
+          if (matching.length > 1) {
+            const lines = matching.map((c) => `- ${c.id}: ${c.db_type} @ ${c.host}:${c.port}`);
+            return toolError("AMBIGUOUS_CONNECTION", `Multiple connections found with name "${connection_name}". Please specify connection_id:\n${lines.join("\n")}`);
+          }
+          config = matching[0];
+        } else {
+          return toolError("CONNECTION_NOT_FOUND", "Either connection_id or connection_name is required.");
+        }
+        return bridgeRequest("/open-table", { connection_name: config.name, table, database, schema }, `Opened ${table} in DBX`);
       },
     );
 
@@ -345,13 +411,29 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
       "dbx_execute_and_show",
       "Execute a SQL query in DBX desktop app UI and show results there. Requires DBX to be running.",
       {
-        connection_name: z.string().describe("Name of the DBX connection"),
+        connection_id: z.string().optional().describe("Unique ID of the DBX connection (use this to disambiguate when multiple connections share the same name)"),
+        connection_name: z.string().optional().describe("Name of the DBX connection"),
         sql: z.string().describe("SQL query to execute"),
         database: z.string().optional().describe("Database name"),
       },
-      async ({ connection_name, sql, database }) => {
-        const config = await backend.findConnection(connection_name);
-        if (!config) return toolError("CONNECTION_NOT_FOUND", `Connection "${connection_name}" not found.`);
+      async ({ connection_id, connection_name, sql, database }) => {
+        let config: ConnectionConfig | undefined;
+        if (connection_id?.trim()) {
+          const connections = await backend.loadConnections();
+          config = connections.find((c) => c.id === connection_id.trim());
+          if (!config) return toolError("CONNECTION_NOT_FOUND", `Connection with id "${connection_id}" not found.`);
+        } else if (connection_name?.trim()) {
+          const connections = await backend.loadConnections();
+          const matching = connections.filter((c) => c.name.toLowerCase() === connection_name.toLowerCase());
+          if (matching.length === 0) return toolError("CONNECTION_NOT_FOUND", `Connection "${connection_name}" not found.`);
+          if (matching.length > 1) {
+            const lines = matching.map((c) => `- ${c.id}: ${c.db_type} @ ${c.host}:${c.port}`);
+            return toolError("AMBIGUOUS_CONNECTION", `Multiple connections found with name "${connection_name}". Please specify connection_id:\n${lines.join("\n")}`);
+          }
+          config = matching[0];
+        } else {
+          return toolError("CONNECTION_NOT_FOUND", "Either connection_id or connection_name is required.");
+        }
         const safetyOptions = sqlSafetyFromEnv();
         if (config?.db_type === "mongodb") {
           const aggregate = parseMongoAggregateCommand(sql);
@@ -368,7 +450,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
         return bridgeRequest(
           "/execute-query",
           {
-            connection_name,
+            connection_name: config!.name,
             sql,
             database,
             allow_writes: safetyOptions.allowWrites,
