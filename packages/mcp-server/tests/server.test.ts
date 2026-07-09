@@ -569,3 +569,108 @@ test("dbx_list_connections includes ID column", async () => {
   // The connection's ID value "1" should appear in the table
   assert.match(result.content[0].text, /1\s+\|\s+local/);
 });
+
+test("same name and db_type with different host/port returns AMBIGUOUS_CONNECTION", async () => {
+  const connA: ConnectionConfig = {
+    ...connection,
+    id: "pg-prod-us",
+    name: "my-db",
+    db_type: "postgres",
+    host: "10.0.1.100",
+    port: 5432,
+    database: "app",
+  };
+  const connB: ConnectionConfig = {
+    ...connection,
+    id: "pg-prod-eu",
+    name: "my-db",
+    db_type: "postgres",
+    host: "10.0.2.200",
+    port: 5432,
+    database: "app",
+  };
+  const scopedBackend: Backend = {
+    ...backend,
+    loadConnections: async () => [connA, connB],
+  };
+  const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+
+  // Using connection_name with duplicates (same db_type) should still return AMBIGUOUS_CONNECTION
+  const result = await (server as any)._registeredTools.dbx_list_tables.handler({
+    connection_name: "my-db",
+  });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /AMBIGUOUS_CONNECTION:/);
+  assert.match(result.content[0].text, /pg-prod-us: postgres @ 10\.0\.1\.100:5432/);
+  assert.match(result.content[0].text, /pg-prod-eu: postgres @ 10\.0\.2\.200:5432/);
+});
+
+test("connection_id routes to correct host among same-name same-type connections", async () => {
+  const connA: ConnectionConfig = {
+    ...connection,
+    id: "pg-prod-us",
+    name: "my-db",
+    db_type: "postgres",
+    host: "10.0.1.100",
+    port: 5432,
+    database: "app",
+  };
+  const connB: ConnectionConfig = {
+    ...connection,
+    id: "pg-prod-eu",
+    name: "my-db",
+    db_type: "postgres",
+    host: "10.0.2.200",
+    port: 5432,
+    database: "app",
+  };
+  const usedConfigs: ConnectionConfig[] = [];
+  const scopedBackend: Backend = {
+    ...backend,
+    loadConnections: async () => [connA, connB],
+    listTables: async (config) => {
+      usedConfigs.push(config);
+      return [{ name: "orders", type: "BASE TABLE" }];
+    },
+    executeQuery: async (config, _sql) => {
+      usedConfigs.push(config);
+      return { columns: ["cnt"], rows: [{ cnt: 42 }], row_count: 1 };
+    },
+  };
+  const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+
+  // Route to US instance via connection_id
+  const listResult = await (server as any)._registeredTools.dbx_list_tables.handler({
+    connection_id: "pg-prod-us",
+  });
+  assert.match(listResult.content[0].text, /orders/);
+  assert.equal(usedConfigs[0].id, "pg-prod-us");
+  assert.equal(usedConfigs[0].host, "10.0.1.100");
+
+  // Route to EU instance via connection_id
+  const queryResult = await (server as any)._registeredTools.dbx_execute_query.handler({
+    connection_id: "pg-prod-eu",
+    database: "app",
+    sql: "select count(*) as cnt from orders",
+  });
+  assert.match(queryResult.content[0].text, /42/);
+  assert.equal(usedConfigs[1].id, "pg-prod-eu");
+  assert.equal(usedConfigs[1].host, "10.0.2.200");
+});
+
+test("tool responses are prefixed with connection identity label", async () => {
+  const scopedBackend: Backend = {
+    ...backend,
+    loadConnections: async () => [{ ...connection, id: "conn-xyz", name: "orders-db", db_type: "postgres", host: "10.5.5.5", port: 5432 }],
+    listTables: async () => [{ name: "orders", type: "BASE TABLE" }],
+    executeQuery: async () => ({ columns: ["cnt"], rows: [{ cnt: 7 }], row_count: 1 }),
+  };
+  const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+
+  const listResult = await (server as any)._registeredTools.dbx_list_tables.handler({ connection_id: "conn-xyz" });
+  assert.match(listResult.content[0].text, /^\[orders-db \(conn-xyz\) \[postgres @ 10\.5\.5\.5:5432\]\]/);
+
+  const queryResult = await (server as any)._registeredTools.dbx_execute_query.handler({ connection_id: "conn-xyz", sql: "select count(*) as cnt from orders" });
+  assert.match(queryResult.content[0].text, /^\[orders-db \(conn-xyz\) \[postgres @ 10\.5\.5\.5:5432\]\]/);
+});

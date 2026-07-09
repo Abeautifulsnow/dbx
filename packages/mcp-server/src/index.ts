@@ -40,6 +40,14 @@ function withDatabase(config: ConnectionConfig, database?: string): ConnectionCo
   return database === undefined ? config : { ...config, database };
 }
 
+function connectionIdentity(config: ConnectionConfig): string {
+  return `${config.name} (${config.id}) [${config.db_type} @ ${config.host}:${config.port}]`;
+}
+
+function labeledText(config: ConnectionConfig, body: string): ReturnType<typeof text> {
+  return text(`[${connectionIdentity(config)}]\n${body}`);
+}
+
 function formatQueryToolResult(result: QueryResult, title?: string) {
   const prefix = title ? `${title}\n` : "";
   if (result.columns.length === 0) return text(`${prefix}Query executed. ${result.row_count} row(s) affected.`);
@@ -175,10 +183,11 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
     async ({ connection_id, connection_name, database, schema }) => {
       const { config, error } = await resolveConnection(backend, scope, connection_id, connection_name);
       if (error) return error;
-      const tables = await backend.listTables(withDatabase(config!, database ?? scope.database), schema);
+      const resolvedConfig = config!;
+      const tables = await backend.listTables(withDatabase(resolvedConfig, database ?? scope.database), schema);
       if (tables.length === 0) return text("No tables found.");
       const rows = tables.map((t) => [t.name, t.type]);
-      return text(mdTable(["Table", "Type"], rows));
+      return labeledText(resolvedConfig, mdTable(["Table", "Type"], rows));
     },
   );
 
@@ -195,10 +204,11 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
     async ({ connection_id, connection_name, table, database, schema }) => {
       const { config, error } = await resolveConnection(backend, scope, connection_id, connection_name);
       if (error) return error;
-      const columns = await backend.describeTable(withDatabase(config!, database ?? scope.database), table, schema);
+      const resolvedConfig = config!;
+      const columns = await backend.describeTable(withDatabase(resolvedConfig, database ?? scope.database), table, schema);
       if (columns.length === 0) return text("No columns found.");
       const rows = columns.map((c) => [c.is_primary_key ? `${c.name} (PK)` : c.name, c.data_type, c.is_nullable ? "YES" : "NO", c.column_default ?? "", c.comment ?? ""]);
-      return text(mdTable(["Column", "Type", "Nullable", "Default", "Comment"], rows));
+      return labeledText(resolvedConfig, mdTable(["Column", "Type", "Nullable", "Default", "Comment"], rows));
     },
   );
 
@@ -230,8 +240,8 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
         for (const statement of statements) {
           results.push(await backend.executeQuery(withDatabase(scopedConfig, database ?? scope.database), statement));
         }
-        if (results.length === 1) return formatQueryToolResult(results[0]);
-        return text(results.map((result, index) => formatQueryToolResult(result, `Statement ${index + 1}`).content[0].text).join("\n\n"));
+        if (results.length === 1) return labeledText(scopedConfig, formatQueryToolResult(results[0]).content[0].text);
+        return labeledText(scopedConfig, results.map((result, index) => formatQueryToolResult(result, `Statement ${index + 1}`).content[0].text).join("\n\n"));
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return toolError("QUERY_ERROR", msg);
@@ -264,7 +274,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
         const result = await backend.executeRedisCommand(scopedConfig, defaultRedisDb(scopedConfig, scope, db), command, {
           skipSafetyCheck: safety.skipSafetyCheck,
         });
-        return formatRedisCommandToolResult(result);
+        return labeledText(scopedConfig, formatRedisCommandToolResult(result).content[0].text);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return toolError("REDIS_COMMAND_ERROR", msg);
@@ -286,13 +296,14 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
     async ({ connection_id, connection_name, database, schema, tables, max_tables }) => {
       const { config, error } = await resolveConnection(backend, scope, connection_id, connection_name);
       if (error) return error;
-      const context = await buildSchemaContext(backend, withDatabase(config!, database ?? scope.database), {
+      const resolvedConfig = config!;
+      const context = await buildSchemaContext(backend, withDatabase(resolvedConfig, database ?? scope.database), {
         schema,
         tables,
         maxTables: max_tables,
       });
       if (context.tables.length === 0) return text("No matching tables found.");
-      return text(formatSchemaContext(context));
+      return labeledText(resolvedConfig, formatSchemaContext(context));
     },
   );
 
