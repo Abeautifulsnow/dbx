@@ -376,6 +376,13 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
           await notifyReload();
           return text(`Connection "${config.name}" (id: ${config.id}) removed.`);
         }
+        const allConnections = await backend.loadConnections();
+        const matching = allConnections.filter((c) => c.name.toLowerCase() === connection_name.toLowerCase());
+        if (matching.length === 0) return toolError("CONNECTION_NOT_FOUND", `Connection "${connection_name}" not found.`);
+        if (matching.length > 1) {
+          const lines = matching.map((c) => `- ${c.id}: ${c.db_type} @ ${c.host}:${c.port}`);
+          return toolError("AMBIGUOUS_CONNECTION", `Multiple connections found with name "${connection_name}". Please specify connection_id:\n${lines.join("\n")}`);
+        }
         const removed = await backend.removeConnection(connection_name);
         if (!removed) return toolError("CONNECTION_NOT_FOUND", `Connection "${connection_name}" not found.`);
         await notifyReload();
@@ -414,7 +421,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
         } else {
           return toolError("CONNECTION_NOT_FOUND", "Either connection_id or connection_name is required.");
         }
-        return bridgeRequest("/open-table", { connection_name: config.name, table, database, schema }, `Opened ${table} in DBX`);
+        return bridgeRequest("/open-table", { connection_id: config.id, connection_name: config.name, table, database, schema }, `Opened ${table} in DBX`);
       },
     );
 
@@ -461,6 +468,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
         return bridgeRequest(
           "/execute-query",
           {
+            connection_id: config!.id,
             connection_name: config!.name,
             sql,
             database,

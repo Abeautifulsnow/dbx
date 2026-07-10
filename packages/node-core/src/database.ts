@@ -856,6 +856,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
   if (hasActiveSshLayer(config)) {
     const result = await withTimeout(
       bridgeDataRequest<BridgeQueryResult>("/data/execute-query", {
+        connection_id: config.id,
         connection_name: config.name,
         database: config.database || "",
         sql,
@@ -927,6 +928,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
   }
   const result = await withTimeout(
     bridgeDataRequest<BridgeQueryResult>("/data/execute-query", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       sql,
@@ -945,6 +947,7 @@ export async function executeRedisCommand(config: ConnectionConfig, db: number, 
   }
   return withTimeout(
     bridgeDataRequest<RedisCommandResult>("/data/redis/execute-command", {
+      connection_id: config.id,
       connection_name: config.name,
       db,
       command,
@@ -1029,6 +1032,7 @@ function redisTextToJson(value: string): unknown {
 export async function listTables(config: ConnectionConfig, schema?: string): Promise<TableInfo[]> {
   if (config.db_type === "mongodb") {
     const collections = await bridgeDataRequest<CollectionListEntry[]>("/data/mongo/list-collections", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       schema: schema || "",
@@ -1041,6 +1045,7 @@ export async function listTables(config: ConnectionConfig, schema?: string): Pro
   }
   if (hasActiveSshLayer(config) || !isDirectQueryType(config.db_type)) {
     const tables = await bridgeDataRequest<BridgeTableInfo[]>("/data/list-tables", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       schema: schema || "",
@@ -1074,6 +1079,7 @@ export async function describeTable(config: ConnectionConfig, table: string, sch
   }
   if (hasActiveSshLayer(config) || !isDirectQueryType(config.db_type)) {
     const columns = await bridgeDataRequest<BridgeColumnInfo[]>("/data/describe-table", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       schema: schema || "",
@@ -1099,6 +1105,7 @@ export async function describeTable(config: ConnectionConfig, table: string, sch
 
 async function mongoFindDocuments(config: ConnectionConfig, collection: string, skip: number, limit: number, filter: string, projection?: string, sort?: string): Promise<MongoDocumentResult> {
   return bridgeDataRequest<MongoDocumentResult>("/data/mongo/find-documents", {
+    connection_id: config.id,
     connection_name: config.name,
     database: config.database || "",
     collection,
@@ -1112,6 +1119,7 @@ async function mongoFindDocuments(config: ConnectionConfig, collection: string, 
 
 async function mongoServerVersion(config: ConnectionConfig): Promise<string> {
   return bridgeDataRequest<string>("/data/mongo/server-version", {
+    connection_id: config.id,
     connection_name: config.name,
     database: config.database || "",
   });
@@ -1119,6 +1127,7 @@ async function mongoServerVersion(config: ConnectionConfig): Promise<string> {
 
 async function mongoCollectionStats(config: ConnectionConfig, collection: string, scale?: number): Promise<Record<string, unknown>> {
   return bridgeDataRequest<Record<string, unknown>>("/data/mongo/collection-stats", {
+    connection_id: config.id,
     connection_name: config.name,
     database: config.database || "",
     collection,
@@ -1129,6 +1138,7 @@ async function mongoCollectionStats(config: ConnectionConfig, collection: string
 async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCommand): Promise<{ affectedRows: number; indexName?: string; droppedNames?: string[] }> {
   if (command.kind === "insert") {
     const result = await bridgeDataRequest<{ affected_rows: number }>("/data/mongo/insert-documents", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       collection: command.collection,
@@ -1138,6 +1148,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
   }
   if (command.kind === "update") {
     const result = await bridgeDataRequest<{ affected_rows: number }>("/data/mongo/update-documents", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       collection: command.collection,
@@ -1149,6 +1160,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
   }
   if (command.kind === "createIndex") {
     const result = await bridgeDataRequest<{ name: string }>("/data/mongo/create-index", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       collection: command.collection,
@@ -1159,6 +1171,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
   }
   if (command.kind === "dropIndex" || command.kind === "dropIndexes") {
     const result = await bridgeDataRequest<{ dropped_names: string[]; affected_rows: number }>("/data/mongo/drop-indexes", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       collection: command.collection,
@@ -1168,6 +1181,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
     return { affectedRows: result.affected_rows, droppedNames: result.dropped_names };
   }
   const result = await bridgeDataRequest<{ affected_rows: number }>("/data/mongo/delete-documents", {
+    connection_id: config.id,
     connection_name: config.name,
     database: config.database || "",
     collection: command.collection,
@@ -1179,6 +1193,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
 
 async function mongoAggregateDocuments(config: ConnectionConfig, collection: string, pipelineJson: string, maxRows: number): Promise<MongoDocumentResult> {
   return bridgeDataRequest<MongoDocumentResult>("/data/mongo/aggregate-documents", {
+    connection_id: config.id,
     connection_name: config.name,
     database: config.database || "",
     collection,

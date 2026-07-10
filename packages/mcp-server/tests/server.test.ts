@@ -448,23 +448,23 @@ test("query exceptions include a stable MCP error code", async () => {
 });
 
 test("desktop bridge failures include a stable MCP error code", async () => {
-  const oldHome = process.env.HOME;
   const dir = await mkdtemp(join(tmpdir(), "dbx-mcp-home-"));
-  process.env.HOME = dir;
 
   try {
-    const server = createDbxMcpServer(backend, { isWebMode: false });
-    const result = await (server as any)._registeredTools.dbx_open_table.handler({
-      connection_name: "local",
-      table: "users",
-    });
+    // Use DBX_DATA_DIR (honoured cross-platform) to point bridgePortFilePath()
+    // at an empty temp directory so no real bridge is reachable.
+    await withScopedEnv({ DBX_DATA_DIR: dir }, async () => {
+      const server = createDbxMcpServer(backend, { isWebMode: false });
+      const result = await (server as any)._registeredTools.dbx_open_table.handler({
+        connection_name: "local",
+        table: "users",
+      });
 
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /DBX_NOT_RUNNING:/);
-    assert.match(result.content[0].text, /DBX is not running/);
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /DBX_NOT_RUNNING:/);
+      assert.match(result.content[0].text, /DBX is not running/);
+    });
   } finally {
-    if (oldHome === undefined) delete process.env.HOME;
-    else process.env.HOME = oldHome;
     await rm(dir, { recursive: true, force: true });
   }
 });
