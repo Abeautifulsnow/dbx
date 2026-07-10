@@ -920,7 +920,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
       return { columns: [], rows: [], row_count: result.affectedRows };
     }
     throw new Error(
-      'Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.count({}), db.projects.getIndexes(), db.projects.dataSize(), db.projects.storageSize(1024), db.projects.totalIndexSize(), db.projects.stats(), db.projects.createIndex({...}), db.projects.dropIndex("name"), db.projects.dropIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})',
+      'Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.count({}), db.projects.getIndexes(), db.projects.dataSize(), db.projects.storageSize(1024), db.projects.totalIndexSize(), db.projects.stats(), db.projects.createIndex({...}), db.projects.dropIndex("name"), db.projects.dropIndexes(), db.projects.drop(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})',
     );
   }
   if (isDirectQueryType(config.db_type)) {
@@ -1180,6 +1180,14 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
     });
     return { affectedRows: result.affected_rows, droppedNames: result.dropped_names };
   }
+  if (command.kind === "dropCollection") {
+    await bridgeDataRequest<{ ok: boolean }>("/data/mongo/drop-collection", {
+      connection_name: config.name,
+      database: config.database || "",
+      collection: command.collection,
+    });
+    return { affectedRows: 1 };
+  }
   const result = await bridgeDataRequest<{ affected_rows: number }>("/data/mongo/delete-documents", {
     connection_id: config.id,
     connection_name: config.name,
@@ -1303,7 +1311,8 @@ export type MongoWriteCommand =
   | { kind: "delete"; collection: string; filter: string; many: boolean }
   | { kind: "createIndex"; collection: string; keys: string; options?: string }
   | { kind: "dropIndex"; collection: string; index: string }
-  | { kind: "dropIndexes"; collection: string; indexes?: string };
+  | { kind: "dropIndexes"; collection: string; indexes?: string }
+  | { kind: "dropCollection"; collection: string };
 
 export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
@@ -1495,6 +1504,13 @@ export function parseMongoWriteCommand(input: string): MongoWriteCommand | null 
     return indexes !== null ? { kind: "dropIndexes", collection: dropIndexes.collection, ...(indexes ? { indexes } : {}) } : null;
   }
 
+  const dropCollection = parseCollectionMethodTarget(source, "drop");
+  if (dropCollection) {
+    const args = parseMethodArgs(source, dropCollection.methodCallIndex);
+    if (!args || args.some((arg) => arg.trim())) return null;
+    return { kind: "dropCollection", collection: dropCollection.collection };
+  }
+
   return null;
 }
 
@@ -1515,6 +1531,12 @@ export function evaluateMongoWriteSafety(command: MongoWriteCommand, options: { 
     return {
       allowed: false,
       reason: "MongoDB dropIndexes() without a specific single index requires DBX_MCP_ALLOW_DANGEROUS_SQL=1.",
+    };
+  }
+  if (!options.allowDangerous && command.kind === "dropCollection") {
+    return {
+      allowed: false,
+      reason: "MongoDB drop() requires DBX_MCP_ALLOW_DANGEROUS_SQL=1.",
     };
   }
   return { allowed: true };
