@@ -1182,6 +1182,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
   }
   if (command.kind === "dropCollection") {
     await bridgeDataRequest<{ ok: boolean }>("/data/mongo/drop-collection", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       collection: command.collection,

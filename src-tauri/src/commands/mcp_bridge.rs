@@ -111,6 +111,7 @@ struct MongoDropIndexesRequest {
 #[derive(Deserialize)]
 struct MongoDropCollectionRequest {
     connection_name: String,
+    connection_id: Option<String>,
     database: Option<String>,
     collection: String,
 }
@@ -657,7 +658,7 @@ async fn handle_mongo_drop_collection_data(state: &Arc<AppState>, body: &str, st
         }
     };
     let Some((pool_key, database, connection_id)) =
-        resolve_mongo_pool_key(state, &req.connection_name, req.database, stream).await
+        resolve_mongo_pool_key(state, req.connection_id.as_deref(), &req.connection_name, req.database, stream).await
     else {
         return;
     };
