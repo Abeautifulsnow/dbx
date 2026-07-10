@@ -674,3 +674,65 @@ test("tool responses are prefixed with connection identity label", async () => {
   const queryResult = await (server as any)._registeredTools.dbx_execute_query.handler({ connection_id: "conn-xyz", sql: "select count(*) as cnt from orders" });
   assert.match(queryResult.content[0].text, /^\[orders-db \(conn-xyz\) \[postgres @ 10\.5\.5\.5:5432\]\]/);
 });
+
+test("dbx_remove_connection with duplicate names returns AMBIGUOUS_CONNECTION", async () => {
+  const connA: ConnectionConfig = { ...connection, id: "db-a", name: "staging", db_type: "postgres", host: "pg-a.local" };
+  const connB: ConnectionConfig = { ...connection, id: "db-b", name: "staging", db_type: "mysql", host: "mysql-b.local", port: 3306 };
+  let removedName: string | undefined;
+  const scopedBackend: Backend = {
+    ...backend,
+    loadConnections: async () => [connA, connB],
+    removeConnection: async (name) => {
+      removedName = name;
+      return true;
+    },
+  };
+  const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+
+  const result = await (server as any)._registeredTools.dbx_remove_connection.handler({
+    connection_name: "staging",
+  });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /AMBIGUOUS_CONNECTION:/);
+  assert.match(result.content[0].text, /db-a: postgres @ pg-a\.local/);
+  assert.match(result.content[0].text, /db-b: mysql @ mysql-b\.local/);
+  // removeConnection must NOT have been called — no silent deletion
+  assert.equal(removedName, undefined);
+});
+
+test("dbx_execute_query with connection_id routes correctly on bridge-backed (SSH) connections", async () => {
+  const connDirect: ConnectionConfig = { ...connection, id: "pg-direct", name: "shared", db_type: "postgres", host: "direct.local", ssh_enabled: false };
+  const connSsh: ConnectionConfig = { ...connection, id: "pg-ssh", name: "shared", db_type: "postgres", host: "private.local", ssh_enabled: true };
+  const usedConfigs: ConnectionConfig[] = [];
+  const scopedBackend: Backend = {
+    ...backend,
+    loadConnections: async () => [connDirect, connSsh],
+    executeQuery: async (config, _sql) => {
+      usedConfigs.push(config);
+      return { columns: ["result"], rows: [{ result: "ok" }], row_count: 1 };
+    },
+  };
+  const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+
+  // connection_name with two same-name connections (one SSH-backed) → AMBIGUOUS_CONNECTION
+  const ambigResult = await (server as any)._registeredTools.dbx_execute_query.handler({
+    connection_name: "shared",
+    sql: "select 1",
+  });
+  assert.equal(ambigResult.isError, true);
+  assert.match(ambigResult.content[0].text, /AMBIGUOUS_CONNECTION:/);
+  assert.match(ambigResult.content[0].text, /pg-direct/);
+  assert.match(ambigResult.content[0].text, /pg-ssh/);
+
+  // connection_id routes to the SSH-backed instance and passes its config through
+  const result = await (server as any)._registeredTools.dbx_execute_query.handler({
+    connection_id: "pg-ssh",
+    sql: "select 1",
+  });
+  assert.equal(result.isError, undefined);
+  assert.equal(usedConfigs.length, 1);
+  assert.equal(usedConfigs[0].id, "pg-ssh");
+  assert.equal(usedConfigs[0].host, "private.local");
+  assert.equal(usedConfigs[0].ssh_enabled, true);
+});
