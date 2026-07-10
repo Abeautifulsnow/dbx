@@ -1270,7 +1270,7 @@ function onAiTempRunSql(sql: string) {
 
 function onAiRequestAutoExecuteSql(sql: string) {
   const tabId = ensureQueryTab();
-  queryStore.updateSql(tabId, sql);
+  queryStore.updateSql(tabId, buildAppendedEditorSql(activeTab.value?.sql || "", sql));
   selectedSql.value = "";
 
   const decision = classifyAiSqlExecution(sql, activeConnection.value);
@@ -1292,7 +1292,7 @@ function onAiRequestAutoExecuteSql(sql: string) {
 
 function onAiOpenExplainPlan(sql: string) {
   const tabId = ensureQueryTab();
-  queryStore.updateSql(tabId, sql);
+  queryStore.updateSql(tabId, buildAppendedEditorSql(activeTab.value?.sql || "", sql));
   selectedSql.value = "";
   nextTick(() => {
     void tryExplain(sql);
