@@ -1226,6 +1226,7 @@ export default {
     copySql: "Copy SQL",
     copyCode: "Copy Code",
     executeSql: "Execute SQL",
+    tempRunSql: "Run without modifying editor",
     copyAll: "Copy All",
     copied: "Copied",
     copyTestResult: "Copy test result",

@@ -1192,6 +1192,7 @@ export default withEnglishFallback({
     copySql: "SQLをコピー",
     copyCode: "コードをコピー",
     executeSql: "SQLを実行",
+    tempRunSql: "編集せずに実行",
     copyAll: "すべてコピー",
     copied: "コピーしました",
     copyTestResult: "テスト結果をコピー",
