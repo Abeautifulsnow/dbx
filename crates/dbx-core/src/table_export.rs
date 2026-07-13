@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::MysqlMode;
 use crate::connection::{task_client_session_id, AppState, PoolKind};
-use crate::csv_export::{escape_csv, format_csv, value_to_csv_text};
+use crate::csv_export::{escape_csv, format_csv, format_tsv, format_tsv_rows, value_to_csv_text};
 pub use crate::database_export::ExportStatus;
 use crate::database_export::{build_export_insert_statements, is_export_cancelled, BuildExportInsertStatementsOptions};
 use crate::db::agent_driver::AgentTableReadStartParams;
@@ -75,33 +75,6 @@ fn format_csv_rows(rows: &[Vec<Value>]) -> String {
         .map(|row| row.iter().map(|cell| escape_csv(&value_to_csv_text(cell))).collect::<Vec<_>>().join(","))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Escape a single field for TSV (Navicat-style TXT export): wrap in double
-/// quotes (doubling inner quotes) only when the field contains a tab, newline,
-/// carriage return, or double quote - the minimum needed to round-trip the value.
-fn escape_tsv(value: &str) -> String {
-    if value.contains('\t') || value.contains('\n') || value.contains('\r') || value.contains('"') {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
-    }
-}
-
-/// Format rows as TSV text without a header row.
-/// Used for streaming subsequent pagination batches.
-fn format_tsv_rows(rows: &[Vec<Value>]) -> String {
-    rows.iter()
-        .map(|row| row.iter().map(|cell| escape_tsv(&value_to_csv_text(cell))).collect::<Vec<_>>().join("\t"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Format columns (header) and rows as TSV text.
-fn format_tsv(columns: &[String], rows: &[Vec<Value>]) -> String {
-    let header = columns.iter().map(|col| escape_tsv(col)).collect::<Vec<_>>().join("\t");
-    let body = format_tsv_rows(rows);
-    format!("{header}\n{body}")
 }
 
 fn export_column_types(request: &TableExportRequest) -> Vec<String> {
@@ -1047,6 +1020,9 @@ pub async fn export_table_data_core(
         }
         "txt" => {
             let mut is_first_batch = true;
+            let header = format_tsv(&col_names, &[]);
+            let header = header.strip_suffix('\n').unwrap_or(&header);
+            file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write TXT: {e}"))?;
 
             loop {
                 if is_export_cancelled(&request.export_id).await {
@@ -1087,8 +1063,8 @@ pub async fn export_table_data_core(
                 }
 
                 if is_first_batch {
-                    let tsv_content = format_tsv(&col_names, &result.rows);
-                    file.write_all(tsv_content.as_bytes()).map_err(|e| format!("Failed to write TXT: {e}"))?;
+                    let rows_tsv = format_tsv_rows(&result.rows);
+                    write!(file, "\n{rows_tsv}").map_err(|e| format!("Failed to write TXT rows: {e}"))?;
                     is_first_batch = false;
                 } else {
                     let rows_tsv = format_tsv_rows(&result.rows);
@@ -1546,7 +1522,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // format_tsv / escape_tsv (Navicat-style TXT export)
+    // format_tsv (Navicat-style TXT export)
     // -----------------------------------------------------------------------
 
     #[test]

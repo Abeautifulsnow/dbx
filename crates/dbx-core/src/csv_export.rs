@@ -48,6 +48,27 @@ pub(crate) fn value_to_query_result_csv_text(value: &Value) -> String {
     }
 }
 
+pub(crate) fn escape_tsv(value: &str) -> String {
+    if value.contains('\t') || value.contains('\n') || value.contains('\r') || value.contains('"') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+pub(crate) fn format_tsv_rows(rows: &[Vec<Value>]) -> String {
+    rows.iter()
+        .map(|row| row.iter().map(|cell| escape_tsv(&value_to_csv_text(cell))).collect::<Vec<_>>().join("\t"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn format_tsv(columns: &[String], rows: &[Vec<Value>]) -> String {
+    let header = columns.iter().map(|col| escape_tsv(col)).collect::<Vec<_>>().join("\t");
+    let body = format_tsv_rows(rows);
+    format!("{header}\n{body}")
+}
+
 /// Format query-result rows as CSV text without a header row, using the
 /// query-result NULL semantics (NULL → "NULL"). Used by the streaming
 /// query-result export for batches after the first.
@@ -176,7 +197,7 @@ pub async fn export_table_data_csv_core(state: &AppState, options: TableCsvExpor
 
 #[cfg(test)]
 mod tests {
-    use super::{format_csv, format_query_result_csv};
+    use super::{format_csv, format_query_result_csv, format_tsv};
     use serde_json::json;
 
     #[test]
@@ -195,6 +216,15 @@ mod tests {
     fn formats_query_result_null_as_null_text() {
         let out = format_query_result_csv(&["id".to_string(), "note".to_string()], &[vec![json!(1), Value::Null]]);
         assert_eq!(out, "\"id\",\"note\"\n\"1\",\"NULL\"");
+    }
+
+    #[test]
+    fn formats_tsv_with_empty_null_and_escaped_special_values() {
+        let out = format_tsv(
+            &["id".to_string(), "note".to_string()],
+            &[vec![json!(1), Value::Null], vec![json!(2), json!("line1\n\"line2\"")]],
+        );
+        assert_eq!(out, "id\tnote\n1\t\n2\t\"line1\n\"\"line2\"\"\"");
     }
 
     use serde_json::Value;

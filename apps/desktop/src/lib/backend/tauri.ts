@@ -2266,7 +2266,7 @@ export interface QueryResultExportRequest {
   databaseType: DatabaseType;
   useAgentCursor: boolean;
   filePath: string;
-  format: "csv" | "xlsx";
+  format: "csv" | "xlsx" | "txt";
   pageSize: number;
   rowLimit?: number | null;
   totalRows?: number | null;
