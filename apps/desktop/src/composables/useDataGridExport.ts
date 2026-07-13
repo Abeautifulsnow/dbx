@@ -818,6 +818,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   async function exportTxt(rowIds?: number[]) {
     await runExclusiveExport(async () => {
       try {
+        if (await exportFullTableDataViaBackend("txt", rowIds)) return;
         const result = await resultToExport(rowIds);
         const content = formatTsv(result.columns, result.rows);
         await saveTextFile(content, exportFileName(tableMeta.value?.tableName || "export", "txt", { preferFallback: true }), "Text", "txt");
@@ -966,7 +967,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     });
   }
 
-  async function exportFullTableDataViaBackend(format: "csv" | "xlsx" | "json" | "markdown" | "sql", rowIds?: number[]): Promise<boolean> {
+  async function exportFullTableDataViaBackend(format: "csv" | "xlsx" | "json" | "markdown" | "sql" | "txt", rowIds?: number[]): Promise<boolean> {
     const meta = tableMeta.value;
     // The backend table exporter currently builds two-part table names. External
     // Doris/StarRocks catalogs need the data-tab paginator's three-part SQL.
