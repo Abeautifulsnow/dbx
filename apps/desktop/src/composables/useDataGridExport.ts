@@ -8,7 +8,7 @@ import { displayCellValue, type CellValue } from "@/lib/dataGrid/cellValue";
 import { tryStartExclusiveActivation, type ActionActivationGuard } from "@/lib/connection/actionActivation";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { buildDataGridCopyInsertStatement, buildDataGridCopyUpdateStatements, type DataGridCopyInsertMode, type DataGridTableMeta } from "@/lib/dataGrid/dataGridSql";
-import { formatSqlInsert } from "@/lib/export/exportFormats";
+import { formatSqlInsert, formatTsv } from "@/lib/export/exportFormats";
 import { uuid } from "@/lib/common/utils";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { expandNestedJsonStringsForCopy } from "@/lib/common/jsonCopyValue";
@@ -815,6 +815,32 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     });
   }
 
+  async function exportTxt(rowIds?: number[]) {
+    await runExclusiveExport(async () => {
+      try {
+        const result = await resultToExport(rowIds);
+        const content = formatTsv(result.columns, result.rows);
+        await saveTextFile(content, exportFileName(tableMeta.value?.tableName || "export", "txt", { preferFallback: true }), "Text", "txt");
+        toast(t("grid.exported"));
+      } catch (e: any) {
+        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+      }
+    });
+  }
+
+  async function exportCurrentPageTxt() {
+    await runExclusiveExport(async () => {
+      try {
+        const result = await resultToExport(undefined, undefined, false);
+        const content = formatTsv(result.columns, result.rows);
+        await saveTextFile(content, exportFileName("export-page", "txt", { page: true }), "Text", "txt");
+        toast(t("grid.exported"));
+      } catch (e: any) {
+        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+      }
+    });
+  }
+
   async function exportXlsx(rowIds?: number[]) {
     await runExclusiveExport(async () => {
       try {
@@ -1186,6 +1212,8 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     exportCurrentPageJson,
     exportMarkdown,
     exportCurrentPageMarkdown,
+    exportTxt,
+    exportCurrentPageTxt,
     exportXlsx,
     exportCurrentPageXlsx,
     exportAllResultsXlsx,
