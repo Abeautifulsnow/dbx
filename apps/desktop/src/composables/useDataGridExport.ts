@@ -17,6 +17,24 @@ import type { DatabaseType, QueryResult } from "@/types/database";
 import type { QueryResultExportRequest } from "@/lib/backend/api";
 import { DBX_ROWID_COLUMN } from "@/lib/table/tableEditing";
 
+/**
+ * Format metadata for backend table exports. Each entry maps a format key
+ * to its default file extension and native save-dialog filter label.
+ *
+ * When a new export format is added only this table needs to be updated;
+ * the extension / filterName ternary chains that used to live inside
+ * exportFullTableDataViaBackend / exportQueryResultViaBackend are no
+ * longer needed.
+ */
+const FORMAT_META: Record<string, { ext: string; label: string }> = {
+  csv: { ext: "csv", label: "CSV" },
+  xlsx: { ext: "xlsx", label: "Excel" },
+  json: { ext: "json", label: "JSON" },
+  markdown: { ext: "md", label: "Markdown" },
+  sql: { ext: "sql", label: "SQL" },
+  txt: { ext: "txt", label: "Text" },
+};
+
 interface RowItem {
   id: number;
   sourceIndex?: number;
@@ -975,8 +993,9 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       return false;
     }
 
-    const extension = format === "markdown" ? "md" : format;
-    const filterName = format === "csv" ? "CSV" : format === "xlsx" ? "Excel" : format === "json" ? "JSON" : format === "markdown" ? "Markdown" : format === "txt" ? "Text" : "SQL";
+    const fmt = FORMAT_META[format];
+    const extension = fmt?.ext ?? format;
+    const filterName = fmt?.label ?? format.toUpperCase();
     let outputPath = exportFileName(meta.tableName || "export", extension, { preferFallback: true });
     if (isTauriRuntime()) {
       const { save } = await import("@tauri-apps/plugin-dialog");
@@ -1057,8 +1076,9 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     // backend just to stream the same rows back to a file.
     if (hasCompleteLocalResult?.value) return false;
 
-    const extension = format;
-    const filterName = format === "csv" ? "CSV" : "Excel";
+    const fmt = FORMAT_META[format];
+    const extension = fmt?.ext ?? format;
+    const filterName = fmt?.label ?? format.toUpperCase();
     let outputPath = exportFileName("query-result", extension);
     if (isTauriRuntime()) {
       const { save } = await import("@tauri-apps/plugin-dialog");
