@@ -1101,6 +1101,7 @@ pub async fn do_execute(
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<db::QueryResult, String> {
+    log::debug!("[do_execute] sql={}", sql);
     if let Some(execution_id) = options.execution_id.as_deref() {
         state.running_queries.set_pool_key(execution_id, pool_key.to_string());
     }
@@ -1639,19 +1640,23 @@ pub async fn execute_sql_statement_with_options(
         do_execute(state, &pool_key, mysql_dialect, Some(database), sql, schema, cancel_token.clone(), options.clone())
             .await;
 
+    let with_sql_context = |r: Result<db::QueryResult, String>| r.map_err(|e| format!("{e}\nSQL: {sql}"));
+
     let action = result.as_ref().err().map(|e| query_pool_error_action(db_type, sql, e));
     match action {
         Some(PoolErrorAction::ReconnectAndRetry) if !is_canceled(&cancel_token) => {
             let db_opt = if database.is_empty() { None } else { Some(database) };
             let new_key =
                 state.reconnect_pool_for_session(connection_id, db_opt, options.client_session_id.as_deref()).await?;
-            do_execute(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options).await
+            with_sql_context(
+                do_execute(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options).await,
+            )
         }
         Some(PoolErrorAction::Discard) => {
             state.remove_pool_by_key(&pool_key).await;
-            result
+            with_sql_context(result)
         }
-        _ => result,
+        _ => with_sql_context(result),
     }
 }
 

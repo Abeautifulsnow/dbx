@@ -231,6 +231,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
       sql: z.string().describe("SQL query to execute"),
     },
     async ({ connection_id, connection_name, database, sql }) => {
+      console.error("[dbx_execute_query] sql:", JSON.stringify(sql));
       const { config, error } = await resolveConnection(backend, scope, connection_id, connection_name);
       if (error) return error;
       const scopedConfig = config!;
@@ -259,7 +260,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
         return labeledText(scopedConfig, results.map((result, index) => formatQueryToolResult(result, `Statement ${index + 1}`).content[0].text).join("\n\n"));
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        return toolError("QUERY_ERROR", msg);
+        return toolError("QUERY_ERROR", `${msg}\nSQL: ${sql}`);
       }
     },
   );
