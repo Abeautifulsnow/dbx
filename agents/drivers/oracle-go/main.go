@@ -169,11 +169,12 @@ type connectParams struct {
 }
 
 type queryOptions struct {
-	SQL       string `json:"sql"`
-	Database  string `json:"database"`
-	Schema    string `json:"schema"`
-	MaxRows   int    `json:"maxRows"`
-	FetchSize int    `json:"fetchSize"`
+	SQL         string `json:"sql"`
+	Database    string `json:"database"`
+	Schema      string `json:"schema"`
+	MaxRows     int    `json:"maxRows"`
+	FetchSize   int    `json:"fetchSize"`
+	TimeoutSecs int    `json:"timeoutSecs"`
 }
 
 type queryResult struct {
@@ -1976,7 +1977,7 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 			HasMore:         false,
 		}, err
 	}
-	rows, err := s.queryRowsWithXMLTypeRewriteIfNeeded(sqlText)
+	rows, err := s.queryRowsWithXMLTypeRewriteIfNeeded(sqlText, opts.TimeoutSecs)
 	if err != nil {
 		return queryPageResult{}, err
 	}
@@ -2042,7 +2043,7 @@ func (s *server) startTableRead(opts queryOptions, pageSize int) (queryPageResul
 	if !isQuerySQL(sqlText) {
 		return queryPageResult{}, errors.New("table read requires a SELECT query")
 	}
-	rows, err := s.queryRowsWithXMLTypeRewriteIfNeeded(sqlText)
+	rows, err := s.queryRowsWithXMLTypeRewriteIfNeeded(sqlText, opts.TimeoutSecs)
 	if err != nil {
 		return queryPageResult{}, err
 	}
@@ -2177,7 +2178,7 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 		maxRows = defaultMaxRows
 	}
 	if isQuerySQL(sqlText) {
-		result, err := s.executeSelect(sqlText, maxRows)
+		result, err := s.executeSelect(sqlText, maxRows, opts.TimeoutSecs)
 		result.ExecutionTimeMS = time.Since(start).Milliseconds()
 		return result, err
 	}
@@ -2185,7 +2186,15 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 	if err != nil {
 		return queryResult{}, err
 	}
-	execResult, err := db.Exec(sqlText)
+	var execCtx context.Context
+	var execCancel context.CancelFunc
+	if opts.TimeoutSecs > 0 {
+		execCtx, execCancel = context.WithTimeout(context.Background(), time.Duration(opts.TimeoutSecs)*time.Second)
+	} else {
+		execCtx, execCancel = context.WithCancel(context.Background())
+	}
+	defer execCancel()
+	execResult, err := db.ExecContext(execCtx, sqlText)
 	if err != nil {
 		return queryResult{}, err
 	}
@@ -2193,8 +2202,8 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 	return queryResult{Columns: []string{}, ColumnTypes: []string{}, Rows: [][]any{}, AffectedRows: affected, ExecutionTimeMS: time.Since(start).Milliseconds()}, nil
 }
 
-func (s *server) executeSelect(sqlText string, maxRows int) (queryResult, error) {
-	rows, err := s.queryRowsWithXMLTypeRewriteIfNeeded(sqlText)
+func (s *server) executeSelect(sqlText string, maxRows int, timeoutSecs int) (queryResult, error) {
+	rows, err := s.queryRowsWithXMLTypeRewriteIfNeeded(sqlText, timeoutSecs)
 	if err != nil {
 		return queryResult{}, err
 	}
@@ -2253,8 +2262,8 @@ func columnTypeNames(rows *sql.Rows) []string {
 	return result
 }
 
-func (s *server) queryRowsWithXMLTypeRewriteIfNeeded(sqlText string) (*sql.Rows, error) {
-	rows, err := s.queryRows(sqlText, nil)
+func (s *server) queryRowsWithXMLTypeRewriteIfNeeded(sqlText string, timeoutSecs int) (*sql.Rows, error) {
+	rows, err := s.queryRowsWithTimeout(sqlText, nil, timeoutSecs)
 	if err != nil {
 		return nil, err
 	}
@@ -2272,7 +2281,7 @@ func (s *server) queryRowsWithXMLTypeRewriteIfNeeded(sqlText string) (*sql.Rows,
 	// Only pay the ALL_TAB_COLUMNS rewrite cost when the result metadata shows
 	// XMLTYPE. Ordinary Oracle queries should not run dictionary probes first.
 	s.closeRows(rows)
-	return s.queryRows(rewritten, nil)
+	return s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
 }
 
 func rowsContainOracleXMLType(rows *sql.Rows) bool {
@@ -2901,11 +2910,21 @@ func (s *server) setSchema(schema string) error {
 }
 
 func (s *server) queryRows(sqlText string, args []any) (*sql.Rows, error) {
+	return s.queryRowsWithTimeout(sqlText, args, 0)
+}
+
+func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs int) (*sql.Rows, error) {
 	db, err := s.requireDB()
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeoutSecs > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
 	s.activeCancelMu.Lock()
 	s.activeCancel = cancel
 	s.activeCancelMu.Unlock()
