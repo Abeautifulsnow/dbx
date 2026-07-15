@@ -325,6 +325,8 @@ type server struct {
 	activeCancelMu         sync.Mutex
 	activeCancel           context.CancelFunc
 	activeRows             map[*sql.Rows]context.CancelFunc
+	activeTimer            *time.Timer
+	activeTimedOut         bool
 }
 
 type agentSession struct {
@@ -2186,15 +2188,34 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 	if err != nil {
 		return queryResult{}, err
 	}
-	var execCtx context.Context
-	var execCancel context.CancelFunc
+	ctx, cancel := context.WithCancel(context.Background())
+	var timer *time.Timer
 	if opts.TimeoutSecs > 0 {
-		execCtx, execCancel = context.WithTimeout(context.Background(), time.Duration(opts.TimeoutSecs)*time.Second)
-	} else {
-		execCtx, execCancel = context.WithCancel(context.Background())
+		var t *time.Timer
+		t = time.AfterFunc(time.Duration(opts.TimeoutSecs)*time.Second, func() {
+			s.activeCancelMu.Lock()
+			if s.activeTimer == t {
+				cancel()
+			}
+			s.activeCancelMu.Unlock()
+		})
+		timer = t
 	}
-	defer execCancel()
-	execResult, err := db.ExecContext(execCtx, sqlText)
+	s.activeCancelMu.Lock()
+	s.activeCancel = cancel
+	s.activeTimer = timer
+	s.activeCancelMu.Unlock()
+	defer func() {
+		cancel()
+		s.activeCancelMu.Lock()
+		s.activeCancel = nil
+		if s.activeTimer != nil {
+			s.activeTimer.Stop()
+			s.activeTimer = nil
+		}
+		s.activeCancelMu.Unlock()
+	}()
+	execResult, err := db.ExecContext(ctx, sqlText)
 	if err != nil {
 		return queryResult{}, err
 	}
@@ -2918,24 +2939,42 @@ func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs in
 	if err != nil {
 		return nil, err
 	}
-	var ctx context.Context
-	var cancel context.CancelFunc
+	ctx, cancel := context.WithCancel(context.Background())
+	var timer *time.Timer
 	if timeoutSecs > 0 {
-		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
-	} else {
-		ctx, cancel = context.WithCancel(context.Background())
+		var t *time.Timer
+		t = time.AfterFunc(time.Duration(timeoutSecs)*time.Second, func() {
+			s.activeCancelMu.Lock()
+			if s.activeTimer == t {
+				s.activeTimedOut = true
+				cancel()
+			}
+			s.activeCancelMu.Unlock()
+		})
+		timer = t
 	}
 	s.activeCancelMu.Lock()
 	s.activeCancel = cancel
+	s.activeTimer = timer
+	s.activeTimedOut = false
 	s.activeCancelMu.Unlock()
 	rows, queryErr := db.QueryContext(ctx, sqlText, args...)
 	s.activeCancelMu.Lock()
 	s.activeCancel = nil
+	if s.activeTimer != nil {
+		s.activeTimer.Stop()
+		s.activeTimer = nil
+	}
+	timedOut := s.activeTimedOut
 	if queryErr != nil {
 		cancel()
+	} else if timedOut {
+		cancel()
+		if rows != nil {
+			rows.Close()
+		}
+		queryErr = fmt.Errorf("query timed out after %ds", timeoutSecs)
 	} else {
-		// Keep the context alive for paged reads; database/sql may continue
-		// fetching from the driver until Rows is closed or exhausted.
 		s.activeRows[rows] = cancel
 	}
 	s.activeCancelMu.Unlock()

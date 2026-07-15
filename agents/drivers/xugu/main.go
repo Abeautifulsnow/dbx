@@ -276,6 +276,12 @@ type server struct {
 	activeCancelMu    sync.Mutex
 	activeCancel      context.CancelFunc
 	activeRows        map[*sql.Rows]context.CancelFunc
+	activeTimer       *time.Timer
+	activeTimedOut    bool
+	// killSession, if non-nil, is called to force-kill the current
+	// statement on the database server. Tests may replace it with a
+	// stub. The real implementation is set during connectWithControl.
+	killSession func()
 }
 
 type agentSession struct {
@@ -787,6 +793,11 @@ func (s *server) connectWithControl(params connectParams, cancelDB *sql.DB, owns
 	s.params = params
 	s.nodeID = databaseSession.nodeID
 	s.databaseSessionID = databaseSession.sessionID
+	s.killSession = func() {
+		if s.cancelDB != nil && s.databaseSessionID > 0 {
+			_, _ = s.cancelDB.Exec(fmt.Sprintf("CALL DBMS_DBA.KILL_SESSION_TRANS(%d, %d)", s.nodeID, s.databaseSessionID))
+		}
+	}
 	return nil
 }
 
@@ -805,6 +816,7 @@ func (s *server) disconnect() error {
 	s.ownsCancelDB = false
 	s.nodeID = 0
 	s.databaseSessionID = 0
+	s.killSession = nil
 	return err
 }
 
@@ -1989,10 +2001,20 @@ func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs in
 	rows, queryErr := db.QueryContext(ctx, sqlText, args...)
 	s.activeCancelMu.Lock()
 	s.activeCancel = nil
+	if s.activeTimer != nil {
+		s.activeTimer.Stop()
+		s.activeTimer = nil
+	}
+	timedOut := s.activeTimedOut
 	if queryErr != nil {
 		cancel()
+	} else if timedOut {
+		cancel()
+		if rows != nil {
+			rows.Close()
+		}
+		queryErr = fmt.Errorf("query timed out after %ds", timeoutSecs)
 	} else {
-		// Paged queries may continue fetching after QueryContext returns.
 		s.activeRows[rows] = cancel
 	}
 	s.activeCancelMu.Unlock()
@@ -2004,15 +2026,27 @@ func (s *server) beginActiveOperation() (context.Context, context.CancelFunc) {
 }
 
 func (s *server) beginActiveOperationWithTimeout(timeoutSecs int) (context.Context, context.CancelFunc) {
-	var ctx context.Context
-	var cancel context.CancelFunc
+	ctx, cancel := context.WithCancel(context.Background())
+	var timer *time.Timer
 	if timeoutSecs > 0 {
-		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
-	} else {
-		ctx, cancel = context.WithCancel(context.Background())
+		var t *time.Timer
+		t = time.AfterFunc(time.Duration(timeoutSecs)*time.Second, func() {
+			s.activeCancelMu.Lock()
+			if s.activeTimer == t {
+				s.activeTimedOut = true
+				cancel()
+				if s.killSession != nil {
+					s.killSession()
+				}
+			}
+			s.activeCancelMu.Unlock()
+		})
+		timer = t
 	}
 	s.activeCancelMu.Lock()
 	s.activeCancel = cancel
+	s.activeTimer = timer
+	s.activeTimedOut = false
 	s.activeCancelMu.Unlock()
 	return ctx, cancel
 }
@@ -2021,6 +2055,10 @@ func (s *server) endActiveOperation(cancel context.CancelFunc) {
 	cancel()
 	s.activeCancelMu.Lock()
 	s.activeCancel = nil
+	if s.activeTimer != nil {
+		s.activeTimer.Stop()
+		s.activeTimer = nil
+	}
 	s.activeCancelMu.Unlock()
 }
 
@@ -2037,13 +2075,13 @@ func (s *server) cancelActiveQuery() {
 	for _, cancel := range cancels {
 		cancel()
 	}
-	if len(cancels) > 0 && s.cancelDB != nil && s.databaseSessionID > 0 {
+	if len(cancels) > 0 && s.killSession != nil {
 		// go-xugu-driver does not implement QueryerContext/ExecerContext and
 		// blocks in network reads, so context cancellation alone cannot interrupt
 		// an in-flight statement. Xugu's control procedure stops the target
 		// session's current transaction while preserving the connection. Runtime
 		// sessions share one control connection per database endpoint.
-		_, _ = s.cancelDB.Exec(fmt.Sprintf("CALL DBMS_DBA.KILL_SESSION_TRANS(%d, %d)", s.nodeID, s.databaseSessionID))
+		s.killSession()
 	}
 }
 
