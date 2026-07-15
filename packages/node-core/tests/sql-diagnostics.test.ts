@@ -48,3 +48,15 @@ test("enabled SQL diagnostic logging emits redacted statements only", () => {
   assert.doesNotMatch(rendered, /secret-123/);
   assert.match(rendered, /\[REDACTED\]/);
 });
+
+test("dollar-quoted strings are redacted", () => {
+  const redacted = redactSqlForDiagnostics("select $$secret$$");
+  assert.doesNotMatch(redacted, /secret/);
+  assert.match(redacted, /\[REDACTED\]/);
+});
+
+test("space-separated sensitive assignments are redacted", () => {
+  const redacted = redactSqlForDiagnostics("select * from t where password = mysecret");
+  assert.doesNotMatch(redacted, /mysecret/);
+  assert.match(redacted, /\[REDACTED\]/);
+});

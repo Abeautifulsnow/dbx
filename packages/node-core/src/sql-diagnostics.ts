@@ -34,6 +34,26 @@ function redactSqlLiterals(sql: string): string {
       }
       continue;
     }
+    if (ch === "$") {
+      let j = i + 1;
+      while (j < sql.length && sql[j] !== "$") j += 1;
+      if (j >= sql.length) {
+        result += "$";
+        i += 1;
+        continue;
+      }
+      const tag = sql.slice(i, j + 1);
+      i = j + 1;
+      while (i < sql.length) {
+        if (sql.slice(i, i + tag.length) === tag) {
+          i += tag.length;
+          break;
+        }
+        i += 1;
+      }
+      result += "$[REDACTED]$";
+      continue;
+    }
     if (ch === "-" && next === "-") {
       result += "--[REDACTED_COMMENT]";
       i += 2;

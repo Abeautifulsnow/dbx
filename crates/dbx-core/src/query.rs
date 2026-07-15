@@ -1691,7 +1691,8 @@ async fn execute_postgres_drop_database(
     let admin_database = postgres_drop_database_admin_database(target_database);
     let pool_key = state
         .get_or_create_pool_for_session(connection_id, Some(admin_database), options.client_session_id.as_deref())
-        .await?;
+        .await
+        .map_err(|e| query_error_with_omitted_sql_context(&e, sql))?;
     if let Some(execution_id) = options.execution_id.as_deref() {
         state.running_queries.set_pool_key(execution_id, pool_key.clone());
     }
@@ -1839,11 +1840,15 @@ pub async fn execute_multi_core_with_options_for_client(
     }
 
     let pool_key = if database.is_empty() {
-        state.get_or_create_pool_for_session(connection_id, None, options.client_session_id.as_deref()).await?
+        state
+            .get_or_create_pool_for_session(connection_id, None, options.client_session_id.as_deref())
+            .await
+            .map_err(|e| query_error_with_omitted_sql_context(&e, sql))?
     } else {
         state
             .get_or_create_pool_for_session(connection_id, Some(database), options.client_session_id.as_deref())
-            .await?
+            .await
+            .map_err(|e| query_error_with_omitted_sql_context(&e, sql))?
     };
     if let Some(execution_id) = options.execution_id.as_deref() {
         state.running_queries.set_pool_key(execution_id, pool_key.clone());
@@ -2219,10 +2224,14 @@ pub async fn execute_statements(
     schema: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<db::QueryResult, String> {
+    let sql_ctx = statements.first().map(|s| s.as_str()).unwrap_or("");
     let pool_key = if database.is_empty() {
         connection_id.to_string()
     } else {
-        state.get_or_create_pool(connection_id, Some(database)).await?
+        state
+            .get_or_create_pool(connection_id, Some(database))
+            .await
+            .map_err(|e| query_error_with_omitted_sql_context(&e, sql_ctx))?
     };
 
     let mut total_affected: u64 = 0;
@@ -2267,7 +2276,7 @@ pub async fn execute_statements(
                         }
                         PoolErrorAction::Keep => {}
                     }
-                    return Err(err);
+                    return Err(query_error_with_omitted_sql_context(&err, sql_ctx));
                 }
             }
         }
@@ -2300,11 +2309,9 @@ pub async fn execute_statements(
                     }
                     PoolErrorAction::Keep => {}
                 }
-                return Err(format!(
-                    "Statement {} failed: {}. Previous {} statement(s) may have been committed.",
-                    i + 1,
-                    e,
-                    i
+                return Err(query_error_with_omitted_sql_context(
+                    &format!("Statement {} failed: {}. Previous {} statement(s) may have been committed.", i + 1, e, i),
+                    sql,
                 ));
             }
         }
@@ -2342,10 +2349,14 @@ pub async fn execute_statements_in_transaction(
     statements: &[String],
     schema: Option<&str>,
 ) -> Result<db::QueryResult, String> {
+    let sql_ctx = statements.first().map(|s| s.as_str()).unwrap_or("");
     let pool_key = if database.is_empty() {
         connection_id.to_string()
     } else {
-        state.get_or_create_pool(connection_id, Some(database)).await?
+        state
+            .get_or_create_pool(connection_id, Some(database))
+            .await
+            .map_err(|e| query_error_with_omitted_sql_context(&e, sql_ctx))?
     };
 
     // Read-only check: intercept all transaction paths before dispatching
@@ -2522,7 +2533,7 @@ async fn exec_tx_pg_statements(
             async { tx.execute(sql, &[]).await.map_err(|e| e.to_string()) },
         )
         .await
-        .map_err(|e| format!("Statement {} failed: {}", i + 1, e))?;
+        .map_err(|e| query_error_with_omitted_sql_context(&format!("Statement {} failed: {}", i + 1, e), sql))?;
         total_affected += affected;
     }
     tokio::time::timeout(budget.cleanup_timeout, tx.commit())
@@ -2556,7 +2567,7 @@ async fn exec_tx_mysql_inner(
             Err(e) => {
                 let _ = mysql_query_drop_with_timeout(&mut conn, "ROLLBACK", budget.cleanup_timeout, "ROLLBACK failed")
                     .await;
-                return Err(format!("Statement {} failed: {}", i + 1, e));
+                return Err(query_error_with_omitted_sql_context(&format!("Statement {} failed: {}", i + 1, e), sql));
             }
         }
     }
@@ -2616,7 +2627,10 @@ async fn exec_tx_sqlite_inner(
                     Ok(_) => total_affected += conn.changes(),
                     Err(e) => {
                         let _ = conn.execute_batch("ROLLBACK");
-                        return Err(format!("Statement {} failed: {}", i + 1, e));
+                        return Err(query_error_with_omitted_sql_context(
+                            &format!("Statement {} failed: {}", i + 1, e),
+                            sql,
+                        ));
                     }
                 }
             }
@@ -2701,7 +2715,7 @@ async fn exec_tx_explicit_inner(
                 {
                     log::error!("ROLLBACK failed after statement {} error: {}", i + 1, rb_err);
                 }
-                return Err(format!("Statement {} failed: {}", i + 1, e));
+                return Err(query_error_with_omitted_sql_context(&format!("Statement {} failed: {}", i + 1, e), sql));
             }
         }
     }
@@ -2744,10 +2758,9 @@ async fn exec_tx_none_inner(
             }
             Err(e) => {
                 log::warn!("Statement {} failed (no transaction support): {}", i + 1, e);
-                return Err(format!(
-                    "Statement {} failed: {}. No transaction support for this database type.",
-                    i + 1,
-                    e
+                return Err(query_error_with_omitted_sql_context(
+                    &format!("Statement {} failed: {}. No transaction support for this database type.", i + 1, e),
+                    sql,
                 ));
             }
         }
@@ -3862,6 +3875,38 @@ mod tests {
         assert!(reconnect_error.contains("connection reset after reconnect"));
         assert!(reconnect_error.contains(SQL_OMITTED_ERROR_CONTEXT));
         assert!(!reconnect_error.contains("secret-123"));
+    }
+
+    #[test]
+    fn execute_statements_error_omits_raw_sql() {
+        let sql = "select 'secret-token' as t";
+        let err = query_error_with_omitted_sql_context(
+            &format!(
+                "Statement {} failed: {}. Previous {} statement(s) may have been committed.",
+                2, "driver error", 1
+            ),
+            sql,
+        );
+
+        assert!(err.contains("driver error"));
+        assert!(err.contains(SQL_OMITTED_ERROR_CONTEXT));
+        assert!(!err.contains("secret-token"));
+        assert!(!err.contains("SQL:"));
+        assert!(err.contains("Statement 2 failed:"));
+    }
+
+    #[test]
+    fn batch_transaction_error_omits_raw_sql() {
+        let sql = "delete from users where id = 'secret-id'";
+        let err = query_error_with_omitted_sql_context(
+            &format!("Statement {} failed: {}. No transaction support for this database type.", 3, "batch error"),
+            sql,
+        );
+
+        assert!(err.contains("batch error"));
+        assert!(err.contains(SQL_OMITTED_ERROR_CONTEXT));
+        assert!(!err.contains("secret-id"));
+        assert!(err.contains("Statement 3 failed:"));
     }
 
     #[test]

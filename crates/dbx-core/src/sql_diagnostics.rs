@@ -55,6 +55,49 @@ fn redact_literals(sql: &str) -> String {
             }
             continue;
         }
+        if ch == '$' {
+            let j = i + 1;
+            if j >= chars.len() {
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            if chars[j] == '$' {
+                // $$...$$ dollar-quoted string
+                out.push_str("$$[REDACTED]$$");
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '$' && chars[i + 1] == '$') {
+                    i += 1;
+                }
+                if i + 1 < chars.len() {
+                    i += 2;
+                }
+                continue;
+            }
+            // $tag$...$tag$ dollar-quoted string
+            let tag_start = j;
+            let mut tag_end = j;
+            while tag_end < chars.len() && (chars[tag_end].is_ascii_alphanumeric() || chars[tag_end] == '_') {
+                tag_end += 1;
+            }
+            if tag_end > tag_start && tag_end < chars.len() && chars[tag_end] == '$' {
+                let tag: String = chars[tag_start..tag_end].iter().collect();
+                out.push_str("$[REDACTED]$");
+                i = tag_end + 1;
+                let closing: Vec<char> = format!("${}$", tag).chars().collect();
+                while i + closing.len() <= chars.len() {
+                    if chars[i..i + closing.len()] == closing[..] {
+                        i += closing.len();
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(ch);
+            i += 1;
+            continue;
+        }
         if ch == '-' && next == Some('-') {
             out.push_str("--[REDACTED_COMMENT]");
             i += 2;
@@ -81,24 +124,66 @@ fn redact_literals(sql: &str) -> String {
 }
 
 fn redact_sensitive_assignments(sql: &str) -> String {
-    sql.split_whitespace()
-        .map(|part| {
-            for separator in ['=', ':'] {
-                if let Some((key, _value)) = part.split_once(separator) {
-                    if is_sensitive_key(key.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-'))
-                    {
-                        return format!("{key}{separator}[REDACTED]");
-                    }
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_whitespace() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len()
+            && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '-' || chars[i] == '.')
+        {
+            i += 1;
+        }
+        if i == start {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let key: String = chars[start..i].iter().collect();
+        let mut j = i;
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+        if j < chars.len() && (chars[j] == '=' || chars[j] == ':') {
+            if is_sensitive_key(&key) {
+                out.push_str(&key);
+                for k in i..j {
+                    out.push(chars[k]);
                 }
+                out.push(chars[j]);
+                j += 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    out.push(chars[j]);
+                    j += 1;
+                }
+                while j < chars.len() && !chars[j].is_whitespace() {
+                    j += 1;
+                }
+                out.push_str("[REDACTED]");
+                i = j;
+                continue;
             }
-            part.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+        }
+        out.push_str(&key);
+    }
+    out
 }
 
 pub fn redact_sql_for_diagnostics(sql: &str) -> String {
-    truncate_for_diagnostics(redact_sensitive_assignments(&redact_literals(sql)), DEFAULT_SQL_DIAGNOSTIC_MAX_CHARS)
+    let max_chars = DEFAULT_SQL_DIAGNOSTIC_MAX_CHARS;
+    // Pre-truncate to bound allocation before redaction passes build Vec<char>
+    let pre_truncated: &str = if sql.len() > max_chars * 8 {
+        let idx = sql.char_indices().nth(max_chars * 8).map(|(i, _)| i).unwrap_or(sql.len());
+        &sql[..idx]
+    } else {
+        sql
+    };
+    truncate_for_diagnostics(redact_sensitive_assignments(&redact_literals(pre_truncated)), max_chars)
 }
 
 pub fn debug_sql(scope: &str, sql: &str) {
@@ -111,13 +196,46 @@ mod tests {
 
     #[test]
     fn redacts_sensitive_literals_and_bounds_large_sql() {
-        let sql = format!("select * from users where password = 'secret-123' and api_key=abc {};", "x".repeat(900));
+        let sql = format!(
+            "select * from users where password = 'secret-123' and api_key=abc and name = 'alice' {};",
+            "x".repeat(900)
+        );
         let redacted = redact_sql_for_diagnostics(&sql);
         assert!(!redacted.contains("secret-123"));
         assert!(!redacted.contains("api_key=abc"));
-        assert!(redacted.contains("'[REDACTED]'"));
+        assert!(!redacted.contains("alice"));
+        // Literals not part of sensitive assignments retain single-quote redaction
+        assert!(redacted.contains("'[REDACTED]'"), "name literal should be redacted: {}", redacted);
+        // Sensitive assignment values are redacted with bracket notation
+        assert!(redacted.contains("password = [REDACTED]"));
         assert!(redacted.contains("api_key=[REDACTED]"));
         assert!(redacted.contains("truncated"));
         assert!(redacted.len() < sql.len());
+    }
+
+    #[test]
+    fn redacts_space_separated_sensitive_assignments() {
+        let sql = "select * from users where password = hunter2";
+        let redacted = redact_sensitive_assignments(sql);
+        assert!(!redacted.contains("hunter2"));
+        assert!(redacted.contains("password = [REDACTED]"));
+        assert!(redacted.contains("select"));
+    }
+
+    #[test]
+    fn redacts_dollar_quoted_strings() {
+        let sql = "select $$secret$$, $tag$hello$tag$ from t";
+        let redacted = redact_sql_for_diagnostics(sql);
+        assert!(redacted.contains("$$[REDACTED]$$"));
+        assert!(redacted.contains("$[REDACTED]$"));
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("hello"));
+    }
+
+    #[test]
+    fn large_input_bounded_allocation() {
+        let sql = "x".repeat(1_000_000);
+        let redacted = redact_sql_for_diagnostics(&sql);
+        assert!(redacted.len() <= 550);
     }
 }
