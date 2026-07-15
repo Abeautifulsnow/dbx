@@ -319,7 +319,8 @@ pub async fn execute_query(
     );
     let cancel_token = registered.token();
 
-    tracing::debug!(sql = %req.sql, connection_id = %req.connection_id, "execute_query");
+    dbx_core::sql_diagnostics::debug_sql("web:execute_query", &req.sql);
+    tracing::debug!(connection_id = %req.connection_id, "execute_query");
 
     let result = dbx_core::query::execute_sql_statement_with_options(
         &state.app,
@@ -359,7 +360,8 @@ pub async fn execute_multi(
     );
     let cancel_token = registered.token();
 
-    tracing::debug!(sql = %req.sql, connection_id = %req.connection_id, "execute_multi");
+    dbx_core::sql_diagnostics::debug_sql("web:execute_multi", &req.sql);
+    tracing::debug!(connection_id = %req.connection_id, "execute_multi");
 
     let result = dbx_core::query::execute_multi_core_with_options_for_client(
         &state.app,

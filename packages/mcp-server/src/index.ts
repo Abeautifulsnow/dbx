@@ -19,6 +19,7 @@ import {
   isLikelyMongoMutation,
   isProductionDatabase,
   postBridge,
+  logSqlDiagnostic,
   sqlSafetyFromEnv,
   splitSqlStatements,
   type Backend,
@@ -231,7 +232,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
       sql: z.string().describe("SQL query to execute"),
     },
     async ({ connection_id, connection_name, database, sql }) => {
-      console.error("[dbx_execute_query] sql:", JSON.stringify(sql));
+      logSqlDiagnostic("dbx_execute_query", sql, { connection_id, connection_name, database });
       const { config, error } = await resolveConnection(backend, scope, connection_id, connection_name);
       if (error) return error;
       const scopedConfig = config!;
@@ -260,7 +261,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
         return labeledText(scopedConfig, results.map((result, index) => formatQueryToolResult(result, `Statement ${index + 1}`).content[0].text).join("\n\n"));
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        return toolError("QUERY_ERROR", `${msg}\nSQL: ${sql}`);
+        return toolError("QUERY_ERROR", msg);
       }
     },
   );
@@ -495,6 +496,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
         }
         // MongoDB shell commands bypass the SQL safety evaluator; pass MCP
         // safety flags to the desktop executor for command-aware gating.
+        logSqlDiagnostic("dbx_execute_in_app", sql, { connection_id: config!.id, connection_name: config!.name, database });
         return bridgeRequest(
           "/execute-query",
           {

@@ -256,6 +256,52 @@ test("redis command tool executes redis commands on the selected database", asyn
   assert.match(result.content[0].text, /value-1/);
 });
 
+test("dbx_execute_query does not log SQL when debug diagnostics are disabled", async () => {
+  const original = console.error;
+  const originalDebug = process.env.DBX_SQL_DEBUG;
+  const originalMcpDebug = process.env.DBX_MCP_DEBUG_SQL;
+  const messages: unknown[][] = [];
+  delete process.env.DBX_SQL_DEBUG;
+  delete process.env.DBX_MCP_DEBUG_SQL;
+  console.error = (...args: unknown[]) => messages.push(args);
+  try {
+    const server = createDbxMcpServer(backend, { isWebMode: true });
+    const result = await (server as any)._registeredTools.dbx_execute_query.handler({
+      connection_name: "local",
+      sql: "select 'secret-123' as token",
+    });
+    assert.equal(result.isError, undefined);
+  } finally {
+    console.error = original;
+    if (originalDebug === undefined) delete process.env.DBX_SQL_DEBUG;
+    else process.env.DBX_SQL_DEBUG = originalDebug;
+    if (originalMcpDebug === undefined) delete process.env.DBX_MCP_DEBUG_SQL;
+    else process.env.DBX_MCP_DEBUG_SQL = originalMcpDebug;
+  }
+
+  assert.equal(messages.length, 0);
+});
+
+test("dbx_execute_query omits raw SQL from user-facing query errors", async () => {
+  const sensitiveSql = "select 'secret-123' as token";
+  const scopedBackend: Backend = {
+    ...backend,
+    executeQuery: async () => {
+      throw new Error("driver rejected statement");
+    },
+  };
+  const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+
+  const result = await (server as any)._registeredTools.dbx_execute_query.handler({
+    connection_name: "local",
+    sql: sensitiveSql,
+  });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /QUERY_ERROR: driver rejected statement/);
+  assert.doesNotMatch(result.content[0].text, /secret-123|SQL:/);
+});
+
 test("redis command tool blocks write commands in read-only MCP sessions", async () => {
   let executed = false;
   const redisConnection: ConnectionConfig = { ...connection, db_type: "redis" };

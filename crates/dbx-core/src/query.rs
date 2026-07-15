@@ -32,6 +32,8 @@ use crate::sql::{split_sql_batches, split_sql_statements, starts_with_executable
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_ROWS: usize = 10000;
 pub const QUERY_CANCELED: &str = "Query canceled";
+const SQL_OMITTED_ERROR_CONTEXT: &str =
+    "SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement.";
 #[cfg(feature = "duckdb-bundled")]
 const DUCKDB_INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "duckdb-bundled")]
@@ -42,6 +44,15 @@ pub enum PoolErrorAction {
     Keep,
     Discard,
     ReconnectAndRetry,
+}
+
+fn query_error_with_omitted_sql_context(error: &str, sql: &str) -> String {
+    crate::sql_diagnostics::debug_sql("query:error", sql);
+    if error.contains(SQL_OMITTED_ERROR_CONTEXT) {
+        error.to_string()
+    } else {
+        format!("{error}\n{SQL_OMITTED_ERROR_CONTEXT}")
+    }
 }
 
 /// A multi-statement result with metadata intended for query clients.
@@ -1101,7 +1112,7 @@ pub async fn do_execute(
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<db::QueryResult, String> {
-    log::debug!("[do_execute] sql={}", sql);
+    crate::sql_diagnostics::debug_sql("do_execute", sql);
     if let Some(execution_id) = options.execution_id.as_deref() {
         state.running_queries.set_pool_key(execution_id, pool_key.to_string());
     }
@@ -1624,11 +1635,15 @@ pub async fn execute_sql_statement_with_options(
     // on that tab-scoped pool so connection-level state (for example MySQL @vars)
     // survives across runs.
     let pool_key = if database.is_empty() {
-        state.get_or_create_pool_for_session(connection_id, None, options.client_session_id.as_deref()).await?
+        state
+            .get_or_create_pool_for_session(connection_id, None, options.client_session_id.as_deref())
+            .await
+            .map_err(|e| query_error_with_omitted_sql_context(&e, sql))?
     } else {
         state
             .get_or_create_pool_for_session(connection_id, Some(database), options.client_session_id.as_deref())
-            .await?
+            .await
+            .map_err(|e| query_error_with_omitted_sql_context(&e, sql))?
     };
 
     if is_canceled(&cancel_token) {
@@ -1640,14 +1655,17 @@ pub async fn execute_sql_statement_with_options(
         do_execute(state, &pool_key, mysql_dialect, Some(database), sql, schema, cancel_token.clone(), options.clone())
             .await;
 
-    let with_sql_context = |r: Result<db::QueryResult, String>| r.map_err(|e| format!("{e}\nSQL: {sql}"));
+    let with_sql_context =
+        |r: Result<db::QueryResult, String>| r.map_err(|e| query_error_with_omitted_sql_context(&e, sql));
 
     let action = result.as_ref().err().map(|e| query_pool_error_action(db_type, sql, e));
     match action {
         Some(PoolErrorAction::ReconnectAndRetry) if !is_canceled(&cancel_token) => {
             let db_opt = if database.is_empty() { None } else { Some(database) };
-            let new_key =
-                state.reconnect_pool_for_session(connection_id, db_opt, options.client_session_id.as_deref()).await?;
+            let new_key = state
+                .reconnect_pool_for_session(connection_id, db_opt, options.client_session_id.as_deref())
+                .await
+                .map_err(|e| query_error_with_omitted_sql_context(&e, sql))?;
             with_sql_context(
                 do_execute(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options).await,
             )
@@ -2716,7 +2734,7 @@ async fn exec_tx_none_inner(
 ) -> Result<db::QueryResult, String> {
     let mut total_affected: u64 = 0;
     for (i, sql) in statements.iter().enumerate() {
-        log::info!("[query][tx-none:statement:start] index={} sql={}", i + 1, sql);
+        log::info!("[query][tx-none:statement:start] index={}", i + 1);
         match do_execute(state, pool_key, mysql_dialect, database, sql, schema, None, QueryExecutionOptions::default())
             .await
         {
@@ -3820,6 +3838,30 @@ mod tests {
         assert!(is_connection_error("socket closed"));
         assert!(is_connection_error("unexpected eof"));
         assert!(is_connection_error("Error occurred while creating a new object: error communicating with the server"));
+    }
+
+    #[test]
+    fn query_error_context_omits_raw_sql_and_is_not_duplicated() {
+        let sql = "select 'secret-123' as token";
+        let error = query_error_with_omitted_sql_context("driver rejected statement", sql);
+
+        assert!(error.contains("driver rejected statement"));
+        assert!(error.contains(SQL_OMITTED_ERROR_CONTEXT));
+        assert!(!error.contains("secret-123"));
+        assert!(!error.contains("SQL:"));
+
+        let repeated = query_error_with_omitted_sql_context(&error, sql);
+        assert_eq!(repeated.matches(SQL_OMITTED_ERROR_CONTEXT).count(), 1);
+    }
+
+    #[test]
+    fn reconnect_retry_error_context_omits_raw_sql() {
+        let sql = "select 'secret-123' as token";
+        let reconnect_error = query_error_with_omitted_sql_context("connection reset after reconnect", sql);
+
+        assert!(reconnect_error.contains("connection reset after reconnect"));
+        assert!(reconnect_error.contains(SQL_OMITTED_ERROR_CONTEXT));
+        assert!(!reconnect_error.contains("secret-123"));
     }
 
     #[test]
