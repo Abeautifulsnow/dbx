@@ -22,6 +22,7 @@ import {
   logSqlDiagnostic,
   sqlSafetyFromEnv,
   splitSqlStatements,
+  supportsHashLineComments,
   type Backend,
   type ConnectionConfig,
   type QueryResult,
@@ -240,7 +241,8 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
         return toolError("REDIS_COMMAND_REQUIRED", "Redis connections do not accept SQL through dbx_execute_query. Use dbx_execute_redis_command with a Redis command such as GET key or INFO.");
       }
       if (scopedConfig.db_type !== "mongodb") {
-        const safety = evaluateSqlSafety(sql, { ...sqlSafetyFromEnv(), allowMultipleStatements: true });
+        const hashLineComments = supportsHashLineComments(scopedConfig.db_type);
+        const safety = evaluateSqlSafety(sql, { ...sqlSafetyFromEnv(), allowMultipleStatements: true, hashLineComments });
         if (!safety.allowed) return toolError("SQL_BLOCKED", safety.reason ?? "SQL blocked.");
         const production = assessProductionSql(sql, scopedConfig, database ?? scope.database ?? scopedConfig.database);
         if (production.active && production.isMutation) {
@@ -252,7 +254,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
       // MongoDB shell commands don't fit the SQL safety evaluator; the backend
       // (node-core executeQuery) applies command-aware read/write gating.
       try {
-        const statements = scopedConfig.db_type === "mongodb" ? [sql] : splitSqlStatements(sql);
+        const statements = scopedConfig.db_type === "mongodb" ? [sql] : splitSqlStatements(sql, { hashLineComments: supportsHashLineComments(scopedConfig.db_type) });
         const results = [];
         for (const statement of statements) {
           results.push(await backend.executeQuery(withDatabase(scopedConfig, database ?? scope.database), statement));
@@ -481,7 +483,8 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
             if (!safety.allowed) return toolError("SQL_BLOCKED", safety.reason ?? "Query blocked.");
           }
         } else {
-          const safety = evaluateSqlSafety(sql, { ...safetyOptions, allowMultipleStatements: true });
+          const hashLineComments = supportsHashLineComments(config?.db_type);
+          const safety = evaluateSqlSafety(sql, { ...safetyOptions, allowMultipleStatements: true, hashLineComments });
           if (!safety.allowed) return toolError("SQL_BLOCKED", safety.reason ?? "SQL blocked.");
         }
         if (config?.db_type === "mongodb") {
