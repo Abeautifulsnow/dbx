@@ -151,9 +151,6 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = tracing_log::LogTracer::init() {
-        eprintln!("Warning: log bridge already initialized: {e}");
-    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

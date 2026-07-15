@@ -1968,7 +1968,6 @@ dependencies = [
  "tokio-util",
  "tower-http",
  "tracing",
- "tracing-log",
  "tracing-subscriber",
  "uuid",
 ]
