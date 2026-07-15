@@ -35,23 +35,46 @@ function redactSqlLiterals(sql: string): string {
       continue;
     }
     if (ch === "$") {
-      let j = i + 1;
-      while (j < sql.length && sql[j] !== "$") j += 1;
+      const j = i + 1;
       if (j >= sql.length) {
         result += "$";
         i += 1;
         continue;
       }
-      const tag = sql.slice(i, j + 1);
-      i = j + 1;
-      while (i < sql.length) {
-        if (sql.slice(i, i + tag.length) === tag) {
-          i += tag.length;
-          break;
+      if (sql[j] === "$") {
+        // $$...$$ empty-tag dollar-quoted string
+        result += "$$[REDACTED]$$";
+        i += 2;
+        while (i + 1 < sql.length && !(sql[i] === "$" && sql[i + 1] === "$")) {
+          i += 1;
         }
-        i += 1;
+        if (i + 1 < sql.length) {
+          i += 2;
+        }
+        continue;
       }
-      result += "$[REDACTED]$";
+      // $tag$...$tag$ dollar-quoted string — tag must be ASCII alphanumerics + underscore only
+      const TAG_CHAR = /^[A-Za-z0-9_]$/;
+      let tagEnd = j;
+      while (tagEnd < sql.length && TAG_CHAR.test(sql[tagEnd])) {
+        tagEnd += 1;
+      }
+      if (tagEnd > j && tagEnd < sql.length && sql[tagEnd] === "$") {
+        const tag = sql.slice(j, tagEnd);
+        result += "$[REDACTED]$";
+        i = tagEnd + 1;
+        const closing = "$" + tag + "$";
+        while (i + closing.length <= sql.length) {
+          if (sql.slice(i, i + closing.length) === closing) {
+            i += closing.length;
+            break;
+          }
+          i += 1;
+        }
+        continue;
+      }
+      result += "$";
+      i += 1;
       continue;
     }
     if (ch === "-" && next === "-") {

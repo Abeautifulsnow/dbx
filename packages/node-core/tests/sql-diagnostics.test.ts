@@ -60,3 +60,34 @@ test("space-separated sensitive assignments are redacted", () => {
   assert.doesNotMatch(redacted, /mysecret/);
   assert.match(redacted, /\[REDACTED\]/);
 });
+
+test("postgres positional parameters are not treated as dollar quotes ($1, $2, ...)", () => {
+  const redacted = redactSqlForDiagnostics("select * from t where id = $1 and name = 'alice'");
+  assert.match(redacted, /\$1\b/);
+  assert.doesNotMatch(redacted, /alice/);
+});
+
+test("multiple postgres positional parameters all survive redaction", () => {
+  const redacted = redactSqlForDiagnostics("select $1, $2, $3, $42 from t");
+  assert.match(redacted, /\$1\b/);
+  assert.match(redacted, /\$2\b/);
+  assert.match(redacted, /\$3\b/);
+  assert.match(redacted, /\$42\b/);
+});
+
+test("empty-tag dollar quote $$secret$$ is redacted", () => {
+  const redacted = redactSqlForDiagnostics("select $$secret$$ from t");
+  assert.match(redacted, /\$\$\[REDACTED\]\$\$/);
+  assert.doesNotMatch(redacted, /secret/);
+});
+
+test("named-tag dollar quote $tag$hello$tag$ is redacted", () => {
+  const redacted = redactSqlForDiagnostics("select $tag$hello$tag$ from t");
+  assert.match(redacted, /\$\[REDACTED\]\$/);
+  assert.doesNotMatch(redacted, /hello/);
+});
+
+test("lone trailing dollar sign does not throw and passes through", () => {
+  const redacted = redactSqlForDiagnostics("select 1 $");
+  assert.match(redacted, /\$/);
+});
