@@ -91,3 +91,17 @@ test("lone trailing dollar sign does not throw and passes through", () => {
   const redacted = redactSqlForDiagnostics("select 1 $");
   assert.match(redacted, /\$/);
 });
+
+test("bounds redaction before scanning an unclosed literal", () => {
+  const redacted = redactSqlForDiagnostics(`select '${"secret-".repeat(1000)}`, 32);
+  assert.doesNotMatch(redacted, /secret-/);
+  assert.match(redacted, /\[REDACTED\]/);
+  assert.match(redacted, /truncated/);
+});
+
+test("does not leak a sensitive value cut at the diagnostic boundary", () => {
+  const redacted = redactSqlForDiagnostics(`password = ${"secret-token".repeat(1000)}`, 24);
+  assert.doesNotMatch(redacted, /secret-token|secret-/);
+  assert.match(redacted, /password = \[REDACTED\]/);
+  assert.match(redacted, /truncated/);
+});

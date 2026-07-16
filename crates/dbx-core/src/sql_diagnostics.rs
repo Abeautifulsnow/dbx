@@ -16,13 +16,22 @@ fn is_sensitive_key(key: &str) -> bool {
         || key.contains("bearer")
 }
 
-fn truncate_for_diagnostics(value: String, max_chars: usize) -> String {
+fn truncate_for_diagnostics(value: String, max_chars: usize, input_truncated: bool) -> String {
     if value.chars().count() <= max_chars {
-        return value;
+        return if input_truncated { format!("{value}…[truncated]") } else { value };
     }
     let head: String = value.chars().take(max_chars).collect();
-    let omitted = value.chars().count().saturating_sub(max_chars);
-    format!("{head}…[truncated {omitted} chars]")
+    format!("{head}…[truncated]")
+}
+
+fn bounded_input(sql: &str, max_chars: usize) -> (&str, bool) {
+    if max_chars == 0 {
+        return ("", !sql.is_empty());
+    }
+    match sql.char_indices().nth(max_chars) {
+        Some((index, _)) => (&sql[..index], true),
+        None => (sql, false),
+    }
 }
 
 fn redact_literals(sql: &str) -> String {
@@ -176,14 +185,8 @@ fn redact_sensitive_assignments(sql: &str) -> String {
 
 pub fn redact_sql_for_diagnostics(sql: &str) -> String {
     let max_chars = DEFAULT_SQL_DIAGNOSTIC_MAX_CHARS;
-    // Pre-truncate to bound allocation before redaction passes build Vec<char>
-    let pre_truncated: &str = if sql.len() > max_chars * 8 {
-        let idx = sql.char_indices().nth(max_chars * 8).map(|(i, _)| i).unwrap_or(sql.len());
-        &sql[..idx]
-    } else {
-        sql
-    };
-    truncate_for_diagnostics(redact_sensitive_assignments(&redact_literals(pre_truncated)), max_chars)
+    let (bounded_sql, input_truncated) = bounded_input(sql, max_chars);
+    truncate_for_diagnostics(redact_sensitive_assignments(&redact_literals(bounded_sql)), max_chars, input_truncated)
 }
 
 pub fn debug_sql(scope: &str, sql: &str) {
@@ -237,5 +240,24 @@ mod tests {
         let sql = "x".repeat(1_000_000);
         let redacted = redact_sql_for_diagnostics(&sql);
         assert!(redacted.len() <= 550);
+    }
+
+    #[test]
+    fn truncation_inside_unclosed_literal_does_not_leak_prefix() {
+        let sql = format!("select '{}'", "secret-".repeat(1_000));
+        let redacted = truncate_for_diagnostics(redact_literals(bounded_input(&sql, 32).0), 32, true);
+        assert!(!redacted.contains("secret-"));
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(redacted.contains("truncated"));
+    }
+
+    #[test]
+    fn truncation_inside_sensitive_assignment_does_not_leak_prefix() {
+        let sql = format!("password = {}", "secret-token".repeat(1_000));
+        let (bounded, truncated) = bounded_input(&sql, 24);
+        let redacted = truncate_for_diagnostics(redact_sensitive_assignments(&redact_literals(bounded)), 24, truncated);
+        assert!(!redacted.contains("secret-token"));
+        assert!(redacted.contains("password = [REDACTED]"));
+        assert!(redacted.contains("truncated"));
     }
 }

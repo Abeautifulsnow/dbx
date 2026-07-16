@@ -46,8 +46,7 @@ pub enum PoolErrorAction {
     ReconnectAndRetry,
 }
 
-fn query_error_with_omitted_sql_context(error: &str, sql: &str) -> String {
-    crate::sql_diagnostics::debug_sql("query:error", sql);
+fn query_error_with_omitted_sql_context(error: &str, _sql: &str) -> String {
     if error.contains(SQL_OMITTED_ERROR_CONTEXT) {
         error.to_string()
     } else {

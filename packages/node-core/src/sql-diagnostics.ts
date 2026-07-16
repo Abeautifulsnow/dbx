@@ -1,9 +1,22 @@
 const DEFAULT_SQL_DIAGNOSTIC_MAX_CHARS = 512;
 const SENSITIVE_NAME_RE = /(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization|bearer)/i;
 
-function truncateForDiagnostic(value: string, maxChars = DEFAULT_SQL_DIAGNOSTIC_MAX_CHARS): string {
-  if (value.length <= maxChars) return value;
-  return `${value.slice(0, maxChars)}…[truncated ${value.length - maxChars} chars]`;
+function boundedInput(sql: string, maxChars: number): [string, boolean] {
+  if (maxChars <= 0) return ["", sql.length > 0];
+
+  let end = 0;
+  let chars = 0;
+  for (const character of sql) {
+    if (chars === maxChars) return [sql.slice(0, end), true];
+    end += character.length;
+    chars += 1;
+  }
+  return [sql, false];
+}
+
+function truncateForDiagnostic(value: string, maxChars: number, inputTruncated: boolean): string {
+  if (value.length > maxChars) return `${value.slice(0, maxChars)}…[truncated]`;
+  return inputTruncated ? `${value}…[truncated]` : value;
 }
 
 function redactSqlLiterals(sql: string): string {
@@ -97,12 +110,13 @@ function redactSqlLiterals(sql: string): string {
 }
 
 export function redactSqlForDiagnostics(sql: string, maxChars = DEFAULT_SQL_DIAGNOSTIC_MAX_CHARS): string {
-  const literalRedacted = redactSqlLiterals(sql);
+  const [boundedSql, inputTruncated] = boundedInput(sql, maxChars);
+  const literalRedacted = redactSqlLiterals(boundedSql);
   const sensitiveRedacted = literalRedacted.replace(/\b([A-Za-z_][\w.-]*)(\s*[:=]\s*)([^\s,;)]+)/g, (match, key: string, separator: string) => {
     if (!SENSITIVE_NAME_RE.test(key)) return match;
     return `${key}${separator}[REDACTED]`;
   });
-  return truncateForDiagnostic(sensitiveRedacted, maxChars);
+  return truncateForDiagnostic(sensitiveRedacted, maxChars, inputTruncated);
 }
 
 export function sqlDiagnosticsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
