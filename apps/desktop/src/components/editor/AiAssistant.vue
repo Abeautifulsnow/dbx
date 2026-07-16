@@ -1871,6 +1871,7 @@ async function openExternalUrl(url: string) {
                     <ChevronRight class="h-3 w-3 transition-transform duration-200" :class="{ 'rotate-90': reasoningExpanded }" />
                     <Loader2 v-if="msg.isThinking" class="h-3 w-3 animate-spin" />
                     <span>{{ t("ai.reasoningProcess") }}</span>
+                    <span v-if="msg.reasoning && !reasoningExpanded" class="tabular-nums text-muted-foreground/60" :class="{ 'animate-pulse': msg.isThinking }">{{ msg.reasoning.length }} {{ t("ai.chars") }}</span>
                   </button>
                   <div
                     class="overflow-hidden transition-[max-height,opacity] duration-200 ease-in-out"
