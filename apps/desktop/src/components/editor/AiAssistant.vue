@@ -57,7 +57,7 @@ import { useNavigationTargets } from "@/composables/useNavigationTargets";
 import { buildAiContext, runAgentStream, isVectorDbType, isValidActionForMode, defaultActionForMode, type AiAction, type AiAssistantMode, type AiSqlFileContext, type CustomPromptContext } from "@/lib/ai/ai";
 import { orderAiConfigsForDisplay } from "@/lib/ai/aiConfigOrdering";
 import { normalizeClaudeCodeReasoningLevel } from "@/lib/ai/aiModelEffort";
-import { ACTIVE_TEMPLATES_TOTAL_MAX } from "@/types/promptTemplate";
+import { ACTIVE_TEMPLATES_TOTAL_MAX, promptTemplateCharacterCount } from "@/types/promptTemplate";
 
 import type { AgentEvent } from "@/lib/backend/tauri";
 import { buildAiAgentPlan } from "@/lib/ai/aiAgentPlan";
@@ -155,6 +155,14 @@ const showTemplateSelector = ref(false);
 const activeTemplateIds = ref<string[]>([]);
 const activeTemplates = computed(() => promptTemplateStore.templates.filter((t) => activeTemplateIds.value.includes(t.id)));
 
+watch(
+  () => promptTemplateStore.templates,
+  (templates) => {
+    const availableIds = new Set(templates.map((template) => template.id));
+    activeTemplateIds.value = activeTemplateIds.value.filter((id) => availableIds.has(id));
+  },
+);
+
 // Retry store load on selector open if prior init failed (e.g. backend not yet ready at mount)
 watch(showTemplateSelector, (open) => {
   if (open) void promptTemplateStore.ensureLoaded();
@@ -176,8 +184,8 @@ function toggleTemplateId(id: string) {
     // Check total content limit
     const tpl = promptTemplateStore.templates.find((t) => t.id === id);
     if (tpl) {
-      const currentTotal = activeTemplates.value.reduce((sum, t) => sum + t.content.length, 0);
-      if (currentTotal + tpl.content.length > ACTIVE_TEMPLATES_TOTAL_MAX) {
+      const currentTotal = activeTemplates.value.reduce((sum, template) => sum + promptTemplateCharacterCount(template.content), 0);
+      if (currentTotal + promptTemplateCharacterCount(tpl.content) > ACTIVE_TEMPLATES_TOTAL_MAX) {
         toast(t("ai.templateSelectorTooLong", { max: ACTIVE_TEMPLATES_TOTAL_MAX }), 4000);
         return;
       }
@@ -192,10 +200,9 @@ function deselectAllTemplates() {
 
 const templateSelectorLabel = computed(() => {
   if (!promptTemplateStore.isLoaded) return t("ai.templateSelectorLoading");
-  const count = activeTemplateIds.value.length;
+  const count = activeTemplates.value.length;
   if (count === 0) return t("ai.templateSelectorNone");
-  const first = promptTemplateStore.templates.find((t) => t.id === activeTemplateIds.value[0]);
-  const name = first?.name ?? "";
+  const name = activeTemplates.value[0].name;
   if (count === 1) return name;
   return `${name} +${count - 1}`;
 });
@@ -1441,6 +1448,10 @@ async function send() {
   if (!props.connection || !props.tab) return;
   if (!settings.isConfigured) {
     toast(t("ai.noConfig"));
+    return;
+  }
+  if (!(await promptTemplateStore.ensureLoaded())) {
+    toast(t("ai.customInstructionsLoadFailed"), 5000);
     return;
   }
 

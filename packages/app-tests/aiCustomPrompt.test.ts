@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import type { AiContext } from "../../apps/desktop/src/lib/ai/ai.ts";
-import type { PromptTemplate } from "../../apps/desktop/src/types/promptTemplate";
+import { promptTemplateCharacterCount, type PromptTemplate } from "../../apps/desktop/src/types/promptTemplate";
 
 // ---------------------------------------------------------------------------
 // Setup (mirrors existing aiPrompt.test.ts setup)
@@ -69,6 +69,11 @@ function context(overrides: Partial<AiContext> = {}): AiContext {
 function makeTemplate(id: string, name: string, content: string): PromptTemplate {
   return { id, name, content, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
 }
+
+test("prompt template character count matches Rust Unicode scalar counting", () => {
+  assert.strictEqual(promptTemplateCharacterCount("A😀中"), 3);
+  assert.strictEqual(promptTemplateCharacterCount("😀".repeat(8000)), 8000);
+});
 
 // ---------------------------------------------------------------------------
 // Baseline (no custom context) — byte-identical

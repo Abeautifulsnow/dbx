@@ -1574,6 +1574,7 @@ export default withEnglishFallback({
     globalInstructionsSaved: "全局指令已保存",
     globalInstructionsSave: "保存",
     globalInstructionsTooLong: "全局指令过长（最多 {max} 字符）",
+    customInstructionsLoadFailed: "自定义 AI 规范加载失败，请稍后重试。",
     promptTemplates: "场景 Prompt 模板",
     promptTemplatesDescription: "在 AI 助手中选择一个或多个模板，注入场景化的约定规范。",
     promptTemplateNew: "新建模板",

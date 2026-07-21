@@ -8,27 +8,34 @@ export const usePromptTemplateStore = defineStore("promptTemplate", () => {
   const globalInstructions = ref("");
   const isLoaded = ref(false);
   const isLoading = ref(false);
+  let loadPromise: Promise<boolean> | null = null;
 
-  async function init() {
-    if (isLoaded.value || isLoading.value) return;
+  async function init(): Promise<boolean> {
+    if (isLoaded.value) return true;
+    if (loadPromise) return loadPromise;
     isLoading.value = true;
-    try {
-      const [tpls, gi] = await Promise.all([api.loadPromptTemplates(), api.getAiGlobalCustomInstructions()]);
-      templates.value = tpls;
-      globalInstructions.value = gi;
-      isLoaded.value = true;
-    } catch {
-      // Start-up backend unavailable — leave isLoaded=false so consumers
-      // show loading state and ensureLoaded() can retry on user interaction.
-    } finally {
-      isLoading.value = false;
-    }
+    loadPromise = (async () => {
+      try {
+        const [tpls, gi] = await Promise.all([api.loadPromptTemplates(), api.getAiGlobalCustomInstructions()]);
+        templates.value = tpls;
+        globalInstructions.value = gi;
+        isLoaded.value = true;
+        return true;
+      } catch {
+        // Keep failed initialization retryable, but do not let callers send
+        // AI requests with an incomplete global-instructions context.
+        return false;
+      } finally {
+        isLoading.value = false;
+        loadPromise = null;
+      }
+    })();
+    return loadPromise;
   }
 
-  /** Call from consumers when !isLoaded — idempotent retry on prior failure. */
-  async function ensureLoaded() {
-    if (isLoaded.value) return;
-    await init();
+  /** Return whether prompt data is ready; failed initialization remains retryable. */
+  async function ensureLoaded(): Promise<boolean> {
+    return init();
   }
 
   async function save(id: string, name: string, content: string): Promise<PromptTemplate> {

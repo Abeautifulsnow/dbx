@@ -1574,6 +1574,7 @@ export default {
     globalInstructionsSaved: "Global instructions saved",
     globalInstructionsSave: "Save",
     globalInstructionsTooLong: "Global instructions too long (max {max} characters)",
+    customInstructionsLoadFailed: "Failed to load custom AI instructions. Please try again.",
     promptTemplates: "Scenario Prompt Templates",
     promptTemplatesDescription: "Select one or more templates in the AI assistant to inject scenario-specific conventions.",
     promptTemplateNew: "New Template",

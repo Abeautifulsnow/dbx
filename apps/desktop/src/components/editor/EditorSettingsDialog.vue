@@ -124,7 +124,7 @@ import { buildAppSupportInfoRows, formatAppSupportInfoForClipboard, type AppSupp
 import { DateTimePatterns, normalizeSupportedDateTimePattern } from "@/lib/dataGrid/columnFormatter";
 import { MAX_RESULT_PAGE_SIZE, MIN_RESULT_PAGE_SIZE } from "@/lib/dataGrid/paginationPageSize";
 import type { PromptTemplate } from "@/types/promptTemplate";
-import { PROMPT_TEMPLATE_NAME_MAX, PROMPT_TEMPLATE_CONTENT_MAX, GLOBAL_INSTRUCTIONS_MAX } from "@/types/promptTemplate";
+import { GLOBAL_INSTRUCTIONS_MAX, PROMPT_TEMPLATE_CONTENT_MAX, PROMPT_TEMPLATE_NAME_MAX, promptTemplateCharacterCount } from "@/types/promptTemplate";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -2054,11 +2054,11 @@ function templateContentValid(): boolean {
 }
 
 function templateNameTooLong(): boolean {
-  return templateForm.value.name.length > PROMPT_TEMPLATE_NAME_MAX;
+  return promptTemplateCharacterCount(templateForm.value.name) > PROMPT_TEMPLATE_NAME_MAX;
 }
 
 function templateContentTooLong(): boolean {
-  return templateForm.value.content.length > PROMPT_TEMPLATE_CONTENT_MAX;
+  return promptTemplateCharacterCount(templateForm.value.content) > PROMPT_TEMPLATE_CONTENT_MAX;
 }
 
 function localNameDuplicate(): boolean {
@@ -2099,7 +2099,7 @@ async function confirmDeleteTemplate(tpl: PromptTemplate) {
 }
 
 async function saveGlobalInstructions() {
-  if (editGlobalInstructions.value.length > GLOBAL_INSTRUCTIONS_MAX) return;
+  if (promptTemplateCharacterCount(editGlobalInstructions.value) > GLOBAL_INSTRUCTIONS_MAX) return;
   globalInstructionsSaving.value = true;
   try {
     await promptTemplateStore.saveGlobalInstructions(editGlobalInstructions.value);
@@ -2112,7 +2112,7 @@ async function saveGlobalInstructions() {
 }
 
 function globalInstructionsTooLong(): boolean {
-  return editGlobalInstructions.value.length > GLOBAL_INSTRUCTIONS_MAX;
+  return promptTemplateCharacterCount(editGlobalInstructions.value) > GLOBAL_INSTRUCTIONS_MAX;
 }
 
 // AI Config Delete Confirmation
@@ -4660,7 +4660,7 @@ onUnmounted(cleanupPreviewEditor);
                 <textarea v-model="editGlobalInstructions" class="w-full rounded-md border bg-background px-3 py-2 text-xs font-mono resize-y min-h-[80px]" rows="4" :placeholder="t('ai.globalInstructionsDescription')"></textarea>
                 <div class="flex items-center justify-between">
                   <span class="text-xs" :class="globalInstructionsTooLong() ? 'text-destructive' : 'text-muted-foreground'">
-                    {{ t("ai.globalInstructionsCharCount", { count: editGlobalInstructions.length, max: GLOBAL_INSTRUCTIONS_MAX }) }}
+                    {{ t("ai.globalInstructionsCharCount", { count: promptTemplateCharacterCount(editGlobalInstructions), max: GLOBAL_INSTRUCTIONS_MAX }) }}
                   </span>
                   <Button type="button" size="sm" :disabled="globalInstructionsTooLong() || globalInstructionsSaving" @click="saveGlobalInstructions">
                     {{ globalInstructionsSaving ? t("common.processing") : t("ai.globalInstructionsSave") }}
@@ -4715,7 +4715,7 @@ onUnmounted(cleanupPreviewEditor);
                       <p v-if="templateNameTooLong()" class="text-xs text-destructive">{{ t("ai.promptTemplateNameTooLong", { max: PROMPT_TEMPLATE_NAME_MAX }) }}</p>
                       <p v-else-if="localNameDuplicate()" class="text-xs text-destructive">{{ t("ai.promptTemplateNameExists", { name: templateForm.name.trim() }) }}</p>
                       <span v-else></span>
-                      <span class="text-xs" :class="templateForm.name.length > PROMPT_TEMPLATE_NAME_MAX ? 'text-destructive' : 'text-muted-foreground'">{{ templateForm.name.length }}/{{ PROMPT_TEMPLATE_NAME_MAX }}</span>
+                      <span class="text-xs" :class="templateNameTooLong() ? 'text-destructive' : 'text-muted-foreground'">{{ promptTemplateCharacterCount(templateForm.name) }}/{{ PROMPT_TEMPLATE_NAME_MAX }}</span>
                     </div>
                   </div>
                   <div>
@@ -4724,7 +4724,7 @@ onUnmounted(cleanupPreviewEditor);
                     <div class="flex justify-between mt-0.5">
                       <p v-if="templateContentTooLong()" class="text-xs text-destructive">{{ t("ai.promptTemplateTooLong", { max: PROMPT_TEMPLATE_CONTENT_MAX }) }}</p>
                       <span v-else></span>
-                      <span class="text-xs" :class="templateForm.content.length > PROMPT_TEMPLATE_CONTENT_MAX ? 'text-destructive' : 'text-muted-foreground'">{{ templateForm.content.length }}/{{ PROMPT_TEMPLATE_CONTENT_MAX }}</span>
+                      <span class="text-xs" :class="templateContentTooLong() ? 'text-destructive' : 'text-muted-foreground'">{{ promptTemplateCharacterCount(templateForm.content) }}/{{ PROMPT_TEMPLATE_CONTENT_MAX }}</span>
                     </div>
                   </div>
                   <div class="flex justify-end gap-2">
