@@ -1296,6 +1296,7 @@ pub fn run() {
             commands::mongo_cmd::mongo_create_database,
             commands::mongo_cmd::mongo_drop_database,
             commands::mongo_cmd::mongo_drop_collection,
+            commands::mongo_cmd::mongo_rename_collection,
             commands::document_cmd::document_list_databases,
             commands::document_cmd::document_list_collections,
             commands::document_cmd::document_find_documents,

@@ -35,6 +35,7 @@ import {
   PanelRight,
   TableProperties,
   Database,
+  Eraser,
   Columns3,
   PencilRuler,
   WandSparkles,
@@ -492,7 +493,7 @@ function sortMenuItems(column: string, columnIndex: number) {
       currentPageDescending: t("grid.sortCurrentPageDescending"),
       clear: t("grid.clearSort"),
     },
-    icons: { database: Database, ascending: ArrowUp, descending: ArrowDown, clear: ArrowUpDown },
+    icons: { database: Database, ascending: ArrowUp, descending: ArrowDown, clear: Eraser },
   });
 }
 
@@ -2855,6 +2856,17 @@ function startDomCellEdit(rowId: number, columnIndex: number, displayText: strin
   startCellEdit(rowId, columnIndex, cellEditContentNeedsExpandedEditor({ displayText, editText, target: event.currentTarget }));
 }
 
+function showReadonlyCellDetailsOnDblClick(item: RowItem, rowIndex: number, visibleColIdx: number, actualColIdx: number): boolean {
+  if (canEditCellItem(item, actualColIdx)) return false;
+  showCellDetailsForVisibleCell(rowIndex, visibleColIdx, actualColIdx);
+  return true;
+}
+
+function onDomCellDblClick(item: RowItem, rowIndex: number, visibleColIdx: number, actualColIdx: number, event: MouseEvent) {
+  if (showReadonlyCellDetailsOnDblClick(item, rowIndex, visibleColIdx, actualColIdx)) return;
+  startDomCellEdit(item.id, actualColIdx, formatCellCached(item.data[actualColIdx], actualColIdx), event);
+}
+
 function cellEditContentNeedsExpandedEditor(options: { displayText: string; editText: string; target: EventTarget | null }): boolean {
   const text = options.editText || options.displayText;
   if (text.includes("\n") || text.includes("\r")) return true;
@@ -4687,7 +4699,8 @@ function onCanvasDblClick(event: MouseEvent) {
   }
   const item = displayItemAt(hit.rowIndex);
   const actualColIdx = visibleColumnIndexes.value[hit.visibleColIdx];
-  if (!item || actualColIdx === undefined || !canEditCellItem(item, actualColIdx)) return;
+  if (!item || actualColIdx === undefined) return;
+  if (showReadonlyCellDetailsOnDblClick(item, item.displayIndex, hit.visibleColIdx, actualColIdx)) return;
   startCellEdit(item.id, actualColIdx, canvasCellContentOverflows(item, actualColIdx, hit.visibleColIdx));
 }
 
@@ -4976,9 +4989,7 @@ const {
   copyRow,
   copyRowAsInsert,
   copyRowAsInsertWithoutPrimaryKeys,
-  prefetchRowAsInsertStatement,
   canCopyRowAsInsert,
-  prefetchRowAsUpdateStatement,
   copyRowAsUpdate,
   canCopyRowAsInsertWithoutPrimaryKeys,
   canCopyRowAsUpdate,
@@ -4989,10 +5000,7 @@ const {
   copySelectionJson,
   copySelectionSqlInList,
   copySelectionAsInsert,
-  prefetchSelectionAsInsertStatement,
-  canCopyPreparedSelectionInsert,
   canCopySelectionAsInsert,
-  selectionInsertRowCount,
   copySelectedRowsTsv,
   copySelectedRowsTsvWithHeaders,
   copyColumnNames,
@@ -5258,11 +5266,20 @@ function showTransposeCellDetails(rowIndex: number, actualColIdx: number) {
   gridRef.value?.focus({ preventScroll: true });
 }
 
+function onTransposeCellDblClick(rowIndex: number, actualColIdx: number, displayText: string, event: MouseEvent) {
+  const item = displayItemAt(rowIndex);
+  if (!item) return;
+  if (!canEditCellItem(item, actualColIdx)) {
+    showTransposeCellDetails(rowIndex, actualColIdx);
+    return;
+  }
+  startDomCellEdit(item.id, actualColIdx, displayText, event);
+}
+
 function onTransposeCellContext(rowIndex: number, actualColIdx: number, event: MouseEvent) {
   selectTransposeCell(rowIndex, actualColIdx, event);
   const item = displayItemAt(rowIndex);
   contextCell.value = item ? { rowId: item.id, rowIndex, col: actualColIdx } : null;
-  void prefetchCopyStatements();
 }
 
 watch([selectedRange, showCellDetail, isEditingDetail], () => {
@@ -6288,7 +6305,6 @@ function selectTransposeRecord(rowIndex: number, event?: MouseEvent) {
       selectRow(rowIndex);
     }
     contextCell.value = { rowId: item.id, rowIndex, col: -1 };
-    void prefetchCopyStatements();
   }
   gridRef.value?.focus({ preventScroll: true });
 }
@@ -6371,7 +6387,6 @@ function onHeaderContext(col: string, columnIndex: number) {
   }
   contextHeaderColumn.value = col;
   contextHeaderColumnIndex.value = columnIndex;
-  void prefetchCopyStatements();
 }
 async function copyHeaderColumn() {
   if (!contextHeaderColumn.value) return;
@@ -6437,14 +6452,12 @@ function onCellContext(rowId: number, rowIndex: number, colIdx: number, visibleC
   contextHeaderColumnIndex.value = null;
   contextCell.value = { rowId, rowIndex, col: colIdx };
   if (hasRowSelection.value && isRowSelected(rowId)) {
-    void prefetchCopyStatements();
     return;
   }
   clearRowSelection();
   if (!cellIsSelected(rowIndex, visibleColIdx)) {
     selectSingleCell(rowIndex, visibleColIdx);
   }
-  void prefetchCopyStatements();
 }
 
 function onCellEditTextareaInput(event: Event) {
@@ -6579,29 +6592,6 @@ function onRowContext(rowId: number, rowIndex: number) {
     clearCellSelection();
     selectedRowIds.value = new Set([rowId]);
     selection.lastClickedRowIndex.value = rowIndex;
-  }
-  void prefetchCopyStatements();
-}
-
-async function prefetchCopyStatements() {
-  if (canCopySelectionAsInsert.value) {
-    await prefetchSelectionAsInsertStatement();
-    if (selectionInsertRowCount.value > 1 && canCopyPreparedSelectionInsert()) {
-      await prefetchSelectionAsInsertStatement("row-by-row");
-    }
-  }
-  await prefetchRowAsInsertStatement(false);
-  if (isMultiRow.value) {
-    await prefetchRowAsInsertStatement(false, "row-by-row");
-  }
-  if (canCopyRowAsInsertWithoutPrimaryKeys.value) {
-    await prefetchRowAsInsertStatement(true);
-    if (isMultiRow.value) {
-      await prefetchRowAsInsertStatement(true, "row-by-row");
-    }
-  }
-  if (canCopyRowAsUpdate.value) {
-    await prefetchRowAsUpdateStatement();
   }
 }
 
@@ -7287,10 +7277,10 @@ function selectionSubmenu(): ContextMenuItem {
   const insertItems: ContextMenuItem[] =
     selectedCells.value.rows.length > 1
       ? [
-          { label: t("grid.copySelectionInsertMerged"), action: () => copySelectionAsInsert("merged"), disabled: () => !canCopySelectionAsInsert.value || !canCopyPreparedSelectionInsert("merged") },
-          { label: t("grid.copySelectionInsertRowByRow"), action: () => copySelectionAsInsert("row-by-row"), disabled: () => !canCopySelectionAsInsert.value || !canCopyPreparedSelectionInsert("row-by-row") },
+          { label: t("grid.copySelectionInsertMerged"), action: () => void copySelectionAsInsert("merged"), disabled: () => !canCopySelectionAsInsert.value },
+          { label: t("grid.copySelectionInsertRowByRow"), action: () => void copySelectionAsInsert("row-by-row"), disabled: () => !canCopySelectionAsInsert.value },
         ]
-      : [{ label: t("grid.copySelectionInsert"), action: () => copySelectionAsInsert(), disabled: () => !canCopySelectionAsInsert.value || !canCopyPreparedSelectionInsert() }];
+      : [{ label: t("grid.copySelectionInsert"), action: () => void copySelectionAsInsert(), disabled: () => !canCopySelectionAsInsert.value }];
   return {
     label: t("grid.selection"),
     icon: SquareDashed,
@@ -7375,7 +7365,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
         localDescending: t("grid.sortCurrentPageDescending"),
         clearSort: t("grid.clearSort"),
       },
-      icons: { copy: Copy, columnDetails: TableProperties, database: Database, ascending: ArrowUp, descending: ArrowDown, clearSort: ArrowUpDown },
+      icons: { copy: Copy, columnDetails: TableProperties, database: Database, ascending: ArrowUp, descending: ArrowDown, clearSort: Eraser },
       actions: { copyName: copyHeaderColumn, copyNames: copyColumnNames, details: openContextColumnDetailDialog, copyAlterSql: copyAlterColumnSql, sort: applyContextSort },
       filterSubmenu: filterSubmenu(),
     }),
@@ -7716,7 +7706,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                       @mouseenter="onTransposeCellMouseenter(cell.recordIndex, cell.valueIndex)"
                       @mouseleave="onCellMouseleave(cell.recordIndex, cell.valueIndex)"
                       @contextmenu="onTransposeCellContext(cell.recordIndex, cell.valueIndex, $event)"
-                      @dblclick.stop="canEditCellItem(displayItems[cell.recordIndex], cell.valueIndex) && startDomCellEdit(displayItems[cell.recordIndex].id, cell.valueIndex, cell.display, $event)"
+                      @dblclick.stop="onTransposeCellDblClick(cell.recordIndex, cell.valueIndex, cell.display, $event)"
                     >
                       <template v-if="editingCell?.rowId === displayItems[cell.recordIndex]?.id && editingCell?.col === cell.valueIndex">
                         <TemporalCellEditor
@@ -7858,9 +7848,10 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                           :items="sortMenuItems(col.name, col.actualColIdx)"
                           :open="headerSortMenuOpenColumn === col.actualColIdx"
                           :selected-value="selectedSortMenuValue(col.name, col.actualColIdx)"
+                          check-position="none"
                           align="end"
                           content-class="w-max min-w-28 p-0.5"
-                          item-class="gap-1 px-1.5 py-0.5 text-xs"
+                          item-class="gap-1 rounded-none px-1.5 py-0.5 text-xs"
                           item-icon-class="h-3 w-3"
                           :match-trigger-width="false"
                           @update:open="(value: boolean) => (headerSortMenuOpenColumn = value ? col.actualColIdx : null)"
@@ -7869,8 +7860,8 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                           <template #trigger="{ open, toggle }">
                             <button
                               type="button"
-                              class="flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-gray-200 dark:hover:bg-gray-800 hover:text-foreground"
-                              :class="columnIsSorted(col.name, col.actualColIdx) ? 'text-primary opacity-100' : 'opacity-80'"
+                              class="flex h-4 w-4 shrink-0 items-center justify-center rounded"
+                              :class="columnIsSorted(col.name, col.actualColIdx) ? 'bg-primary text-primary-foreground opacity-100 shadow-sm hover:bg-primary/90' : 'text-muted-foreground opacity-80 hover:bg-accent hover:text-foreground'"
                               :title="t('grid.sort')"
                               :aria-expanded="open"
                               @mousedown.stop
@@ -8369,7 +8360,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                       "
                       @mouseenter="onCellMouseenter(item.displayIndex, col.visibleColIdx, col.actualColIdx)"
                       @mouseleave="onCellMouseleave(item.displayIndex, col.actualColIdx)"
-                      @dblclick="canEditCellItem(item, col.actualColIdx) && startDomCellEdit(item.id, col.actualColIdx, formatCellCached(item.data[col.actualColIdx], col.actualColIdx), $event)"
+                      @dblclick="onDomCellDblClick(item, item.displayIndex, col.visibleColIdx, col.actualColIdx, $event)"
                       :data-visible-col-index="col.visibleColIdx"
                       @contextmenu="onCellContext(item.id, item.displayIndex, col.actualColIdx, col.visibleColIdx, $event)"
                     >
