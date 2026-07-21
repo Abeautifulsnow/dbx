@@ -155,6 +155,11 @@ const showTemplateSelector = ref(false);
 const activeTemplateIds = ref<string[]>([]);
 const activeTemplates = computed(() => promptTemplateStore.templates.filter((t) => activeTemplateIds.value.includes(t.id)));
 
+// Retry store load on selector open if prior init failed (e.g. backend not yet ready at mount)
+watch(showTemplateSelector, (open) => {
+  if (open) void promptTemplateStore.ensureLoaded();
+});
+
 function toggleTemplateId(id: string) {
   if (activeTemplateIds.value.includes(id)) {
     activeTemplateIds.value = activeTemplateIds.value.filter((tid) => tid !== id);

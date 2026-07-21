@@ -2090,10 +2090,11 @@ async function saveTemplateForm() {
 async function confirmDeleteTemplate(tpl: PromptTemplate) {
   try {
     await promptTemplateStore.remove(tpl.id);
-    templateDeleteConfirm.value = null;
     toast(t("ai.promptTemplateDeleted"));
   } catch (e: any) {
     toast(e?.message || String(e), 5000);
+  } finally {
+    templateDeleteConfirm.value = null;
   }
 }
 

@@ -7,18 +7,28 @@ export const usePromptTemplateStore = defineStore("promptTemplate", () => {
   const templates = ref<PromptTemplate[]>([]);
   const globalInstructions = ref("");
   const isLoaded = ref(false);
+  const isLoading = ref(false);
 
   async function init() {
-    if (isLoaded.value) return;
+    if (isLoaded.value || isLoading.value) return;
+    isLoading.value = true;
     try {
       const [tpls, gi] = await Promise.all([api.loadPromptTemplates(), api.getAiGlobalCustomInstructions()]);
       templates.value = tpls;
       globalInstructions.value = gi;
       isLoaded.value = true;
     } catch {
-      // If backend is not available yet, leave store unloaded; consumers
-      // will treat it as empty until init succeeds on a later call.
+      // Start-up backend unavailable — leave isLoaded=false so consumers
+      // show loading state and ensureLoaded() can retry on user interaction.
+    } finally {
+      isLoading.value = false;
     }
+  }
+
+  /** Call from consumers when !isLoaded — idempotent retry on prior failure. */
+  async function ensureLoaded() {
+    if (isLoaded.value) return;
+    await init();
   }
 
   async function save(id: string, name: string, content: string): Promise<PromptTemplate> {
@@ -40,11 +50,12 @@ export const usePromptTemplateStore = defineStore("promptTemplate", () => {
   }
 
   async function saveGlobalInstructions(content: string): Promise<void> {
-    await api.setAiGlobalCustomInstructions(content);
-    globalInstructions.value = content;
+    const trimmed = content.trim();
+    await api.setAiGlobalCustomInstructions(trimmed);
+    globalInstructions.value = trimmed;
   }
 
-  return { templates, globalInstructions, isLoaded, init, save, remove, saveGlobalInstructions };
+  return { templates, globalInstructions, isLoaded, isLoading, init, ensureLoaded, save, remove, saveGlobalInstructions };
 });
 
 function sortTemplates(a: PromptTemplate, b: PromptTemplate): number {
