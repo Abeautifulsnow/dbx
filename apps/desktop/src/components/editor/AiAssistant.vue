@@ -160,6 +160,15 @@ watch(showTemplateSelector, (open) => {
   if (open) void promptTemplateStore.ensureLoaded();
 });
 
+// Reset template selection when the user switches to a different connection or database —
+// a new database context warrants a fresh selection of scenario templates.
+watch(
+  () => [props.connection?.id, props.tab?.database],
+  () => {
+    activeTemplateIds.value = [];
+  },
+);
+
 function toggleTemplateId(id: string) {
   if (activeTemplateIds.value.includes(id)) {
     activeTemplateIds.value = activeTemplateIds.value.filter((tid) => tid !== id);
