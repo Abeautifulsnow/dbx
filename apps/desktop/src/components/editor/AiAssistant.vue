@@ -171,7 +171,11 @@ watch(showTemplateSelector, (open) => {
 // Reset template selection when the user switches to a different connection or database —
 // a new database context warrants a fresh selection of scenario templates.
 watch(
-  () => [props.connection?.id, props.tab?.database],
+  // Return a stable primitive key: a fresh array literal is never Object.is-equal to the
+  // previous one, so a getter returning `[id, database]` fires on every dependency
+  // invalidation (e.g. the 30s backup scheduler replacing connection objects) even when the
+  // id/database values are unchanged — spuriously clearing the selection mid agent-run.
+  () => `${props.connection?.id ?? ""}::${props.tab?.database ?? ""}`,
   () => {
     activeTemplateIds.value = [];
   },
