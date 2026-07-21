@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn connection_read_only_errors_use_the_stable_mcp_code() {
-        assert_eq!(connection_read_only_error("write blocked").0, "CONNECTION_READ_ONLY: write blocked");
+        assert_eq!(connection_read_only_error("write blocked").message, "CONNECTION_READ_ONLY: write blocked");
     }
 
     #[test]

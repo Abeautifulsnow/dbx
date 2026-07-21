@@ -209,7 +209,7 @@ mod tests {
 
         let path = match safe_uploaded_sql_path(&tmp_dir, "../outside.sql") {
             Ok(path) => path,
-            Err(error) => panic!("{}", error.0),
+            Err(error) => panic!("{}", error.message),
         };
 
         assert_eq!(path, tmp_dir.join("outside.sql"));

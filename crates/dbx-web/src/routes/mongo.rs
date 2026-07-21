@@ -844,12 +844,12 @@ mod tests {
         let revoked = ensure_find_one_write_policy(&state, &headers, &connection.id, "app", r#"{"_id":1}"#, "Update")
             .await
             .unwrap_err();
-        assert!(revoked.0.starts_with("MCP_READ_ONLY:"), "{}", revoked.0);
+        assert!(revoked.message.starts_with("MCP_READ_ONLY:"), "{}", revoked.message);
 
         state.app.storage.save_mcp_global_policy(&writable_policy).await.unwrap();
         let empty_filter =
             ensure_find_one_write_policy(&state, &headers, &connection.id, "app", "{}", "Delete").await.unwrap_err();
-        assert!(empty_filter.0.starts_with("SQL_BLOCKED:"), "{}", empty_filter.0);
+        assert!(empty_filter.message.starts_with("SQL_BLOCKED:"), "{}", empty_filter.message);
 
         state
             .app
@@ -864,7 +864,7 @@ mod tests {
             ensure_find_one_write_policy(&state, &headers, &connection.id, "app", r#"{"_id":1}"#, "Update")
                 .await
                 .unwrap_err();
-        assert!(production.0.starts_with("PRODUCTION_DATABASE_READ_ONLY:"), "{}", production.0);
+        assert!(production.message.starts_with("PRODUCTION_DATABASE_READ_ONLY:"), "{}", production.message);
 
         state.app.storage.save_connections(std::slice::from_ref(&connection)).await.unwrap();
         state
@@ -880,7 +880,7 @@ mod tests {
         let allowlist = ensure_find_one_write_policy(&state, &headers, &connection.id, "app", r#"{"_id":1}"#, "Delete")
             .await
             .unwrap_err();
-        assert!(allowlist.0.starts_with("CONNECTION_OUT_OF_SCOPE:"), "{}", allowlist.0);
+        assert!(allowlist.message.starts_with("CONNECTION_OUT_OF_SCOPE:"), "{}", allowlist.message);
 
         drop(state);
         let _ = std::fs::remove_dir_all(dir);

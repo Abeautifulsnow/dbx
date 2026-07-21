@@ -4506,7 +4506,6 @@ mod tests {
         let storage = Storage::open(&db).await.unwrap();
 
         // 25 Chinese characters = 75 bytes but only 25 chars — should be allowed under 50 char limit
-        let name25 = "数据库查询规范模板名称测试".to_string(); // 12 chars, let me construct exactly 25
         let name25 = "数".repeat(25); // 25 chars, 75 bytes
         assert_eq!(name25.chars().count(), 25);
         assert!(name25.len() > 50); // byte length exceeds 50

@@ -387,7 +387,7 @@ mod tests {
 
         let error = write_import_upload_stream(chunks, &file_path, 4).await.unwrap_err();
 
-        assert!(error.0.contains("File too large"));
+        assert!(error.message.contains("File too large"));
         assert!(!file_path.exists());
     }
 
@@ -398,7 +398,7 @@ mod tests {
 
         let error = write_import_upload_stream(chunks, &file_path, 8).await.unwrap_err();
 
-        assert_eq!(error.0, "multipart stream failed");
+        assert_eq!(error.message, "multipart stream failed");
         assert!(!file_path.exists());
     }
 }

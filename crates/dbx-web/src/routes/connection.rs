@@ -512,13 +512,13 @@ mod tests {
             Json(ConnectRequest { config: config.clone(), client_attempt: None }),
         )
         .await
-        .unwrap_or_else(|error| panic!("{}", error.0));
+        .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(legacy.0, "Connection successful");
 
         let detailed =
             test_connection_with_info(State(state.clone()), Json(ConnectRequest { config, client_attempt: None }))
                 .await
-                .unwrap_or_else(|error| panic!("{}", error.0));
+                .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(detailed.0.message, "Connection successful");
         assert_eq!(detailed.0.database_info, None);
         assert!(state.app.configs.read().await.keys().all(|key| !key.starts_with("__test_")));
@@ -550,7 +550,7 @@ mod tests {
             connect_db(State(state.clone()), Json(ConnectRequest { config: invalid.clone(), client_attempt: None }))
                 .await
                 .unwrap_err();
-        assert!(connect_error.0.contains("in-memory main database"), "{}", connect_error.0);
+        assert!(connect_error.message.contains("in-memory main database"), "{}", connect_error.message);
 
         invalid.transport_layers.push(TransportLayerConfig::Proxy(ProxyTunnelConfig {
             id: "proxy".to_string(),
@@ -569,7 +569,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(proxy_error.0.contains("in-memory main database"), "{}", proxy_error.0);
+        assert!(proxy_error.message.contains("in-memory main database"), "{}", proxy_error.message);
 
         assert!(state.app.connections.read().await.contains_key(&initial.id));
         assert_eq!(state.app.configs.read().await.get(&initial.id), Some(&initial));
@@ -685,7 +685,7 @@ mod tests {
             Json(McpRemoveConnectionRequest { connection_id: removed.id.clone() }),
         )
         .await
-        .unwrap_or_else(|error| panic!("{}", error.0));
+        .unwrap_or_else(|error| panic!("{}", error.message));
         assert!(removed_result.0);
         assert_eq!(state.app.storage.load_connections().await.unwrap()[0].id, kept.id);
 
@@ -695,7 +695,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(scope_error.0.starts_with("CONNECTION_OUT_OF_SCOPE:"));
+        assert!(scope_error.message.starts_with("CONNECTION_OUT_OF_SCOPE:"));
 
         state
             .app
@@ -713,7 +713,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(read_only_error.0.starts_with("MCP_READ_ONLY:"));
+        assert!(read_only_error.message.starts_with("MCP_READ_ONLY:"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
