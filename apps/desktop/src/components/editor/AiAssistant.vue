@@ -47,15 +47,17 @@ import { useSettingsStore, AI_PROVIDER_PRESETS, normalizeAiConfig } from "@/stor
 import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
+import { usePromptTemplateStore } from "@/stores/promptTemplateStore";
 import { connectionIconType } from "@/lib/connection/connectionPresentation";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import ConnectionGroupBadge from "@/components/connection/ConnectionGroupBadge.vue";
 import { useQueryStore } from "@/stores/queryStore";
 import { useToast } from "@/composables/useToast";
 import { useNavigationTargets } from "@/composables/useNavigationTargets";
-import { buildAiContext, runAgentStream, isVectorDbType, isValidActionForMode, defaultActionForMode, type AiAction, type AiAssistantMode, type AiSqlFileContext } from "@/lib/ai/ai";
+import { buildAiContext, runAgentStream, isVectorDbType, isValidActionForMode, defaultActionForMode, type AiAction, type AiAssistantMode, type AiSqlFileContext, type CustomPromptContext } from "@/lib/ai/ai";
 import { orderAiConfigsForDisplay } from "@/lib/ai/aiConfigOrdering";
 import { normalizeClaudeCodeReasoningLevel } from "@/lib/ai/aiModelEffort";
+import { ACTIVE_TEMPLATES_TOTAL_MAX } from "@/types/promptTemplate";
 
 import type { AgentEvent } from "@/lib/backend/tauri";
 import { buildAiAgentPlan } from "@/lib/ai/aiAgentPlan";
@@ -85,6 +87,7 @@ const { t } = useI18n();
 const settings = useSettingsStore();
 const connectionStore = useConnectionStore();
 const savedSqlStore = useSavedSqlStore();
+const promptTemplateStore = usePromptTemplateStore();
 const queryStore = useQueryStore();
 const { openTableTarget } = useNavigationTargets({
   showFieldLineageDialog: ref(false),
@@ -146,6 +149,42 @@ const currentSessionId = ref("");
 const conversationId = ref("");
 const conversations = ref<AiConversation[]>([]);
 const showConversationList = ref(false);
+const showTemplateSelector = ref(false);
+
+// Prompt template selection (panel-session scope)
+const activeTemplateIds = ref<string[]>([]);
+const activeTemplates = computed(() => promptTemplateStore.templates.filter((t) => activeTemplateIds.value.includes(t.id)));
+
+function toggleTemplateId(id: string) {
+  if (activeTemplateIds.value.includes(id)) {
+    activeTemplateIds.value = activeTemplateIds.value.filter((tid) => tid !== id);
+  } else {
+    // Check total content limit
+    const tpl = promptTemplateStore.templates.find((t) => t.id === id);
+    if (tpl) {
+      const currentTotal = activeTemplates.value.reduce((sum, t) => sum + t.content.length, 0);
+      if (currentTotal + tpl.content.length > ACTIVE_TEMPLATES_TOTAL_MAX) {
+        toast(t("ai.templateSelectorTooLong", { max: ACTIVE_TEMPLATES_TOTAL_MAX }), 4000);
+        return;
+      }
+    }
+    activeTemplateIds.value = [...activeTemplateIds.value, id];
+  }
+}
+
+function deselectAllTemplates() {
+  activeTemplateIds.value = [];
+}
+
+const templateSelectorLabel = computed(() => {
+  if (!promptTemplateStore.isLoaded) return t("ai.templateSelectorLoading");
+  const count = activeTemplateIds.value.length;
+  if (count === 0) return t("ai.templateSelectorNone");
+  const first = promptTemplateStore.templates.find((t) => t.id === activeTemplateIds.value[0]);
+  const name = first?.name ?? "";
+  if (count === 1) return name;
+  return `${name} +${count - 1}`;
+});
 const promptTextareaRef = ref<HTMLTextAreaElement | null>(null);
 const shouldAutoScroll = ref(true);
 const userPausedAutoScroll = ref(false);
@@ -1428,6 +1467,10 @@ async function send() {
       sqlFiles,
     });
     const history: AiMessage[] = messagesForAgentHistory(messages.value.slice(0, -2));
+    const customPromptContext: CustomPromptContext = {
+      globalInstructions: promptTemplateStore.globalInstructions,
+      activeTemplates: activeTemplates.value,
+    };
     await runAgentStream(
       {
         config: activeFullConfig.value!,
@@ -1472,6 +1515,7 @@ async function send() {
         scrollToBottom();
       },
       sessionId,
+      customPromptContext,
     );
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : String(e);
@@ -2105,6 +2149,44 @@ async function openExternalUrl(url: string) {
             @keydown="onPromptKeydown"
           />
           <div class="flex min-w-0 flex-nowrap items-center gap-1.5 overflow-hidden">
+            <!-- Template selector -->
+            <Popover v-model:open="showTemplateSelector">
+              <PopoverTrigger as-child>
+                <button type="button" class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground">
+                  <FileCode class="h-3 w-3" />
+                  {{ t("ai.templateSelectorLabel", { label: templateSelectorLabel }) }}
+                  <svg class="h-3 w-3 shrink-0 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" /></svg>
+                </button>
+              </PopoverTrigger>
+              <PopoverContent align="start" class="w-64 gap-0 p-1.5">
+                <div class="max-h-64 overflow-auto">
+                  <div v-if="!promptTemplateStore.isLoaded" class="px-3 py-4 text-center text-xs text-muted-foreground">
+                    {{ t("ai.templateSelectorLoading") }}
+                  </div>
+                  <div v-else-if="promptTemplateStore.templates.length === 0" class="px-3 py-4 text-center text-xs text-muted-foreground">
+                    {{ t("ai.templateSelectorEmpty") }}
+                  </div>
+                  <template v-else>
+                    <template v-for="tpl in promptTemplateStore.templates" :key="tpl.id">
+                      <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-muted" @click="toggleTemplateId(tpl.id)">
+                        <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="activeTemplateIds.includes(tpl.id) ? 'border-primary bg-primary text-primary-foreground' : ''">
+                          <Check v-if="activeTemplateIds.includes(tpl.id)" class="h-3 w-3" />
+                        </div>
+                        <div class="flex-1 truncate text-left">
+                          <div class="font-medium">{{ tpl.name }}</div>
+                          <div class="text-[10px] text-muted-foreground truncate">{{ tpl.content.slice(0, 60) }}</div>
+                        </div>
+                      </button>
+                    </template>
+                  </template>
+                </div>
+                <div v-if="promptTemplateStore.isLoaded && promptTemplateStore.templates.length > 0" class="border-t mt-1 pt-1 px-1">
+                  <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" @click="deselectAllTemplates">
+                    {{ t("ai.templateSelectorDeselectAll") }}
+                  </button>
+                </div>
+              </PopoverContent>
+            </Popover>
             <LightDropdown
               v-model="assistantMode"
               :items="assistantModeItems"

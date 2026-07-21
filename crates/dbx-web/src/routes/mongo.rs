@@ -18,7 +18,7 @@ pub struct MongoParseShellCommandRequest {
 pub async fn parse_shell_command(
     Json(req): Json<MongoParseShellCommandRequest>,
 ) -> Result<Json<dbx_core::mongo_shell::MongoCommand>, AppError> {
-    dbx_core::mongo_shell::parse(&req.source).map(Json).map_err(AppError)
+    dbx_core::mongo_shell::parse(&req.source).map(Json).map_err(AppError::from)
 }
 
 async fn run_cancellable<T, F>(state: &Arc<WebState>, execution_id: Option<String>, future: F) -> Result<T, AppError>
@@ -33,11 +33,11 @@ where
         let token = query.token();
         tokio::select! {
             biased;
-            _ = token.cancelled() => Err(AppError(dbx_core::query::canceled_error())),
-            result = future => result.map_err(AppError),
+            _ = token.cancelled() => Err(AppError::from(dbx_core::query::canceled_error())),
+            result = future => result.map_err(AppError::from),
         }
     } else {
-        future.await.map_err(AppError)
+        future.await.map_err(AppError::from)
     }
 }
 
@@ -48,7 +48,7 @@ async fn ensure_writable(
     action: &str,
 ) -> Result<(), AppError> {
     if let Some(name) = dbx_core::query::connection_readonly_name(app, connection_id).await {
-        return Err(AppError(format!(
+        return Err(AppError::from(format!(
             "Read-only mode: connection '{}' has read-only protection enabled. {} blocked.",
             name, action
         )));
@@ -275,7 +275,7 @@ pub async fn list_databases(
 ) -> Result<Json<Vec<String>>, AppError> {
     super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
     let result =
-        dbx_core::mongo_ops::mongo_list_databases_core(&state.app, &req.connection_id).await.map_err(AppError)?;
+        dbx_core::mongo_ops::mongo_list_databases_core(&state.app, &req.connection_id).await.map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -287,7 +287,7 @@ pub async fn list_collections(
     super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
     let result = dbx_core::mongo_ops::mongo_list_collections_core(&state.app, &req.connection_id, &req.database)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -310,7 +310,7 @@ pub async fn vector_collection_detail(
         &req.collection,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -321,7 +321,7 @@ pub async fn create_database(
     ensure_writable(&state.app, &req.connection_id, "Create database").await?;
     dbx_core::mongo_ops::mongo_create_database_core(&state.app, &req.connection_id, &req.database)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -332,7 +332,7 @@ pub async fn drop_database(
     ensure_writable(&state.app, &req.connection_id, "Drop database").await?;
     dbx_core::mongo_ops::mongo_drop_database_core(&state.app, &req.connection_id, &req.database)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -346,7 +346,7 @@ pub async fn drop_collection(
     ensure_writable(&state.app, &req.connection_id, "Drop collection").await?;
     dbx_core::mongo_ops::mongo_drop_collection_core(&state.app, &req.connection_id, &req.database, &req.collection)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -372,7 +372,7 @@ pub async fn find_documents(
         ),
     )
     .await?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn find_one(
@@ -393,7 +393,7 @@ pub async fn find_one(
         ),
     )
     .await?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn count_documents(
@@ -430,7 +430,7 @@ pub async fn server_version(
         dbx_core::mongo_ops::mongo_server_version_core(&state.app, &req.connection_id, &req.database),
     )
     .await?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn collection_stats(
@@ -451,7 +451,7 @@ pub async fn collection_stats(
         ),
     )
     .await?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn aggregate_documents(
@@ -492,7 +492,7 @@ pub async fn aggregate_documents(
         ),
     )
     .await?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn distinct(
@@ -514,7 +514,7 @@ pub async fn distinct(
         ),
     )
     .await?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn create_index(
@@ -534,7 +534,7 @@ pub async fn create_index(
         req.options_json.as_deref(),
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "name": name })))
 }
 
@@ -555,8 +555,8 @@ pub async fn drop_indexes(
         req.single,
     )
     .await
-    .map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn insert_document(
@@ -573,7 +573,7 @@ pub async fn insert_document(
         None,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -592,7 +592,7 @@ pub async fn insert_documents(
         &req.docs_json,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "affected_rows": result })))
 }
 
@@ -611,7 +611,7 @@ pub async fn update_document(
         req.routing.as_deref(),
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -638,7 +638,7 @@ pub async fn update_documents(
         req.options_json.as_deref(),
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "affected_rows": result })))
 }
 
@@ -660,8 +660,8 @@ pub async fn find_one_and_update(
         req.options_json.as_deref(),
     )
     .await
-    .map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn find_one_and_replace(
@@ -682,8 +682,8 @@ pub async fn find_one_and_replace(
         req.options_json.as_deref(),
     )
     .await
-    .map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn find_one_and_delete(
@@ -703,8 +703,8 @@ pub async fn find_one_and_delete(
         req.options_json.as_deref(),
     )
     .await
-    .map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn delete_document(
@@ -721,7 +721,7 @@ pub async fn delete_document(
         req.routing.as_deref(),
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -746,7 +746,7 @@ pub async fn delete_documents(
         req.many,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "affected_rows": result })))
 }
 

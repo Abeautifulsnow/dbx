@@ -63,7 +63,7 @@ pub async fn get_driver_store_usage(State(state): State<Arc<WebState>>) -> Resul
 pub async fn clear_driver_download_cache(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    clear_agent_download_cache(&state.app.agent_manager).map_err(AppError)?;
+    clear_agent_download_cache(&state.app.agent_manager).map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -83,7 +83,7 @@ pub async fn stop_driver_runtime(
     State(state): State<Arc<WebState>>,
     Json(req): Json<DriverRuntimeRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    dbx_core::driver_runtime::stop_driver_runtime(&state.app, &req.runtime_id).await.map_err(AppError)?;
+    dbx_core::driver_runtime::stop_driver_runtime(&state.app, &req.runtime_id).await.map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -91,7 +91,7 @@ pub async fn restart_driver_runtime(
     State(state): State<Arc<WebState>>,
     Json(req): Json<DriverRuntimeRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    dbx_core::driver_runtime::restart_driver_runtime(&state.app, &req.runtime_id).await.map_err(AppError)?;
+    dbx_core::driver_runtime::restart_driver_runtime(&state.app, &req.runtime_id).await.map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -99,32 +99,32 @@ pub async fn install_agent(
     State(state): State<Arc<WebState>>,
     Json(req): Json<AgentTypeRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    ensure_no_agent_update_blockers(&state.app, std::slice::from_ref(&req.db_type)).await.map_err(AppError)?;
+    ensure_no_agent_update_blockers(&state.app, std::slice::from_ref(&req.db_type)).await.map_err(AppError::from)?;
     let tx = progress_sender(&state, "global").await;
     install_agent_driver(&state.app.agent_manager, &req.db_type, |event| send_progress_event(&tx, event))
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn upgrade_all_agents(State(state): State<Arc<WebState>>) -> Result<Json<serde_json::Value>, AppError> {
-    let registry = fetch_registry().await.map_err(AppError)?;
+    let registry = fetch_registry().await.map_err(AppError::from)?;
     let agents = build_agent_list(&state.app.agent_manager, Some(&registry));
     let updatable: Vec<String> =
         agents.iter().filter(|agent| agent.update_available).map(|agent| agent.db_type.clone()).collect();
-    ensure_no_agent_update_blockers(&state.app, &updatable).await.map_err(AppError)?;
+    ensure_no_agent_update_blockers(&state.app, &updatable).await.map_err(AppError::from)?;
     let tx = progress_sender(&state, "global").await;
     let result = upgrade_all_agent_drivers(&state.app.agent_manager, |event| send_progress_event(&tx, event))
         .await
-        .map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|err| AppError(err.to_string()))?))
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|err| AppError::from(err.to_string()))?))
 }
 
 pub async fn uninstall_agent(
     State(state): State<Arc<WebState>>,
     Json(req): Json<AgentTypeRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    uninstall_agent_driver(&state.app.agent_manager, &req.db_type).await.map_err(AppError)?;
+    uninstall_agent_driver(&state.app.agent_manager, &req.db_type).await.map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -142,7 +142,7 @@ pub async fn set_agent_java_runtime_config(
     let mut config = req.config;
     if config.mode == JavaRuntimeMode::Custom || config.mode == JavaRuntimeMode::System {
         let candidate_state = AgentState { java_runtime: config.clone(), ..am.load_state() };
-        let resolved = am.resolve_java_runtime(&candidate_state, DEFAULT_JRE_KEY).map_err(AppError)?;
+        let resolved = am.resolve_java_runtime(&candidate_state, DEFAULT_JRE_KEY).map_err(AppError::from)?;
         if config.mode == JavaRuntimeMode::Custom {
             config.custom_java_path = Some(resolved.to_string_lossy().to_string());
         }
@@ -153,7 +153,7 @@ pub async fn set_agent_java_runtime_config(
 
     let mut local_state = am.load_state();
     local_state.java_runtime = config.clone();
-    am.save_state(&local_state).map_err(AppError)?;
+    am.save_state(&local_state).map_err(AppError::from)?;
     am.stop_daemons().await;
     Ok(Json(config))
 }
@@ -168,27 +168,27 @@ pub async fn import_agents_from_zip(
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tmp_dir = state.data_dir.join("tmp");
-    std::fs::create_dir_all(&tmp_dir).map_err(|err| AppError(err.to_string()))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|err| AppError::from(err.to_string()))?;
 
-    if let Some(field) = multipart.next_field().await.map_err(|err| AppError(err.to_string()))? {
+    if let Some(field) = multipart.next_field().await.map_err(|err| AppError::from(err.to_string()))? {
         let file_name = field.file_name().unwrap_or("offline-drivers.zip").to_string();
         if !file_name.to_ascii_lowercase().ends_with(".zip") {
-            return Err(AppError("Offline driver package must be a .zip file".to_string()));
+            return Err(AppError::from("Offline driver package must be a .zip file".to_string()));
         }
 
         let zip_path = tmp_dir.join(format!("agent-offline-{}.zip", uuid::Uuid::new_v4()));
-        let mut upload = tokio::fs::File::create(&zip_path).await.map_err(|err| AppError(err.to_string()))?;
+        let mut upload = tokio::fs::File::create(&zip_path).await.map_err(|err| AppError::from(err.to_string()))?;
         let mut field = field;
-        while let Some(chunk) = field.chunk().await.map_err(|err| AppError(err.to_string()))? {
-            upload.write_all(&chunk).await.map_err(|err| AppError(err.to_string()))?;
+        while let Some(chunk) = field.chunk().await.map_err(|err| AppError::from(err.to_string()))? {
+            upload.write_all(&chunk).await.map_err(|err| AppError::from(err.to_string()))?;
         }
-        upload.flush().await.map_err(|err| AppError(err.to_string()))?;
+        upload.flush().await.map_err(|err| AppError::from(err.to_string()))?;
         drop(upload);
 
         let tx = progress_sender(&state, "global").await;
         let result =
             import_agents_from_zip_core(&state.app.agent_manager, &zip_path, |event| send_progress_event(&tx, event))
-                .map_err(AppError);
+                .map_err(AppError::from);
         let _ = std::fs::remove_file(&zip_path);
 
         let result = result?;
@@ -196,7 +196,7 @@ pub async fn import_agents_from_zip(
         return Ok(Json(serde_json::json!({ "count": result.drivers_installed.len() as u32 })));
     }
 
-    Err(AppError("No file uploaded".to_string()))
+    Err(AppError::from("No file uploaded".to_string()))
 }
 
 pub async fn import_agent_jar(
@@ -210,23 +210,23 @@ pub async fn import_agent_jar(
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
         if name == "dbType" {
-            db_type = Some(field.text().await.map_err(|e| AppError(e.to_string()))?);
+            db_type = Some(field.text().await.map_err(|e| AppError::from(e.to_string()))?);
         } else if name == "file" {
             jar_name = field.file_name().unwrap_or("driver.jar").to_string();
             if !jar_name.to_lowercase().ends_with(".jar") {
-                return Err(AppError("Only .jar files can be imported".to_string()));
+                return Err(AppError::from("Only .jar files can be imported".to_string()));
             }
-            jar_data = Some(field.bytes().await.map_err(|e| AppError(e.to_string()))?.to_vec());
+            jar_data = Some(field.bytes().await.map_err(|e| AppError::from(e.to_string()))?.to_vec());
         }
     }
 
-    let db_type = db_type.ok_or_else(|| AppError("Missing dbType field".to_string()))?;
-    let data = jar_data.ok_or_else(|| AppError("No file uploaded".to_string()))?;
+    let db_type = db_type.ok_or_else(|| AppError::from("Missing dbType field".to_string()))?;
+    let data = jar_data.ok_or_else(|| AppError::from("No file uploaded".to_string()))?;
 
     let temp_dir = state.app.plugins.root_dir().join("jar_upload_tmp");
-    std::fs::create_dir_all(&temp_dir).map_err(|e| AppError(e.to_string()))?;
+    std::fs::create_dir_all(&temp_dir).map_err(|e| AppError::from(e.to_string()))?;
     let tmp_path = temp_dir.join(&jar_name);
-    std::fs::write(&tmp_path, &data).map_err(|e| AppError(e.to_string()))?;
+    std::fs::write(&tmp_path, &data).map_err(|e| AppError::from(e.to_string()))?;
 
     dbx_core::agent_service::import_agent_jar(&state.app.agent_manager, &db_type, &tmp_path).map_err(AppError::from)?;
     let _ = std::fs::remove_file(&tmp_path);
@@ -242,7 +242,7 @@ pub async fn reinstall_jre(
         send_progress_event(&tx, event);
     })
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -251,7 +251,7 @@ pub async fn uninstall_jre(
     Json(req): Json<JreRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let key = req.jre_key.as_deref().unwrap_or(DEFAULT_JRE_KEY);
-    uninstall_agent_jre(&state.app.agent_manager, key).await.map_err(AppError)?;
+    uninstall_agent_jre(&state.app.agent_manager, key).await.map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

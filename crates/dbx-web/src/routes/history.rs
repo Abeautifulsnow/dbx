@@ -25,7 +25,7 @@ pub async fn save_history(
     State(state): State<Arc<WebState>>,
     Json(body): Json<SaveHistoryRequest>,
 ) -> Result<Json<()>, AppError> {
-    state.app.storage.save_history_entry(&body.entry).await.map_err(AppError)?;
+    state.app.storage.save_history_entry(&body.entry).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -35,12 +35,13 @@ pub async fn load_history(
 ) -> Result<Json<Vec<HistoryEntry>>, AppError> {
     let limit = q.limit.unwrap_or(100);
     let offset = q.offset.unwrap_or(0);
-    let entries = state.app.storage.load_history_entries(limit, offset, q.activity_kind).await.map_err(AppError)?;
+    let entries =
+        state.app.storage.load_history_entries(limit, offset, q.activity_kind).await.map_err(AppError::from)?;
     Ok(Json(entries))
 }
 
 pub async fn clear_history(State(state): State<Arc<WebState>>) -> Result<Json<()>, AppError> {
-    state.app.storage.clear_history().await.map_err(AppError)?;
+    state.app.storage.clear_history().await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -48,6 +49,6 @@ pub async fn delete_history_entry(
     State(state): State<Arc<WebState>>,
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
-    state.app.storage.delete_history_entry(&id).await.map_err(AppError)?;
+    state.app.storage.delete_history_entry(&id).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
