@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
-use dbx_core::history::HistoryEntry;
+use dbx_core::history::{HistoryConnectionOption, HistoryEntry, HistorySearchRequest, HistorySearchResult};
 use serde::Deserialize;
 
 use crate::error::AppError;
@@ -38,6 +38,19 @@ pub async fn load_history(
     let entries =
         state.app.storage.load_history_entries(limit, offset, q.activity_kind).await.map_err(AppError::from)?;
     Ok(Json(entries))
+}
+
+pub async fn search_history(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<HistorySearchRequest>,
+) -> Result<Json<HistorySearchResult>, AppError> {
+    state.app.storage.search_history_entries(request).await.map(Json).map_err(AppError)
+}
+
+pub async fn load_history_connection_options(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<Vec<HistoryConnectionOption>>, AppError> {
+    state.app.storage.load_history_connection_options().await.map(Json).map_err(AppError)
 }
 
 pub async fn clear_history(State(state): State<Arc<WebState>>) -> Result<Json<()>, AppError> {

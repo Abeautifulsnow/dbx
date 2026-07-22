@@ -78,6 +78,9 @@ import type {
   MongoCollectionStatsResult,
   MongoGridFsBucketInfo,
   HistoryEntry,
+  HistorySearchRequest,
+  HistorySearchResult,
+  HistoryConnectionOption,
   SqlFileRequest,
   SqlFilePreview,
   SqlFileProgress,
@@ -2287,6 +2290,14 @@ export async function loadHistory(limit: number, offset: number, activityKind?: 
   return get(`/api/history?${qs({ limit, offset, activity_kind: activityKind })}`);
 }
 
+export async function searchHistory(request: HistorySearchRequest): Promise<HistorySearchResult> {
+  return post("/api/history/search", request);
+}
+
+export async function loadHistoryConnectionOptions(): Promise<HistoryConnectionOption[]> {
+  return get("/api/history/options");
+}
+
 export async function loadRedisHistory(limit = 100, offset = 0): Promise<HistoryEntry[]> {
   return loadHistory(limit, offset, "redis_command");
 }
@@ -2308,8 +2319,11 @@ export async function deleteHistoryEntry(id: string): Promise<void> {
 // Updates
 // ---------------------------------------------------------------------------
 
-export async function checkForUpdates(locale?: string): Promise<UpdateInfo> {
-  const query = locale ? `?locale=${encodeURIComponent(locale)}` : "";
+export async function checkForUpdates(locale?: string, source?: UpdateDownloadSource): Promise<UpdateInfo> {
+  const params = new URLSearchParams();
+  if (locale) params.set("locale", locale);
+  if (source) params.set("source", source);
+  const query = params.size > 0 ? `?${params.toString()}` : "";
   return get(`/api/update/check${query}`);
 }
 

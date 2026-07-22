@@ -3,6 +3,7 @@ import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, sha
 import { CaseLower, CaseUpper, Code2, FileCode, Pencil, PencilRuler, Play, Copy, List, Search, Sparkles, Table2, TextSelect, Trash2 } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import type { CompletionContext } from "@codemirror/autocomplete";
+import { Transaction } from "@codemirror/state";
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { search as cmSearch } from "@codemirror/search";
 import EditorSearchPanel from "./EditorSearchPanel.vue";
@@ -68,12 +69,14 @@ import { focusEditorView } from "@/lib/editor/queryEditorFocus";
 import { createDbxCodeMirrorSqlDialect } from "@/lib/editor/codemirrorSqlDialect";
 import { sqlSemanticTableNameSpansForSyntaxTree } from "@/lib/editor/codemirrorSqlSemanticHighlight";
 import { startsQueryEditorRectangularSelection } from "@/lib/editor/queryEditorPointerSelection";
+import { LARGE_PASTE_HISTORY_USER_EVENT, normalizeQueryEditorPasteText, recoverableNativePasteSuffix, shouldRecoverLargeTauriPaste } from "@/lib/editor/queryEditorLargePaste";
 import type { StatementExecutionMarker } from "@/lib/tabs/tabPresentation";
 import { isSchemaAware, isSingleDatabase, supportsSqlInListPaste } from "@/lib/database/databaseFeatureSupport";
 import { metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { usesLocalOnlyEditorCompletionMetadata, usesOnDemandOnlyEditorColumnMetadata } from "@/lib/metadata/completionMetadataPolicy";
 import { queryContextObjectActions, queryContextObjectRoute, queryTableCandidateAtSqlPosition, resolveQueryContextCandidateDatabase, resolveQueryContextObjectTarget, type QueryContextObjectAction } from "@/lib/sql/queryCursorTableTarget";
 import * as api from "@/lib/backend/api";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import {
   areSqlSemanticDiagnosticsEqual,
   buildSqlParserErrorDiagnostic,
@@ -1000,6 +1003,44 @@ async function pasteClipboardAsSqlInCondition(): Promise<boolean> {
   });
   currentView.focus();
   toast(t("editor.exPastePasted", { count: result.valueCount }), 2000);
+  return true;
+}
+
+function recoverLargeTauriPaste(event: ClipboardEvent, currentView: EditorViewType): boolean {
+  const eventText = event.clipboardData?.getData("text/plain") ?? "";
+  if (props.readOnly || currentView.state.selection.ranges.length !== 1 || !shouldRecoverLargeTauriPaste(eventText, isTauriRuntime())) return false;
+
+  event.preventDefault();
+  const selection = currentView.state.selection.main;
+  const insertedText = normalizeQueryEditorPasteText(eventText);
+  const insertedFrom = selection.from;
+  const insertedTo = insertedFrom + insertedText.length;
+  const pasteStartedAt = Date.now();
+  currentView.dispatch({
+    changes: { from: selection.from, to: selection.to, insert: insertedText },
+    selection: { anchor: insertedTo },
+    scrollIntoView: true,
+    // CodeMirror only joins input.type history events; keep one timestamp so delayed recovery is one undo step.
+    annotations: Transaction.time.of(pasteStartedAt),
+    userEvent: LARGE_PASTE_HISTORY_USER_EVENT,
+  });
+
+  void readTextFromClipboard()
+    .then((nativeText) => {
+      const suffix = recoverableNativePasteSuffix(eventText, nativeText);
+      if (!suffix || props.readOnly || view.value !== currentView) return;
+      if (currentView.state.doc.sliceString(insertedFrom, insertedTo) !== insertedText) return;
+      const currentSelection = currentView.state.selection.main;
+      const selectionRemainedAtPasteEnd = currentSelection.empty && currentSelection.head === insertedTo;
+      currentView.dispatch({
+        changes: { from: insertedTo, insert: suffix },
+        ...(selectionRemainedAtPasteEnd ? { selection: { anchor: insertedTo + suffix.length } } : {}),
+        scrollIntoView: selectionRemainedAtPasteEnd,
+        annotations: Transaction.time.of(pasteStartedAt),
+        userEvent: LARGE_PASTE_HISTORY_USER_EVENT,
+      });
+    })
+    .catch(() => {});
   return true;
 }
 
@@ -3567,6 +3608,9 @@ onMounted(async () => {
         }),
       ),
       EditorView.domEventHandlers({
+        paste(event, currentView) {
+          return recoverLargeTauriPaste(event, currentView);
+        },
         dragover(event) {
           if (props.readOnly || !hasDroppedTableReference(event)) return false;
           event.preventDefault();

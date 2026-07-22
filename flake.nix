@@ -160,9 +160,9 @@
         #   3. pnpm build      → compile Vue/TypeScript frontend               #
         #   4. cargo build -p dbx → compile Tauri Rust backend                 #
         #                                                                      #
-        # ⚠️  The pnpmDeps.hash below is a placeholder.                       #
-        #    Run `nix build .#dbx-desktop` once; Nix will report the          #
-        #    correct sha256 — paste it in place of the placeholder.           #
+        # The pnpmDeps hash is verified by the nix-packaging CI job.           #
+        # When dependency inputs change, use the hash reported by the failed  #
+        # Nix build and rerun the job before merging.                          #
         # ------------------------------------------------------------------ #
         packages.dbx-desktop = pkgs.stdenv.mkDerivation (finalAttrs: {
           pname = "dbx-desktop";
@@ -177,7 +177,7 @@
             inherit (finalAttrs) pname version src;
             # `fetcherVersion = 4` is supported for `pnpm_11`
             fetcherVersion = 4;
-            # Replace with the correct hash after the first failed build:
+            # Update with the hash reported by a failed fixed-output build:
             #   nix build .#dbx-desktop 2>&1 | grep 'got:'
             hash = "sha256-xRnzwsiLazZVedPCOnRha2f1fos3uEO+UuNRaWJhQ6I=";
           };

@@ -497,6 +497,8 @@ export const vectorListCollections = forward("vectorListCollections");
 // History
 export const saveHistory = forward("saveHistory");
 export const loadHistory = forward("loadHistory");
+export const searchHistory = forward("searchHistory");
+export const loadHistoryConnectionOptions = forward("loadHistoryConnectionOptions");
 export const loadRedisHistory = forward("loadRedisHistory");
 export const clearHistory = forward("clearHistory");
 export const clearRedisHistory = forward("clearRedisHistory");
@@ -587,6 +589,12 @@ export type {
   KvDeleteResponse,
   MongoDocumentResult,
   HistoryEntry,
+  HistoryConnectionFilter,
+  HistoryDatabaseFilter,
+  HistoryCursor,
+  HistorySearchRequest,
+  HistorySearchResult,
+  HistoryConnectionOption,
   SqlFileStatus,
   SqlFileRequest,
   SqlFilePreview,
