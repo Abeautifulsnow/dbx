@@ -96,3 +96,17 @@ test("send() never leaks the guard on an early return after acquiring it", () =>
     );
   }
 });
+
+test("send() snapshots custom prompts before deferred AI context loading", () => {
+  const body = functionBody(scriptSetupContent(), "async function send()");
+  const ensureLoadedAwait = body.indexOf("await promptTemplateStore.ensureLoaded()");
+  const snapshot = body.indexOf("const customPromptContext: CustomPromptContext");
+  const sqlFileLoad = body.indexOf("await loadReferencedSqlFiles");
+  const aiContextLoad = body.indexOf("await buildAiContext");
+
+  assert.notEqual(snapshot, -1, "send() should snapshot the custom prompt context");
+  assert.ok(ensureLoadedAwait < snapshot, "the snapshot must be taken after templates finish loading");
+  assert.ok(snapshot < sqlFileLoad, "SQL file loading must not delay the custom prompt snapshot");
+  assert.ok(snapshot < aiContextLoad, "AI context loading must not delay the custom prompt snapshot");
+  assert.match(body.slice(snapshot, sqlFileLoad), /activeTemplates:\s*\[\.\.\.activeTemplates\.value\]/);
+});
