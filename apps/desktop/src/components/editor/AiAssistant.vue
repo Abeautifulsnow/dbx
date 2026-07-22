@@ -1466,6 +1466,12 @@ async function send() {
     toast(t("ai.customInstructionsLoadFailed"), 5000);
     return;
   }
+  // Snapshot the selected custom prompts at send time so later async context loading
+  // cannot change the instructions for an already-submitted request.
+  const customPromptContext: CustomPromptContext = {
+    globalInstructions: promptTemplateStore.globalInstructions,
+    activeTemplates: [...activeTemplates.value],
+  };
 
   const selectedTableMentions = [...selectedMentions.value];
   const selectedSqlFiles = [...selectedSqlFileMentions.value];
@@ -1503,10 +1509,6 @@ async function send() {
       sqlFiles,
     });
     const history: AiMessage[] = messagesForAgentHistory(messages.value.slice(0, -2));
-    const customPromptContext: CustomPromptContext = {
-      globalInstructions: promptTemplateStore.globalInstructions,
-      activeTemplates: activeTemplates.value,
-    };
     await runAgentStream(
       {
         config: activeFullConfig.value!,

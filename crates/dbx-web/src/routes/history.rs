@@ -44,13 +44,13 @@ pub async fn search_history(
     State(state): State<Arc<WebState>>,
     Json(request): Json<HistorySearchRequest>,
 ) -> Result<Json<HistorySearchResult>, AppError> {
-    state.app.storage.search_history_entries(request).await.map(Json).map_err(AppError)
+    state.app.storage.search_history_entries(request).await.map(Json).map_err(AppError::from)
 }
 
 pub async fn load_history_connection_options(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<Vec<HistoryConnectionOption>>, AppError> {
-    state.app.storage.load_history_connection_options().await.map(Json).map_err(AppError)
+    state.app.storage.load_history_connection_options().await.map(Json).map_err(AppError::from)
 }
 
 pub async fn clear_history(State(state): State<Arc<WebState>>) -> Result<Json<()>, AppError> {
