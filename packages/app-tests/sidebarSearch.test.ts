@@ -121,6 +121,28 @@ test("separator-blind works with consecutive separators", () => {
   assert.equal(matchSidebarLabel("del..order", "delo")?.score, 65);
 });
 
+test("separator-blind works with forward-slash separators", () => {
+  // / is in both isWordBoundary and stripSeparators
+  // prefix across /
+  assert.equal(matchSidebarLabel("del/order", "delo")?.kind, "word-prefix");
+  assert.equal(matchSidebarLabel("del/order", "delo")?.score, 65);
+  // substring across /
+  assert.equal(matchSidebarLabel("del/order", "elo")?.kind, "substring");
+  assert.equal(matchSidebarLabel("del/order", "elo")?.score, 55);
+  // abbreviation: d(0 boundary) o(4 boundary after /) → 60
+  assert.equal(matchSidebarLabel("del/order", "do")?.kind, "abbreviation");
+  assert.equal(matchSidebarLabel("del/order", "do")?.score, 60);
+  // three-segment with /
+  assert.equal(matchSidebarLabel("user/role/permission", "urp")?.kind, "abbreviation");
+  assert.equal(matchSidebarLabel("user/role/permission", "urp")?.score, 60);
+  // word-prefix at boundary: "role" starts after /
+  assert.equal(matchSidebarLabel("user/role/permission", "role")?.kind, "word-prefix");
+  assert.equal(matchSidebarLabel("user/role/permission", "role")?.score, 80);
+  // separator-blind prefix across multiple /
+  assert.equal(matchSidebarLabel("user/role/permission", "userrole")?.kind, "word-prefix");
+  assert.equal(matchSidebarLabel("user/role/permission", "userrole")?.score, 65);
+});
+
 test("separator-blind works with mixed separators in the same label", () => {
   // Underscore then dot (common in MySQL schema.table notation)
   // "del_order.sub" → stripped "delordersub", "delord" starts at 0
@@ -170,6 +192,42 @@ test("separator-blind is a no-op for labels without any separators", () => {
   assert.equal(matchSidebarLabel("orders", "odr")?.kind, "fuzzy");
   // A query that doesn't match via direct or separator-blind on a no-separator label
   assert.equal(matchSidebarLabel("products", "pdt")?.kind, "fuzzy");
+});
+
+test("separator-blind handles leading and trailing separators", () => {
+  // Leading underscore: stripped "_del_order" = "delorder"
+  assert.equal(matchSidebarLabel("_del_order", "delo")?.kind, "word-prefix");
+  assert.equal(matchSidebarLabel("_del_order", "delo")?.score, 65);
+  // Trailing underscore: stripped "del_order_" = "delorder"
+  assert.equal(matchSidebarLabel("del_order_", "delord")?.kind, "word-prefix");
+  assert.equal(matchSidebarLabel("del_order_", "delord")?.score, 65);
+  // Leading hyphen
+  assert.equal(matchSidebarLabel("-del_order", "delo")?.kind, "word-prefix");
+  assert.equal(matchSidebarLabel("-del_order", "delo")?.score, 65);
+  // Leading + trailing: stripped "_del_order_" = "delorder"
+  assert.equal(matchSidebarLabel("_del_order_", "delo")?.kind, "word-prefix");
+  assert.equal(matchSidebarLabel("_del_order_", "delo")?.score, 65);
+  // Leading separator-only label: "___" → stripped "" → length 0 < query.length → no match
+  assert.equal(matchSidebarLabel("___", "x"), null);
+});
+
+test("separator-blind with query equal to the fully stripped label", () => {
+  // "a_b" search "ab" → abbreviation fires first: a(0 boundary) b(2 boundary) → 60
+  assert.equal(matchSidebarLabel("a_b", "ab")?.kind, "abbreviation");
+  assert.equal(matchSidebarLabel("a_b", "ab")?.score, 60);
+  // "del_order" search "delorder" → stripped "delorder".startsWith("delorder") → 65
+  // (abbreviation fails: d,e,l at 0/1/2 are NOT boundaries)
+  assert.equal(matchSidebarLabel("del_order", "delorder")?.kind, "word-prefix");
+  assert.equal(matchSidebarLabel("del_order", "delorder")?.score, 65);
+  // "sys_user_log" search "sysuserlog" → 65 (abbreviation fails)
+  assert.equal(matchSidebarLabel("sys_user_log", "sysuserlog")?.kind, "word-prefix");
+  assert.equal(matchSidebarLabel("sys_user_log", "sysuserlog")?.score, 65);
+  // "t_json" search "tjson" → 65 (abbreviation fails: t(0 ✓) j(2 ✓) but s,o,n not boundaries)
+  assert.equal(matchSidebarLabel("t_json", "tjson")?.kind, "word-prefix");
+  assert.equal(matchSidebarLabel("t_json", "tjson")?.score, 65);
+  // "a.b" search "ab" → abbreviation: a(0 ✓) b(2 after . ✓) → 60, beats separator-blind
+  assert.equal(matchSidebarLabel("a.b", "ab")?.kind, "abbreviation");
+  assert.equal(matchSidebarLabel("a.b", "ab")?.score, 60);
 });
 
 test("direct matches always beat separator-blind counterparts", () => {
