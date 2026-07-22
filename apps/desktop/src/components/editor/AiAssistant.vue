@@ -1454,7 +1454,12 @@ async function send() {
     toast(t("ai.noConfig"));
     return;
   }
+  // Acquire the send guard before the first async operation so two rapid
+  // submissions cannot both pass the initial isGenerating check and then
+  // resume into concurrent agent runs.
+  isGenerating.value = true;
   if (!(await promptTemplateStore.ensureLoaded())) {
+    isGenerating.value = false;
     toast(t("ai.customInstructionsLoadFailed"), 5000);
     return;
   }
@@ -1482,7 +1487,6 @@ async function send() {
   // Agent confirmation cannot grant autonomous writes while the active database is production.
   const allowWriteSql = requestedMode === "agent" && allowWriteSqlForNextRun && !productionContext.value.active;
   allowWriteSqlForNextRun = false;
-  isGenerating.value = true;
   messages.value.push({ role: "assistant", content: "" });
   const assistantIdx = messages.value.length - 1;
   const sessionId = uuid();

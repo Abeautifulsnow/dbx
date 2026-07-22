@@ -1965,16 +1965,33 @@ watch(snippetProvider, (provider) => {
   void refreshSnippetTokenStatus();
 });
 
-watch(activeSettingsTab, (tab) => {
+watch(activeSettingsTab, async (tab) => {
   if (tab === "mcp" && !mcpStatus.value && !mcpStatusLoading.value) void refreshMcpStatus();
   if (tab === "ai" && aiIsCliProvider.value) void ensureCliMcpStatus();
-  if (tab === "ai") editGlobalInstructions.value = promptTemplateStore.globalInstructions;
+  if (tab === "ai") {
+    // Await completion so we don't snapshot an empty default when the store
+    // is still loading its first payload (init via App.vue is fire-and-forget).
+    await promptTemplateStore.ensureLoaded();
+    editGlobalInstructions.value = promptTemplateStore.globalInstructions;
+  }
   if (tab === "about" && !appSupportInfo.value) void refreshAppSupportInfo();
   if (tab === "appearance") {
     checkLayoutDescTruncation();
     checkIconThemeDescTruncation();
   }
 });
+
+// If the store finishes loading while the AI tab is already open (e.g. a retry
+// from another entry point succeeded after the tab-switch snapshot saw a failed
+// load), backfill the textarea — but never clobber text the user already typed.
+watch(
+  () => promptTemplateStore.isLoaded,
+  (loaded) => {
+    if (loaded && activeSettingsTab.value === "ai" && !editGlobalInstructions.value) {
+      editGlobalInstructions.value = promptTemplateStore.globalInstructions;
+    }
+  },
+);
 
 onMounted(() => {
   void refreshWebDavPasswordStatus();
@@ -4682,7 +4699,7 @@ onUnmounted(cleanupPreviewEditor);
                   <span class="text-xs" :class="globalInstructionsTooLong() ? 'text-destructive' : 'text-muted-foreground'">
                     {{ t("ai.globalInstructionsCharCount", { count: promptTemplateCharacterCount(editGlobalInstructions), max: GLOBAL_INSTRUCTIONS_MAX }) }}
                   </span>
-                  <Button type="button" size="sm" :disabled="globalInstructionsTooLong() || globalInstructionsSaving" @click="saveGlobalInstructions">
+                  <Button type="button" size="sm" :disabled="!promptTemplateStore.isLoaded || globalInstructionsTooLong() || globalInstructionsSaving" @click="saveGlobalInstructions">
                     {{ globalInstructionsSaving ? t("common.processing") : t("ai.globalInstructionsSave") }}
                   </Button>
                 </div>

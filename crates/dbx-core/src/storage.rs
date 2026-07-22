@@ -1631,16 +1631,19 @@ impl Storage {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
         self.with_conn(move |conn| {
-            // Case-insensitive duplicate name check
-            let duplicate: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM prompt_templates WHERE LOWER(name) = LOWER(?1) AND id != ?2",
-                    params![name, id],
-                    |row| row.get(0),
-                )
-                .optional()
+            // Case-insensitive duplicate name check (Unicode-aware).
+            // SQLite LOWER() is ASCII-only, so we compare in Rust where
+            // str::to_lowercase() handles full Unicode case folding.
+            let name_lower = name.to_lowercase();
+            let mut stmt = conn
+                .prepare("SELECT name FROM prompt_templates WHERE id != ?1")
                 .map_err(|e| e.to_string())?;
-            if duplicate.is_some() {
+            let duplicate = stmt
+                .query_map(params![id], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .any(|existing| existing.to_lowercase() == name_lower);
+            if duplicate {
                 return Err("duplicate template name".to_string());
             }
 
@@ -4549,6 +4552,28 @@ mod tests {
         let update = storage.save_prompt_template("t1", "Production Rules", "updated").await.unwrap();
         assert_eq!(update.id, "t1");
         assert_eq!(update.content, "updated");
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn prompt_template_save_rejects_duplicate_name_unicode_case_folding() {
+        let db = temp_db_path("pt-dup-unicode");
+        let storage = Storage::open(&db).await.unwrap();
+
+        // SQLite LOWER() is ASCII-only (U+00C4 'Ä' → no change), but Rust
+        // str::to_lowercase() does full Unicode case folding (Ä → ä).
+        // Both directions must detect the duplicate.
+        storage.save_prompt_template("t1", "Ä规则", "content-upper").await.unwrap();
+        let err = storage.save_prompt_template("t2", "ä规则", "content-lower").await.unwrap_err();
+        assert!(err.contains("duplicate"), "expected 'duplicate', got: {err}");
+
+        // Reverse: lower-case first, upper-case second.
+        let db = temp_db_path("pt-dup-unicode-2");
+        let storage = Storage::open(&db).await.unwrap();
+        storage.save_prompt_template("t1", "ä规则", "content-lower").await.unwrap();
+        let err = storage.save_prompt_template("t2", "Ä规则", "content-upper").await.unwrap_err();
+        assert!(err.contains("duplicate"), "expected 'duplicate', got: {err}");
 
         std::fs::remove_file(&db).ok();
     }
