@@ -8,6 +8,7 @@ import {
   rankCandidates,
   run,
   scoreCandidate,
+  searchTerms,
   searchTitleTerms,
 } from "./suggest-similar-issues.mjs";
 
@@ -50,6 +51,23 @@ test("builds a short title query with identifiers split safely", () => {
   assert.match(query, /光标/u);
   assert.match(query, /语句/u);
   assert.doesNotMatch(query, /失效|弹出/u);
+});
+
+test("excludes bot source metadata from searchable text", () => {
+  const issue = {
+    ...baseIssue,
+    body: `### 来源
+
+QQ 群反馈 · **反馈人**：独特反馈人名称
+
+### 原始描述
+
+查询结果无法保存。`,
+  };
+
+  const terms = searchTerms(issue);
+  assert.doesNotMatch(terms, /QQ群反馈|独特反馈人名称/u);
+  assert.match(terms, /查询结果无法保存/u);
 });
 
 test("keeps compound Chinese product terms in the title query", () => {
@@ -96,6 +114,22 @@ test("detects database conflicts from issue forms before labels are added", () =
 
   assert.equal(scoreCandidate(issue, mysqlCandidate).reason, "database-mismatch");
   assert.equal(scoreCandidate(issue, postgresCandidate).accepted, true);
+});
+
+test("detects database conflicts from legacy bot metadata", () => {
+  const issue = {
+    ...baseIssue,
+    body: "**来源**: QQ 群反馈\n**数据库类型和版本**: PostgreSQL 16\n\n## 原始描述\n修改后保存失败。",
+    labels: [{ name: "bug" }],
+  };
+  const candidate = {
+    number: 102,
+    title: "MySQL 查询结果修改后保存失败",
+    body: "### 数据库类型和版本\n\nMySQL 8.0\n\n### 问题描述\n\n修改后保存失败。",
+    labels: [{ name: "bug" }],
+  };
+
+  assert.equal(scoreCandidate(issue, candidate).reason, "database-mismatch");
 });
 
 test("does not treat a shared database product as issue similarity", () => {

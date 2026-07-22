@@ -471,6 +471,7 @@ export interface ToolbarItems {
   ai: boolean;
   theme: boolean;
   github: boolean;
+  exclusiveRightSidebarPanels: boolean;
 }
 
 export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
@@ -486,7 +487,27 @@ export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
   ai: true,
   theme: true,
   github: true,
+  exclusiveRightSidebarPanels: true,
 };
+
+export const RIGHT_SIDEBAR_PANEL_IDS = ["ai", "history", "sqlLibrary", "sqlFile"] as const;
+export type RightSidebarPanelId = (typeof RIGHT_SIDEBAR_PANEL_IDS)[number];
+export type RightSidebarPanelState = Record<RightSidebarPanelId, boolean>;
+
+export function transitionRightSidebarPanels(current: RightSidebarPanelState, panel: RightSidebarPanelId, open: boolean, exclusive: boolean): RightSidebarPanelState {
+  const next = { ...current };
+  if (open && exclusive) {
+    for (const panelId of RIGHT_SIDEBAR_PANEL_IDS) next[panelId] = false;
+  }
+  next[panel] = open;
+  return next;
+}
+
+export function enforceRightSidebarPanelExclusivity(current: RightSidebarPanelState, preferred?: RightSidebarPanelId): RightSidebarPanelState {
+  const panelToKeep = preferred && current[preferred] ? preferred : RIGHT_SIDEBAR_PANEL_IDS.find((panelId) => current[panelId]);
+  if (!panelToKeep) return { ...current };
+  return transitionRightSidebarPanels(current, panelToKeep, true, true);
+}
 
 export const EDITOR_THEMES: { value: EditorTheme; label: string; dark: boolean }[] = [
   { value: "app", label: "Follow app theme", dark: false },
@@ -752,6 +773,8 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
     ai: items.ai ?? defaults.ai,
     theme: items.theme ?? defaults.theme,
     github: items.github ?? defaults.github,
+    // Saved settings from before right-sidebar exclusivity must adopt the new default.
+    exclusiveRightSidebarPanels: items.exclusiveRightSidebarPanels !== false,
   };
 }
 

@@ -47,6 +47,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           token: ${{ github.event.pull_request.head.repo.full_name == github.repository && steps.app-token.outputs.token || github.token }}
           fetch-depth: 0
+          allow-unsafe-pr-checkout: true
           # The workflow executes the trusted base-branch script copied above;
           # fork contents are only parsed as translation data, never executed.
 

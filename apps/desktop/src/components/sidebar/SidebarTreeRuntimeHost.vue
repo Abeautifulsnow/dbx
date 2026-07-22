@@ -89,7 +89,7 @@ import {
 import { copyNameForTreeNode, isDocumentBrowserTreeNode, objectSourceKindForTreeNode, shouldRunTreeNodeRowAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "@/lib/sidebar/treeNodeClick";
 import { dataTabOpenModeFromTreeClick, type DataTabOpenMode } from "@/lib/sidebar/dataTabOpenPolicy";
 import { isCopySidebarSelectionShortcut, isEditSidebarConnectionShortcut, isPasteSidebarSelectionShortcut } from "@/lib/editor/keyboardShortcuts";
-import { canRefreshDataTableFromSingleActivationDoubleClick, dataTableDoubleClickAction } from "@/lib/tabs/dataTabActivation";
+import { dataTableDoubleClickAction } from "@/lib/tabs/dataTabActivation";
 import { attachedDatabaseNameFromPath, buildCreateDatabaseSql, buildDuckDbAttachDatabaseSql, buildSqliteAttachDatabaseSql, supportsCreateDatabaseCharset, uniqueAttachedDatabaseName } from "@/lib/database/createDatabaseSql";
 import { appendCreateDatabaseErrorHint } from "@/lib/database/createDatabaseErrorHints";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
@@ -671,9 +671,6 @@ function runRowClickAction(clickDetail: number) {
   const action = treeNodeRowAction(node.type, canExpand.value, settingsStore.editorSettings.sidebarActivation);
   if (!shouldRunTreeNodeRowAction(action, clickDetail)) return;
   if (action === "open-data") {
-    if (node.type === "table") {
-      singleActivationDoubleClickRefreshAllowed = canRefreshDataTableFromSingleActivationDoubleClick(findExistingSameTableDataTab());
-    }
     scheduleOpenData(node);
   } else if (isDocumentBrowserTreeNode(node.type)) {
     openMongoTreeData(node);
@@ -683,8 +680,6 @@ function runRowClickAction(clickDetail: number) {
     toggle();
   }
 }
-
-let singleActivationDoubleClickRefreshAllowed = false;
 
 function refreshActiveKvBrowserAfterOpen(mode: "etcd" | "zookeeper", connectionId: string) {
   void nextTick(() => {
@@ -919,8 +914,8 @@ function onDoubleClick(event: MouseEvent) {
     if (!activeNode.value.isExpanded) void toggle();
   } else if (action === "open-data") {
     openDataImmediately(activeNode.value);
-  } else if (action === "refresh-data") {
-    void refreshData();
+  } else if (action === "activate-data") {
+    activateDataTableFromDoubleClick();
   } else if (action === "open-source") {
     openObjectSourceDialog(false);
   } else if (action === "open-saved-sql") {
@@ -932,24 +927,21 @@ function onDoubleClick(event: MouseEvent) {
   }
 }
 
-async function refreshData() {
+function activateDataTableFromDoubleClick() {
   const node = activeNode.value;
   if (node.type !== "table" || !hasNodeDatabaseContext(node)) return;
-  const singleActivationRefreshAllowed = singleActivationDoubleClickRefreshAllowed;
-  singleActivationDoubleClickRefreshAllowed = false;
   const activation = settingsStore.editorSettings.sidebarActivation;
-  if (activation === "single" && !singleActivationRefreshAllowed) return;
   const existingSameTableTab = findExistingSameTableDataTab();
-  const action = dataTableDoubleClickAction(existingSameTableTab, activation, singleActivationRefreshAllowed);
+  const action = dataTableDoubleClickAction(existingSameTableTab, activation);
   if (action === "none") return;
   if (action === "open") {
     openDataImmediately(node);
     return;
   }
   if (!existingSameTableTab) return;
+  // Reopening an available table follows DBeaver's editor reuse model: only
+  // activate the existing tab so filters, result rows, and in-flight work stay intact.
   queryStore.switchTab(existingSameTableTab.id);
-  if (action === "activate") return;
-  await queryStore.refreshDataTab(existingSameTableTab.id);
 }
 
 function findExistingSameTableDataTab() {

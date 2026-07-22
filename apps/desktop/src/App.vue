@@ -14,7 +14,7 @@ import WelcomeScreen from "@/components/layout/WelcomeScreen.vue";
 import type { ConfigTab } from "@/components/connection/ConnectionDialog.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
-import { useSettingsStore } from "@/stores/settingsStore";
+import { enforceRightSidebarPanelExclusivity, RIGHT_SIDEBAR_PANEL_IDS, transitionRightSidebarPanels, useSettingsStore, type RightSidebarPanelId, type RightSidebarPanelState } from "@/stores/settingsStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { usePromptTemplateStore } from "@/stores/promptTemplateStore";
 import { useToast } from "@/composables/useToast";
@@ -181,6 +181,18 @@ const showHistory = ref(false);
 const showAiPanel = ref(safeLocalStorageGet("dbx-ai-panel-open") === "true");
 const showSqlLibraryPanel = ref(safeLocalStorageGet("dbx-sql-library-open") === "true");
 const showSqlFilePanel = ref(safeLocalStorageGet("dbx-sql-file-panel-open") === "true");
+const rightSidebarPanelRefs: Record<RightSidebarPanelId, typeof showAiPanel> = {
+  ai: showAiPanel,
+  history: showHistory,
+  sqlLibrary: showSqlLibraryPanel,
+  sqlFile: showSqlFilePanel,
+};
+const rightSidebarPanelStorageKeys: Partial<Record<RightSidebarPanelId, string>> = {
+  ai: "dbx-ai-panel-open",
+  sqlLibrary: "dbx-sql-library-open",
+  sqlFile: "dbx-sql-file-panel-open",
+};
+let lastOpenedRightSidebarPanel = RIGHT_SIDEBAR_PANEL_IDS.find((panelId) => rightSidebarPanelRefs[panelId].value);
 const sidebarOpen = ref(safeLocalStorageGet("dbx-sidebar-open") !== "false");
 const aiPanelReady = ref(false);
 const { sidebarWidth, aiPanelWidth, historyWidth, sqlLibraryWidth, sqlFilePanelWidth, startSidebarResize, startAiPanelResize, startHistoryResize, startSqlLibraryResize, startSqlFilePanelResize } = usePanelResize();
@@ -551,19 +563,50 @@ watch(
   { immediate: true },
 );
 
-function toggleAiPanel() {
-  showAiPanel.value = !showAiPanel.value;
-  safeLocalStorageSet("dbx-ai-panel-open", String(showAiPanel.value));
+watch(
+  [() => settingsStore.isEditorSettingsLoaded, () => settingsStore.editorSettings.toolbarItems.exclusiveRightSidebarPanels],
+  ([loaded, exclusive]) => {
+    if (!loaded || !exclusive) return;
+    // Compatibility: old persisted panel flags may contain multiple open panels.
+    applyRightSidebarPanelState(enforceRightSidebarPanelExclusivity(currentRightSidebarPanelState(), lastOpenedRightSidebarPanel));
+  },
+  { immediate: true },
+);
+
+function currentRightSidebarPanelState(): RightSidebarPanelState {
+  return Object.fromEntries(RIGHT_SIDEBAR_PANEL_IDS.map((panelId) => [panelId, rightSidebarPanelRefs[panelId].value])) as RightSidebarPanelState;
 }
 
-function toggleSqlLibrary() {
-  showSqlLibraryPanel.value = !showSqlLibraryPanel.value;
-  safeLocalStorageSet("dbx-sql-library-open", String(showSqlLibraryPanel.value));
+function applyRightSidebarPanelState(next: RightSidebarPanelState) {
+  for (const panelId of RIGHT_SIDEBAR_PANEL_IDS) {
+    const panelRef = rightSidebarPanelRefs[panelId];
+    if (panelRef.value === next[panelId]) continue;
+    panelRef.value = next[panelId];
+    const storageKey = rightSidebarPanelStorageKeys[panelId];
+    if (storageKey) safeLocalStorageSet(storageKey, String(next[panelId]));
+  }
 }
 
-function toggleSqlFilePanel() {
-  showSqlFilePanel.value = !showSqlFilePanel.value;
-  safeLocalStorageSet("dbx-sql-file-panel-open", String(showSqlFilePanel.value));
+function setRightSidebarPanelOpen(panelId: RightSidebarPanelId, open: boolean) {
+  const exclusive = settingsStore.isEditorSettingsLoaded && settingsStore.editorSettings.toolbarItems.exclusiveRightSidebarPanels;
+  applyRightSidebarPanelState(transitionRightSidebarPanels(currentRightSidebarPanelState(), panelId, open, exclusive));
+  if (open) {
+    lastOpenedRightSidebarPanel = panelId;
+  } else if (lastOpenedRightSidebarPanel === panelId) {
+    lastOpenedRightSidebarPanel = RIGHT_SIDEBAR_PANEL_IDS.find((candidate) => rightSidebarPanelRefs[candidate].value);
+  }
+}
+
+function toggleRightSidebarPanel(panelId: RightSidebarPanelId) {
+  setRightSidebarPanelOpen(panelId, !rightSidebarPanelRefs[panelId].value);
+}
+
+function openRightSidebarPanel(panelId: RightSidebarPanelId) {
+  setRightSidebarPanelOpen(panelId, true);
+}
+
+function closeRightSidebarPanel(panelId: RightSidebarPanelId) {
+  setRightSidebarPanelOpen(panelId, false);
 }
 
 function invokeWhenAiReady(invoke: (handle: AiAssistantHandle) => void) {
@@ -582,26 +625,17 @@ function invokeWhenAiReady(invoke: (handle: AiAssistantHandle) => void) {
 }
 
 function fixWithAi(errorMessage: string) {
-  if (!showAiPanel.value) {
-    showAiPanel.value = true;
-    safeLocalStorageSet("dbx-ai-panel-open", "true");
-  }
+  openRightSidebarPanel("ai");
   invokeWhenAiReady((handle) => handle.triggerAction("fix", errorMessage));
 }
 
 function sendSelectionToAi(sql: string) {
-  if (!showAiPanel.value) {
-    showAiPanel.value = true;
-    safeLocalStorageSet("dbx-ai-panel-open", "true");
-  }
+  openRightSidebarPanel("ai");
   invokeWhenAiReady((handle) => handle.setPrompt(sql));
 }
 
 function openAiPanel() {
-  if (!showAiPanel.value) {
-    showAiPanel.value = true;
-    safeLocalStorageSet("dbx-ai-panel-open", "true");
-  }
+  openRightSidebarPanel("ai");
 }
 
 function analyzeHistoryWithAi(entry: HistoryEntry) {
@@ -2039,10 +2073,10 @@ onUnmounted(() => {
           @new-connection="showConnectionDialog = true"
           @new-query="newQuery"
           @set-theme-mode="setThemeMode"
-          @toggle-ai="toggleAiPanel"
-          @toggle-history="showHistory = !showHistory"
-          @toggle-sql-library="toggleSqlLibrary"
-          @toggle-sql-file-panel="toggleSqlFilePanel"
+          @toggle-ai="toggleRightSidebarPanel('ai')"
+          @toggle-history="toggleRightSidebarPanel('history')"
+          @toggle-sql-library="toggleRightSidebarPanel('sqlLibrary')"
+          @toggle-sql-file-panel="toggleRightSidebarPanel('sqlFile')"
           @open-github="openGitHub"
           @open-settings="openSettings()"
           @open-driver-store="openDriverStorePage"
@@ -2214,7 +2248,7 @@ onUnmounted(() => {
                 @open-saved-sql="openSavedSqlFromWelcome"
                 @new-connection="showConnectionDialog = true"
                 @new-query="newQuery"
-                @show-history="showHistory = true"
+                @show-history="openRightSidebarPanel('history')"
                 @import-config="dialogs.onImportClick"
                 @open-github="openGitHub"
                 @open-mcp-guide="openMcpGuide"
@@ -2235,27 +2269,27 @@ onUnmounted(() => {
                 @temp-run-sql="onAiTempRunSql"
                 @request-auto-execute-sql="onAiRequestAutoExecuteSql"
                 @open-explain-plan="onAiOpenExplainPlan"
-                @close="toggleAiPanel"
+                @close="closeRightSidebarPanel('ai')"
               />
             </div>
           </div>
 
           <div v-if="showHistory" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: historyWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startHistoryResize" />
-            <QueryHistory @restore="restoreHistorySql" @analyze-ai="analyzeHistoryWithAi" @close="showHistory = false" />
+            <QueryHistory @restore="restoreHistorySql" @analyze-ai="analyzeHistoryWithAi" @close="closeRightSidebarPanel('history')" />
           </div>
 
           <div v-if="showSqlLibraryPanel" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: sqlLibraryWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startSqlLibraryResize" />
             <div class="h-full min-h-0 overflow-hidden">
-              <SqlLibraryPanel @close="toggleSqlLibrary" />
+              <SqlLibraryPanel @close="closeRightSidebarPanel('sqlLibrary')" />
             </div>
           </div>
 
           <div v-if="showSqlFilePanel" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: sqlFilePanelWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startSqlFilePanelResize" />
             <div class="h-full min-h-0 overflow-hidden">
-              <SqlFilePanel @close="toggleSqlFilePanel" />
+              <SqlFilePanel @close="closeRightSidebarPanel('sqlFile')" />
             </div>
           </div>
         </div>

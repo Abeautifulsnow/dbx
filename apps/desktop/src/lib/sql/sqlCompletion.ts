@@ -2777,7 +2777,7 @@ function unquoteIdentifier(value: string): string {
   return value;
 }
 
-function quoteSqlIdentifier(identifier: string, dialect?: "mysql" | "postgres" | "sqlserver"): string {
+export function quoteSqlIdentifier(identifier: string, dialect?: "mysql" | "postgres" | "sqlserver"): string {
   if (dialect !== "postgres" || !requiresPostgresIdentifierQuote(identifier)) return identifier;
   return `"${identifier.replaceAll('"', '""')}"`;
 }

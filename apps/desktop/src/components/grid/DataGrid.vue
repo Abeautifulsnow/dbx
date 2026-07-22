@@ -129,7 +129,7 @@ import { applyColumnFormatter, buildColumnFormatterKey, getSupportedTimeZoneOpti
 import { temporalCellEditorConfig, type TemporalCellEditorConfig } from "@/lib/dataGrid/dataGridTemporalEditor";
 import { isCancelSearchShortcut, isCopyCurrentRowShortcut, isDeleteCurrentRowShortcut, isFocusSearchShortcut, isModRShortcut, isSaveShortcut, isToggleTransposeShortcut } from "@/lib/editor/keyboardShortcuts";
 import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid/dataGridScrollGutter";
-import { canGoNextDataGridPage } from "@/lib/dataGrid/dataGridPagination";
+import { canGoNextDataGridPage, hasCompleteLocalDataGridResult } from "@/lib/dataGrid/dataGridPagination";
 import { dataGridCountQueryOptions } from "@/lib/dataGrid/dataGridQueryOptions";
 import { dataGridBottomScrollTop, dataGridScrollPosition, isDataGridAtScrollBottom, isDataGridNearScrollBottom, shouldCheckInfiniteScrollAfterScroll, type DataGridScrollPosition } from "@/lib/dataGrid/dataGridInfiniteScroll";
 import { CANVAS_DATA_GRID_ROW_HEIGHT, dataGridSearchMatchKey, drawCanvasDataGrid } from "@/lib/dataGrid/canvasDataGridRenderer";
@@ -201,10 +201,12 @@ import type { DataGridSortDirection, DataGridSortMode } from "@/lib/dataGrid/dat
 import { DATA_GRID_COMPACT_TOPBAR_WIDTH, type DataGridReloadIntent, type DataGridToolbarActionCapability, type DataGridToolbarAutoRefreshCapability, type DataGridToolbarSaveCapability } from "@/lib/dataGrid/dataGridToolbar";
 import { getTableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilities";
 import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
+import { filterObjectBrowserTableColumns } from "@/lib/table/objectBrowserTableInfo";
 import { reserveDataGridHeaderLine } from "@/lib/dataGrid/dataGridHeaderLayout";
 import { supportsTableStructureEditing } from "@/lib/database/databaseCapabilities";
 import { rememberDataGridConditionHistory } from "@/lib/dataGrid/dataGridConditionHistory";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { dataGridConditionColumnOptions } from "@/lib/dataGrid/dataGridConditionCompletion";
 import { isMacOS } from "@/lib/backend/platform";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { formatShortcut } from "@/lib/editor/shortcutRegistry";
@@ -567,6 +569,7 @@ const { searchText, deferredSearchText: deferredClientSearchText, overlayVisible
 
 const orderByInput = ref(props.initialOrderByInput ?? "");
 const whereFilterInput = ref(props.initialWhereInput ?? "");
+const conditionColumns = computed(() => dataGridConditionColumnOptions(props.tableMeta?.columns ?? props.result.columns, resolvedDatabaseType.value));
 const conditionHistoryScope = computed(() => ({
   connectionId: props.connectionId,
   database: props.database,
@@ -2269,6 +2272,8 @@ const isInfiniteScrollPaginating = ref(false);
 let lastInfiniteScrollPage = 0;
 let infiniteScrollCheckScheduled = false;
 let infiniteScrollAllLoaded = false;
+let infiniteScrollRequestedOffset: number | undefined;
+let infiniteScrollRequestedLimit: number | undefined;
 // Tracks whether the current loading cycle was triggered by a refresh/rollback
 // (as opposed to a normal paginate). Used to decide whether to auto-redirect
 // when the current page no longer exists after data was deleted.
@@ -2313,9 +2318,19 @@ watch(
     if (prevLoading && !loading && infiniteScrollLoading.value) {
       infiniteScrollLoading.value = false;
       isInfiniteScrollPaginating.value = false;
-      // Detect if the backend returned no new data for this page
-      const expectedRows = currentPage.value * pageSize.value;
-      if (props.result.rows.length < expectedRows) {
+      const requestedOffset = infiniteScrollRequestedOffset;
+      const requestedLimit = infiniteScrollRequestedLimit;
+      infiniteScrollRequestedOffset = undefined;
+      infiniteScrollRequestedLimit = undefined;
+      if (requestedOffset === undefined || props.result.appended_from_row_count !== requestedOffset) {
+        // Failed/stale append requests preserve the old result. Roll back the
+        // optimistic page marker so a later scroll can retry the same segment.
+        currentPage.value = Math.max(1, currentPage.value - 1);
+        lastInfiniteScrollPage = Math.max(0, currentPage.value - 1);
+        return;
+      }
+      const appendedRows = props.result.rows.length - requestedOffset;
+      if (props.result.rows.length >= infiniteScrollMaxRows.value || appendedRows < (requestedLimit ?? pageSize.value)) {
         infiniteScrollAllLoaded = true;
       }
     }
@@ -2347,10 +2362,19 @@ const hasKnownTotalRowCount = computed(() => typeof serverKnownTotalRowCount.val
 // rowCount IS the total. Without this hint, the "page is full → assume more"
 // fallback in canGoNextDataGridPage lets the user keep clicking next forever.
 const allRowsLoaded = computed(() => isResultsContext.value && props.pageLimit === undefined);
-// True when the in-memory result already holds the complete result set (results
-// context, no server-side pagination, not truncated, no further pages). Used to
-// skip re-executing the query on export and instead write the local rows.
-const hasCompleteLocalResult = computed(() => !!props.result && allRowsLoaded.value && props.result.truncated !== true && props.result.has_more !== true);
+// Skip re-executing a query when the first page already contains every row.
+// This also covers paginated queries whose first page is shorter than the limit.
+const hasCompleteLocalResult = computed(() =>
+  hasCompleteLocalDataGridResult({
+    isResultsContext: isResultsContext.value,
+    rowCount: props.result.rows.length,
+    pageLimit: props.pageLimit,
+    pageOffset: props.pageOffset,
+    totalRowCount: serverKnownTotalRowCount.value,
+    truncated: props.result.truncated,
+    hasMore: props.result.has_more,
+  }),
+);
 const canGoNextPage = computed(() => {
   return canGoNextDataGridPage({
     hasMore: props.result.has_more,
@@ -2489,21 +2513,21 @@ function nextPage() {
 
 function infiniteScrollNextPage() {
   if (infiniteScrollLoading.value || props.loading) return;
+  const nextOffset = props.result.rows.length;
+  const remainingRows = infiniteScrollMaxRows.value - nextOffset;
+  if (remainingRows <= 0) return;
+  const nextLimit = Math.min(pageSize.value, remainingRows);
   const nextPageNum = currentPage.value + 1;
-  const cumulativeLimit = nextPageNum * pageSize.value;
-  if (cumulativeLimit > infiniteScrollMaxRows.value) return;
   // Stop if we already know all data is loaded
   if (infiniteScrollAllLoaded) return;
-  // Skip if we already have this many rows loaded (e.g. cached data)
-  if (props.result.rows.length >= cumulativeLimit) {
-    currentPage.value = nextPageNum;
-    return;
-  }
   infiniteScrollLoading.value = true;
   isInfiniteScrollPaginating.value = true;
+  infiniteScrollRequestedOffset = nextOffset;
+  infiniteScrollRequestedLimit = nextLimit;
   currentPage.value = nextPageNum;
-  // Load cumulative data (all rows up to current page) to append instead of replace
-  emit("paginate", 0, cumulativeLimit, currentWhereInput(), currentOrderBy());
+  // Fetch only the missing segment. Re-reading offset 0 grows transfer and replaces
+  // row identities, which would invalidate pending edits while the user scrolls.
+  emit("paginate", nextOffset, nextLimit, currentWhereInput(), currentOrderBy());
 }
 function checkInfiniteScroll(scroller: HTMLElement) {
   if (!infiniteScrollEnabled.value || infiniteScrollLoading.value || props.loading) return;
@@ -2969,6 +2993,8 @@ function resetInfiniteScrollState() {
   currentPage.value = 1;
   lastInfiniteScrollPage = 0;
   infiniteScrollAllLoaded = false;
+  infiniteScrollRequestedOffset = undefined;
+  infiniteScrollRequestedLimit = undefined;
   isInfiniteScrollPaginating.value = false;
   infiniteScrollLoading.value = false;
   infiniteScrollPositions = new WeakMap();
@@ -7056,11 +7082,7 @@ onUnmounted(() => {
   stopLoadingElapsedTimer();
 });
 
-const filteredColumns = computed(() => {
-  if (!searchQuery.value) return props.tableMeta?.columns ?? [];
-  const q = searchQuery.value.toLowerCase();
-  return (props.tableMeta?.columns ?? []).filter((c) => c.name.toLowerCase().includes(q) || c.data_type.toLowerCase().includes(q));
-});
+const filteredColumns = computed(() => filterObjectBrowserTableColumns(props.tableMeta?.columns ?? [], searchQuery.value));
 
 const filteredIndexes = computed(() => {
   if (!searchQuery.value) return indexes.value;
@@ -7459,7 +7481,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   v-model:order-by-input="orderByInput"
                   v-model:filter-builder-open="filterBuilderOpen"
                   :columns="props.tableMeta?.columns.map((column) => column.name) ?? props.result.columns"
-                  :condition-columns="props.tableMeta?.columns ?? props.result.columns"
+                  :condition-columns="conditionColumns"
                   :history-scope="conditionHistoryScope"
                   :can-use-where-search="canUseWhereSearch"
                   :compact="compactDataGridToolbar"
