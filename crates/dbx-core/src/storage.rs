@@ -1631,6 +1631,19 @@ impl Storage {
         self.load_app_state_value(APP_STATE_OPEN_TABS_KEY).await
     }
 
+    /// Persist open tabs under an isolated state key while sharing the rest of the database.
+    ///
+    /// Desktop development builds use this to avoid overwriting the installed app's
+    /// in-progress SQL when both instances use the same data directory.
+    pub async fn save_open_tabs_state_with_key(&self, key: &str, state: &serde_json::Value) -> Result<(), String> {
+        self.save_app_state_value(key, state).await
+    }
+
+    /// Load open tabs from an isolated state key.
+    pub async fn load_open_tabs_state_with_key(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        self.load_app_state_value(key).await
+    }
+
     pub async fn save_saved_sql_editor_positions(&self, positions: &serde_json::Value) -> Result<(), String> {
         self.save_app_state_value(APP_STATE_SAVED_SQL_EDITOR_POSITIONS_KEY, positions).await
     }
@@ -4481,6 +4494,30 @@ mod tests {
         assert_eq!(
             storage.load_editor_settings().await.unwrap(),
             Some(serde_json::json!({ "openTabsRestoreMode": "pinned" }))
+        );
+        assert_eq!(
+            storage.load_open_tabs_state().await.unwrap().and_then(|value| value.get("activeTabId").cloned()),
+            Some(serde_json::json!("tab-1"))
+        );
+
+        let development_open_tabs_key = "development_open_tabs";
+        storage
+            .save_open_tabs_state_with_key(
+                development_open_tabs_key,
+                &serde_json::json!({
+                    "tabs": [{ "id": "tab-2", "title": "Development", "connectionId": "pg", "database": "app", "sql": "select 2" }],
+                    "activeTabId": "tab-2"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .load_open_tabs_state_with_key(development_open_tabs_key)
+                .await
+                .unwrap()
+                .and_then(|value| value.get("activeTabId").cloned()),
+            Some(serde_json::json!("tab-2"))
         );
         assert_eq!(
             storage.load_open_tabs_state().await.unwrap().and_then(|value| value.get("activeTabId").cloned()),
