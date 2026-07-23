@@ -772,10 +772,11 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        linux_appimage_system_gtk_immodules_cache, linux_appimage_wayland_backend_override,
-        linux_nvidia_driver_from_state, linux_selected_drm_render_device, linux_webkit_rendering_workarounds,
-        native_window_decorations_override, should_confirm_app_exit_request, should_fallback_to_native_quit,
-        should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup,
+        app_menu_copy_support_info_label, app_menu_quit_label, linux_appimage_system_gtk_immodules_cache,
+        linux_appimage_wayland_backend_override, linux_nvidia_driver_from_state, linux_selected_drm_render_device,
+        linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
+        should_enable_single_instance, should_fallback_to_native_quit, should_hide_window_on_close,
+        should_setup_desktop_tray, should_show_main_window_after_setup, tray_menu_labels_for_locale,
         uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
     };
     use std::ffi::OsStr;
