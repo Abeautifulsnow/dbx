@@ -60,6 +60,30 @@ impl CloseBehaviorState {
         self.frontend_ready.load(Ordering::Acquire)
     }
 }
+
+/// UI language pushed from the frontend i18n layer; native menus follow it and
+/// fall back to the OS locale until the first `set_app_locale` call arrives.
+pub struct AppLocaleState {
+    locale: std::sync::Mutex<Option<String>>,
+}
+
+impl AppLocaleState {
+    fn new() -> Self {
+        Self { locale: std::sync::Mutex::new(None) }
+    }
+
+    pub(crate) fn set(&self, locale: String) {
+        *self.locale.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(locale);
+    }
+
+    fn get(&self) -> String {
+        self.locale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| sys_locale::get_locale().unwrap_or_default())
+    }
+}
 #[cfg(target_os = "macos")]
 const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/tray-macos-template.png");
 #[cfg(target_os = "macos")]
@@ -135,9 +159,20 @@ fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri:
         icon: Some(ABOUT_APP_ICON),
         ..Default::default()
     };
-    let copy_support_info_item =
-        MenuItem::with_id(app_handle, APP_MENU_COPY_SUPPORT_INFO_ID, "Copy Support Info", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app_handle, APP_MENU_QUIT_ID, format!("Quit {app_name}"), true, Some("Cmd+Q"))?;
+    let copy_support_info_item = MenuItem::with_id(
+        app_handle,
+        APP_MENU_COPY_SUPPORT_INFO_ID,
+        app_menu_copy_support_info_label(&current_app_locale(app_handle)),
+        true,
+        None::<&str>,
+    )?;
+    let quit_item = MenuItem::with_id(
+        app_handle,
+        APP_MENU_QUIT_ID,
+        app_menu_quit_label(&current_app_locale(app_handle), &app_name),
+        true,
+        Some("Cmd+Q"),
+    )?;
 
     Menu::with_items(
         app_handle,
@@ -475,12 +510,114 @@ fn open_connection_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
     show_main_window(app);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocaleFamily {
+    English,
+    SimplifiedChinese,
+    TraditionalChinese,
+    Japanese,
+    Spanish,
+    Italian,
+    Portuguese,
+}
+
+// Mirrors the frontend language mapping in apps/desktop/src/i18n/index.ts
+// (localeFromLanguageTag) so native menus agree with the UI language.
+fn locale_family(locale: &str) -> LocaleFamily {
+    let normalized = locale.replace('_', "-").to_ascii_lowercase();
+    let is_language = |language: &str| normalized == language || normalized.starts_with(&format!("{language}-"));
+    if is_language("zh") {
+        if normalized.contains("hant")
+            || normalized.starts_with("zh-tw")
+            || normalized.starts_with("zh-hk")
+            || normalized.starts_with("zh-mo")
+        {
+            LocaleFamily::TraditionalChinese
+        } else {
+            LocaleFamily::SimplifiedChinese
+        }
+    } else if is_language("ja") {
+        LocaleFamily::Japanese
+    } else if is_language("es") {
+        LocaleFamily::Spanish
+    } else if is_language("it") {
+        LocaleFamily::Italian
+    } else if is_language("pt") {
+        LocaleFamily::Portuguese
+    } else {
+        LocaleFamily::English
+    }
+}
+
+fn tray_menu_labels_for_locale(locale: &str) -> (&'static str, &'static str) {
+    match locale_family(locale) {
+        LocaleFamily::SimplifiedChinese => ("显示 DBX", "退出 DBX"),
+        LocaleFamily::TraditionalChinese => ("顯示 DBX", "退出 DBX"),
+        LocaleFamily::Japanese => ("DBXを表示", "DBXを終了"),
+        LocaleFamily::Spanish => ("Mostrar DBX", "Salir de DBX"),
+        LocaleFamily::Italian => ("Mostra DBX", "Esci da DBX"),
+        LocaleFamily::Portuguese => ("Mostrar DBX", "Sair do DBX"),
+        LocaleFamily::English => ("Show DBX", "Quit DBX"),
+    }
+}
+
+// Matches the frontend supportInfoCopy translations in apps/desktop/src/i18n/locales/*.ts.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn app_menu_copy_support_info_label(locale: &str) -> &'static str {
+    match locale_family(locale) {
+        LocaleFamily::SimplifiedChinese => "复制支持信息",
+        LocaleFamily::TraditionalChinese => "複製支援資訊",
+        LocaleFamily::Japanese => "サポート情報をコピー",
+        LocaleFamily::Spanish => "Copiar información",
+        LocaleFamily::Italian => "Copia informazioni",
+        LocaleFamily::Portuguese => "Copiar informações",
+        LocaleFamily::English => "Copy Support Info",
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn app_menu_quit_label(locale: &str, app_name: &str) -> String {
+    match locale_family(locale) {
+        LocaleFamily::SimplifiedChinese | LocaleFamily::TraditionalChinese => format!("退出 {app_name}"),
+        LocaleFamily::Japanese => format!("{app_name}を終了"),
+        LocaleFamily::Spanish => format!("Salir de {app_name}"),
+        LocaleFamily::Italian => format!("Esci da {app_name}"),
+        LocaleFamily::Portuguese => format!("Sair do {app_name}"),
+        LocaleFamily::English => format!("Quit {app_name}"),
+    }
+}
+
+fn current_app_locale<R: tauri::Runtime, M: Manager<R>>(manager: &M) -> String {
+    match manager.try_state::<AppLocaleState>() {
+        Some(state) => state.get(),
+        None => sys_locale::get_locale().unwrap_or_default(),
+    }
+}
+
+fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<tauri::menu::Menu<R>> {
+    let (show_label, quit_label) = tray_menu_labels_for_locale(&current_app_locale(manager));
+    MenuBuilder::new(manager).text("show", show_label).separator().text("quit", quit_label).build()
+}
+
+/// Rebuilds the tray menu (and the macOS app menu) so native labels follow the
+/// UI language after the frontend reports a locale change.
+pub(crate) fn refresh_native_menus(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {
+        tray.set_menu(Some(build_tray_menu(app)?))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.set_menu(build_app_menu(app)?)?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn setup_desktop_tray<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
     _icon_theme: DesktopIconTheme,
 ) -> tauri::Result<()> {
-    let menu = MenuBuilder::new(manager).text("show", "Show DBX").separator().text("quit", "Quit DBX").build()?;
+    let menu = build_tray_menu(manager)?;
     let mut tray =
         TrayIconBuilder::<R>::with_id(DESKTOP_TRAY_ID).tooltip("DBX").menu(&menu).show_menu_on_left_click(false);
     #[cfg(target_os = "macos")]
@@ -611,16 +748,49 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        linux_appimage_system_gtk_immodules_cache, linux_appimage_wayland_backend_override,
-        linux_nvidia_driver_from_state, linux_selected_drm_render_device, linux_webkit_rendering_workarounds,
-        native_window_decorations_override, should_confirm_app_exit_request, should_fallback_to_native_quit,
-        should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup,
-        uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
+        app_menu_copy_support_info_label, app_menu_quit_label, linux_appimage_system_gtk_immodules_cache,
+        linux_appimage_wayland_backend_override, linux_nvidia_driver_from_state, linux_selected_drm_render_device,
+        linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
+        should_fallback_to_native_quit, should_hide_window_on_close, should_setup_desktop_tray,
+        should_show_main_window_after_setup, tray_menu_labels_for_locale, uses_application_level_icon,
+        LinuxDrmRenderDevice, LinuxNvidiaDriver,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
     const TEST_GTK3_IMMODULES_CACHE: &str = "/usr/lib/test/gtk-3.0/3.0.0/immodules.cache";
+
+    #[test]
+    fn tray_menu_labels_follow_locale() {
+        assert_eq!(tray_menu_labels_for_locale("zh-CN"), ("显示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh_CN"), ("显示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh-Hans-CN"), ("显示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh"), ("显示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh-TW"), ("顯示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh-Hant-HK"), ("顯示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh-MO"), ("顯示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("ja-JP"), ("DBXを表示", "DBXを終了"));
+        assert_eq!(tray_menu_labels_for_locale("es-ES"), ("Mostrar DBX", "Salir de DBX"));
+        assert_eq!(tray_menu_labels_for_locale("it-IT"), ("Mostra DBX", "Esci da DBX"));
+        assert_eq!(tray_menu_labels_for_locale("pt-BR"), ("Mostrar DBX", "Sair do DBX"));
+        assert_eq!(tray_menu_labels_for_locale("en-US"), ("Show DBX", "Quit DBX"));
+        // Unknown and empty locales fall back to English; "ita" must not match "it".
+        assert_eq!(tray_menu_labels_for_locale("ko-KR"), ("Show DBX", "Quit DBX"));
+        assert_eq!(tray_menu_labels_for_locale("ita"), ("Show DBX", "Quit DBX"));
+        assert_eq!(tray_menu_labels_for_locale(""), ("Show DBX", "Quit DBX"));
+    }
+
+    #[test]
+    fn app_menu_labels_follow_locale() {
+        assert_eq!(app_menu_quit_label("zh-CN", "DBX"), "退出 DBX");
+        assert_eq!(app_menu_quit_label("zh-TW", "DBX"), "退出 DBX");
+        assert_eq!(app_menu_quit_label("ja-JP", "DBX"), "DBXを終了");
+        assert_eq!(app_menu_quit_label("en-US", "DBX"), "Quit DBX");
+        assert_eq!(app_menu_quit_label("", "DBX"), "Quit DBX");
+        assert_eq!(app_menu_copy_support_info_label("zh-CN"), "复制支持信息");
+        assert_eq!(app_menu_copy_support_info_label("zh-TW"), "複製支援資訊");
+        assert_eq!(app_menu_copy_support_info_label("en-US"), "Copy Support Info");
+    }
 
     #[test]
     fn hides_window_on_close_for_windows_and_macos() {
@@ -930,6 +1100,7 @@ pub fn run() {
 
     builder
         .manage(CloseBehaviorState::new())
+        .manage(AppLocaleState::new())
         .on_page_load(|webview, payload| {
             if payload.event() == PageLoadEvent::Started {
                 if let Some(state) = webview.app_handle().try_state::<CloseBehaviorState>() {
@@ -1082,6 +1253,7 @@ pub fn run() {
             commands::app_settings::save_desktop_settings,
             commands::app_settings::load_max_agent_turns,
             commands::app_settings::save_max_agent_turns,
+            commands::app_settings::set_app_locale,
             commands::app_settings::complete_app_close,
             commands::app_settings::mark_frontend_ready,
             commands::app_settings::request_app_close_from_window_controls,
