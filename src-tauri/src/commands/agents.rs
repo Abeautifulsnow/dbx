@@ -172,7 +172,8 @@ pub async fn import_agents_from_zip(
     let app_handle = app.clone();
     let operation_id = operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let result =
-        import_agents_from_zip_core(am, &zip_path, |event| emit_agent_progress(&app_handle, &operation_id, event))?;
+        import_agents_from_zip_core(am, &zip_path, |event| emit_agent_progress(&app_handle, &operation_id, event))
+            .await?;
     let count = result.drivers_installed.len() as u32;
     emit_agent_progress(&app, &operation_id, AgentProgressEvent::step("done"));
     Ok(count)

@@ -220,6 +220,7 @@ pub async fn import_agents_from_zip(
             import_agents_from_zip_core(&state.app.agent_manager, &zip_path, |event| {
                 send_progress_event(&tx, event.with_operation_id(&operation_id))
             })
+            .await
             .map_err(AppError::from)
         }
         .await;

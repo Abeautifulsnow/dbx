@@ -608,7 +608,7 @@ pub async fn reinstall_agent_jre_from(
     Ok(())
 }
 
-pub fn import_agents_from_zip(
+pub async fn import_agents_from_zip(
     am: &AgentManager,
     zip_path: &Path,
     progress: impl Fn(AgentProgressEvent),
@@ -619,11 +619,12 @@ pub fn import_agents_from_zip(
             step: p.step,
             downloaded: Some(p.current as u64),
             total: Some(p.total as u64),
-            db_type: Some(p.label),
+            db_type: p.db_type,
             current: Some(p.current),
             total_drivers: Some(p.total),
         });
     })
+    .await
 }
 
 async fn install_agent_driver_with_batch(
@@ -1394,7 +1395,12 @@ pub struct OfflineImportProgress {
     pub step: String,
     pub current: u32,
     pub total: u32,
+    /// Display label for the current item (e.g. "MySQL", "JRE 21.0.12").
     pub label: String,
+    /// The real database-type key (e.g. "mysql"), used by the frontend for
+    /// per-driver progress routing. `None` for JRE-only steps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1425,11 +1431,16 @@ pub fn inspect_offline_zip(zip_path: &Path) -> Result<OfflineImportPlan, String>
     })
 }
 
-pub fn import_offline_zip(
+pub async fn import_offline_zip(
     am: &AgentManager,
     zip_path: &Path,
     progress: impl Fn(OfflineImportProgress),
 ) -> Result<OfflineImportResult, String> {
+    // Offline import can touch both JRE and driver directories — hold an
+    // exclusive installation-operation lock so that concurrent driver installs,
+    // JRE installs, Upgrade All, and uninstall operations are serialised.
+    let _installation_guard = am.installation_operation_lock.write().await;
+
     let file = std::fs::File::open(zip_path).map_err(|e| format!("Failed to open ZIP file: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid ZIP file: {e}"))?;
 
@@ -1458,7 +1469,13 @@ pub fn import_offline_zip(
             continue;
         }
 
-        progress(OfflineImportProgress { step: "jre-extract".into(), current, total, label: format!("JRE {jre_key}") });
+        progress(OfflineImportProgress {
+            step: "jre-extract".into(),
+            current,
+            total,
+            label: format!("JRE {jre_key}"),
+            db_type: None,
+        });
 
         let mut entry = archive.by_name(entry_name).map_err(|e| format!("Failed to read {entry_name}: {e}"))?;
         let tmp_archive = am.base_dir().join(format!("jre-offline-{jre_key}.tar.gz"));
@@ -1512,6 +1529,7 @@ pub fn import_offline_zip(
             current,
             total,
             label: agent_catalog::label_for_key(db_type).unwrap_or(db_type).to_string(),
+            db_type: Some(db_type.clone()),
         });
 
         let driver_path = if *is_native { am.driver_native_path(db_type) } else { am.driver_jar_path(db_type) };
@@ -2403,6 +2421,24 @@ mod agent_registry_install_tests {
         assert!(cache_path.exists());
         assert!(!jar_path.exists());
         assert!(!manager.load_state().installed_drivers.contains_key(db_type));
+    }
+
+    #[tokio::test]
+    async fn offline_import_exclusive_lock_waits_for_in_flight_driver_operation() {
+        let manager = test_manager("offline-import-lock");
+        // Simulate an in-flight driver operation holding a read lock.
+        let driver_guard = manager.installation_operation_lock.read().await;
+        // import_offline_zip acquires the write lock — it must wait.
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(50), manager.installation_operation_lock.write())
+                .await;
+        assert!(blocked.is_err(), "offline import entered before an in-flight driver operation completed");
+
+        drop(driver_guard);
+        let _offline_guard =
+            tokio::time::timeout(std::time::Duration::from_secs(1), manager.installation_operation_lock.write())
+                .await
+                .expect("offline import did not resume after driver operations completed");
     }
 }
 
