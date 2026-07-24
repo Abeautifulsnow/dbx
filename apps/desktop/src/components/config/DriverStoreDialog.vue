@@ -18,7 +18,17 @@ import type { JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, JdbcPlug
 import * as api from "@/lib/backend/api";
 import type { AgentDriverInfo, DriverRuntimeInfo, DriverRuntimeSummary, DriverStoreUsage, JavaRuntimeConfig } from "@/lib/backend/api";
 import { formatRuntimeBytes, formatRuntimeCpu, formatRuntimeUptime, runtimeHealthClass, runtimeStatusClass, runtimeStatusDotClass } from "@/lib/connection/driverRuntimePresentation";
-import { addDriverInstallQueue, driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressTarget, removeDriverInstallQueue, takeNextDriverInstallQueue, updatePerDriverProgress, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
+import {
+  addDriverInstallQueue,
+  driverInstallProgressChannel,
+  driverInstallProgressPercent,
+  isDriverInstallProgressForOperation,
+  isDriverInstallProgressTarget,
+  removeDriverInstallQueue,
+  takeNextDriverInstallQueue,
+  updatePerDriverProgress,
+  type DriverInstallProgress,
+} from "@/lib/connection/driverInstallProgressUi";
 import { PRESTOSQL_DRIVER_DB_TYPE, prestoSqlBuiltinDriverRow, prestoSqlMavenBundle } from "@/lib/database/prestoSqlBuiltinDriver";
 import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { isOfflineDriverPackage, webDriverImportAccept } from "@/lib/driverStore/driverImportSelection";
@@ -170,6 +180,7 @@ const upgradingCompletedCount = ref(0);
 const upgradingTotal = ref(0);
 const queuedDriverInstalls = ref<string[]>([]);
 const reinstallingJre = ref<string | null>(null);
+const activeAgentOperationId = ref<string | null>(null);
 const refreshing = ref(false);
 const agentProgressByDbType = reactive<Record<string, DriverInstallProgress | null | undefined>>({});
 const jdbcPluginProgress = ref<DriverInstallProgress | null>(null);
@@ -435,6 +446,7 @@ async function installDriver(dbType: string) {
 async function runDriverInstall(dbType: string) {
   const label = driverLabel(dbType);
   installing.value = dbType;
+  activeAgentOperationId.value = crypto.randomUUID();
   resetAgentInstallProgress();
   try {
     if (isPrestoSqlBuiltinDriver(dbType)) {
@@ -453,13 +465,14 @@ async function runDriverInstall(dbType: string) {
       toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
       return;
     }
-    await api.installAgent(dbType);
+    await api.installAgent(dbType, activeAgentOperationId.value);
     await refreshAgents();
     toast(t("driverStore.driverInstallSuccess", { label }));
   } catch (e: any) {
     toast(t("driverStore.driverInstallFailed", { label, error: e }));
   } finally {
     installing.value = null;
+    activeAgentOperationId.value = null;
     resetAgentInstallProgress();
   }
 }
@@ -477,6 +490,7 @@ async function runQueuedDriverInstalls() {
 
 async function upgradeAll() {
   upgradingAll.value = true;
+  activeAgentOperationId.value = crypto.randomUUID();
   upgradingCompletedCount.value = 0;
   queuedDriverInstalls.value = [];
   resetAgentInstallProgress();
@@ -488,7 +502,7 @@ async function upgradeAll() {
       toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
       return;
     }
-    const result = await api.upgradeAllAgents();
+    const result = await api.upgradeAllAgents(activeAgentOperationId.value);
     await refreshAgents();
     if (result.failed.length > 0) {
       const failedLabels = result.failed.map((item) => drivers.value.find((driver) => driver.db_type === item.db_type)?.label ?? item.db_type).join(", ");
@@ -500,6 +514,7 @@ async function upgradeAll() {
     toast(t("driverStore.upgradeAllFailed", { error: e }));
   } finally {
     upgradingAll.value = false;
+    activeAgentOperationId.value = null;
     upgradingCompletedCount.value = 0;
     upgradingTotal.value = 0;
     resetAgentInstallProgress();
@@ -582,15 +597,17 @@ async function importOfflineZip() {
   }
   if (!selected) return;
   importingZip.value = true;
+  activeAgentOperationId.value = crypto.randomUUID();
   resetAgentInstallProgress();
   try {
-    const count = await api.importAgentsFromZip(selected);
+    const count = await api.importAgentsFromZip(selected, activeAgentOperationId.value);
     await refreshAgents();
     toast(t("driverStore.offlineImportSuccess", { count }));
   } catch (e: any) {
     toast(t("driverStore.offlineImportFailed", { error: e }));
   } finally {
     importingZip.value = false;
+    activeAgentOperationId.value = null;
     resetAgentInstallProgress();
   }
 }
@@ -611,9 +628,16 @@ async function importDriverFile(driver: AgentDriverInfo) {
   const isWindows = navigator.userAgent.toLowerCase().includes("windows");
   const installSelectedFile = async (selected: string | File) => {
     if (isOfflineDriverPackage(selected)) {
-      const count = await api.importAgentsFromZip(selected);
-      await refreshAgents();
-      toast(t("driverStore.offlineImportSuccess", { count }));
+      activeAgentOperationId.value = crypto.randomUUID();
+      resetAgentInstallProgress();
+      try {
+        const count = await api.importAgentsFromZip(selected, activeAgentOperationId.value);
+        await refreshAgents();
+        toast(t("driverStore.offlineImportSuccess", { count }));
+      } finally {
+        activeAgentOperationId.value = null;
+        resetAgentInstallProgress();
+      }
     } else {
       await api.importAgentDriver(dbType, selected);
       await refreshAgents();
@@ -648,15 +672,17 @@ async function importDriverFile(driver: AgentDriverInfo) {
 
 async function reinstallJre(jreKey: string) {
   reinstallingJre.value = jreKey;
+  activeAgentOperationId.value = crypto.randomUUID();
   resetAgentInstallProgress();
   try {
-    await api.reinstallJre(jreKey);
+    await api.reinstallJre(jreKey, activeAgentOperationId.value);
     await refreshAgents();
     toast(t("driverStore.jreReinstallSuccess", { jre: jreKey }));
   } catch (e: any) {
     toast(t("driverStore.jreReinstallFailed", { jre: jreKey, error: e }));
   } finally {
     reinstallingJre.value = null;
+    activeAgentOperationId.value = null;
     resetAgentInstallProgress();
   }
 }
@@ -1161,6 +1187,7 @@ onMounted(async () => {
 
   unlisten = await api.listenAgentInstallProgress((payload) => {
     const incoming = payload as DriverInstallProgress;
+    if (!isDriverInstallProgressForOperation(incoming, activeAgentOperationId.value)) return;
     const channel = driverInstallProgressChannel(incoming);
     const jdbcProgressBelongsToPrestoSql = channel === "jdbc-plugin" && installing.value === PRESTOSQL_DRIVER_DB_TYPE && !isInstallingJdbcPlugin.value;
     if (jdbcProgressBelongsToPrestoSql) {

@@ -434,12 +434,12 @@ export async function restartDriverRuntime(runtimeId: string): Promise<void> {
   await post("/api/agents/runtime/restart", { runtimeId });
 }
 
-export async function installAgent(dbType: string, _source?: UpdateDownloadSource): Promise<void> {
-  await post("/api/agents/install", { dbType });
+export async function installAgent(dbType: string, _source?: UpdateDownloadSource, operationId?: string): Promise<void> {
+  await post("/api/agents/install", { dbType, operationId });
 }
 
-export async function upgradeAllAgents(_source?: UpdateDownloadSource): Promise<UpgradeAllAgentDriversResult> {
-  return post("/api/agents/upgrade-all", {});
+export async function upgradeAllAgents(_source?: UpdateDownloadSource, operationId?: string): Promise<UpgradeAllAgentDriversResult> {
+  return post("/api/agents/upgrade-all", { operationId });
 }
 
 export async function checkAgentUpdateBlockers(_dbTypes: string[]): Promise<AgentUpdateBlocker[]> {
@@ -462,11 +462,12 @@ export async function invalidateAgentRegistryCache(): Promise<void> {
   await post("/api/agents/invalidate-registry-cache", {});
 }
 
-export async function importAgentsFromZip(fileOrPath: string | File): Promise<number> {
+export async function importAgentsFromZip(fileOrPath: string | File, operationId?: string): Promise<number> {
   if (typeof fileOrPath === "string") {
     throw new Error("Offline ZIP import in web mode requires a File object, not a file path");
   }
   const formData = new FormData();
+  if (operationId) formData.append("operationId", operationId);
   formData.append("file", fileOrPath);
   const res = await fetch(apiUrl("/api/agents/import-offline"), { method: "POST", body: formData });
   if (!res.ok) throw new Error(await res.text());
@@ -493,8 +494,8 @@ export async function importAgentDriver(dbType: string, pathOrFile: string | Fil
 
 export const importAgentJar = importAgentDriver;
 
-export async function reinstallJre(jreKey?: string, _source?: UpdateDownloadSource): Promise<void> {
-  await post("/api/agents/reinstall-jre", { jreKey });
+export async function reinstallJre(jreKey?: string, _source?: UpdateDownloadSource, operationId?: string): Promise<void> {
+  await post("/api/agents/reinstall-jre", { jreKey, operationId });
 }
 
 export async function uninstallJre(jreKey: string): Promise<void> {

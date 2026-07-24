@@ -364,7 +364,9 @@ fn atomic_replace_moves_download_into_place() {
 
 #[test]
 fn agent_progress_event_serializes_backward_compatible_fields() {
-    let event = AgentProgressEvent::transfer("driver", 512, 1024).with_batch(Some("h2"), Some(1), Some(2));
+    let event = AgentProgressEvent::transfer("driver", 512, 1024)
+        .with_batch(Some("h2"), Some(1), Some(2))
+        .with_operation_id("upgrade-123");
 
     let value = serde_json::to_value(event).unwrap();
 
@@ -374,6 +376,7 @@ fn agent_progress_event_serializes_backward_compatible_fields() {
     assert_eq!(value["db_type"], "h2");
     assert_eq!(value["current"], 1);
     assert_eq!(value["total_drivers"], 2);
+    assert_eq!(value["operation_id"], "upgrade-123");
 }
 
 #[test]

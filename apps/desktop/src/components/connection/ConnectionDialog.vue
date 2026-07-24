@@ -53,7 +53,7 @@ import { loadConnectionPickerView, saveConnectionPickerView, type DbPickerView }
 import { normalizeRocketmqNamesrvAddr } from "@/lib/connection/rocketmqNamesrv";
 import { normalizeRabbitmqAddresses } from "@/lib/connection/rabbitmqAddresses";
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
-import { driverInstallProgressChannel, driverInstallProgressPercent, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
+import { driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressForOperation, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityConfig, sqlServerUsesLegacyCompatibility, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
 import { normalizeNacosEndpoint } from "@/lib/nacos/nacosAdmin";
 import {
@@ -174,6 +174,7 @@ const savedDatabaseInfoFingerprint = ref("");
 const savedConnectionConfigFingerprint = ref("");
 const showAgentInstallDialog = ref(false);
 const agentInstallRunning = ref(false);
+const agentInstallOperationId = ref<string | null>(null);
 const agentInstallDriverKey = ref("");
 const agentInstallLabel = ref("");
 const agentInstallProgress = ref<DriverInstallProgress | null>(null);
@@ -1375,6 +1376,7 @@ async function refreshLocalAgentDrivers(): Promise<AgentDriverInstallState[]> {
 }
 
 function beginAgentDriverInstall(driverKey: string, label: string) {
+  agentInstallOperationId.value = crypto.randomUUID();
   agentInstallDriverKey.value = driverKey;
   agentInstallLabel.value = label;
   agentInstallProgress.value = null;
@@ -1384,6 +1386,7 @@ function beginAgentDriverInstall(driverKey: string, label: string) {
 }
 
 function finishAgentDriverInstall() {
+  agentInstallOperationId.value = null;
   agentInstallRunning.value = false;
   agentInstallProgress.value = null;
   agentInstallError.value = "";
@@ -1391,6 +1394,7 @@ function finishAgentDriverInstall() {
 }
 
 function failAgentDriverInstall(error: unknown) {
+  agentInstallOperationId.value = null;
   agentInstallRunning.value = false;
   agentInstallError.value = errorMessage(error);
   showAgentInstallDialog.value = true;
@@ -1410,6 +1414,7 @@ function setAgentInstallDialogOpen(value: boolean) {
 function handleAgentInstallProgress(payload: DriverInstallProgress) {
   if (!agentInstallRunning.value || !agentInstallDriverKey.value) return;
   if (driverInstallProgressChannel(payload) !== "agent") return;
+  if (!isDriverInstallProgressForOperation(payload, agentInstallOperationId.value)) return;
   if (payload.db_type && payload.db_type !== agentInstallDriverKey.value) return;
   if (payload.step === "done" || payload.step === "all-done") {
     agentInstallProgress.value = null;
@@ -1444,7 +1449,7 @@ async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Pro
   testResult.value = { ok: true, message: `Installing ${label} driver...` };
   beginAgentDriverInstall(driverKey, label);
   try {
-    await api.installAgent(driverKey);
+    await api.installAgent(driverKey, agentInstallOperationId.value ?? undefined);
     await refreshLocalAgentDrivers();
     finishAgentDriverInstall();
   } catch (error) {
@@ -1475,7 +1480,7 @@ async function installSqlServerLegacyCompatibilityComponentIfNeeded(): Promise<b
   const label = t("connection.sqlServerLegacyCompatibilityComponent");
   beginAgentDriverInstall(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY, label);
   try {
-    await api.installAgent(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY);
+    await api.installAgent(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY, agentInstallOperationId.value ?? undefined);
     await refreshLocalAgentDrivers();
     finishAgentDriverInstall();
   } catch (error) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { driverInstallProgressChannel, isDriverInstallProgressTarget, updateDriverInstallProgress, updatePerDriverProgress, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
+import { driverInstallProgressChannel, isDriverInstallProgressForOperation, isDriverInstallProgressTarget, updateDriverInstallProgress, updatePerDriverProgress, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 
 describe("driver install progress channels", () => {
   it("classifies agent and JDBC plugin progress independently", () => {
@@ -15,6 +15,16 @@ describe("driver install progress channels", () => {
 
     expect(updateDriverInstallProgress(agentProgress, jdbcProgress, "agent")).toBe(agentProgress);
     expect(updateDriverInstallProgress(jdbcProgress, agentProgress, "jdbc-plugin")).toBe(jdbcProgress);
+  });
+
+  it("rejects progress and terminal events from another operation", () => {
+    expect(isDriverInstallProgressForOperation({ operation_id: "upgrade-b", step: "driver", db_type: "mysql" }, "upgrade-a")).toBe(false);
+    expect(isDriverInstallProgressForOperation({ operation_id: "upgrade-b", step: "all-done" }, "upgrade-a")).toBe(false);
+    expect(isDriverInstallProgressForOperation({ operation_id: "upgrade-a", step: "all-done" }, "upgrade-a")).toBe(true);
+  });
+
+  it("keeps legacy progress compatible when no operation id is emitted", () => {
+    expect(isDriverInstallProgressForOperation({ step: "driver", db_type: "mysql" }, "upgrade-a")).toBe(true);
   });
 
   it("allows a built-in driver backed by JDBC to consume JDBC progress explicitly", () => {

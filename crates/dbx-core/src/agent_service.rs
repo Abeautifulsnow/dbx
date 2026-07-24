@@ -139,6 +139,8 @@ static REGISTRY_CACHE: std::sync::LazyLock<
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AgentProgressEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
     pub step: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub downloaded: Option<u64>,
@@ -166,7 +168,15 @@ pub struct UpgradeAllAgentDriversResult {
 
 impl AgentProgressEvent {
     pub fn step(step: impl Into<String>) -> Self {
-        Self { step: step.into(), downloaded: None, total: None, db_type: None, current: None, total_drivers: None }
+        Self {
+            operation_id: None,
+            step: step.into(),
+            downloaded: None,
+            total: None,
+            db_type: None,
+            current: None,
+            total_drivers: None,
+        }
     }
 
     pub fn transfer(step: impl Into<String>, downloaded: u64, total: u64) -> Self {
@@ -177,6 +187,11 @@ impl AgentProgressEvent {
         self.db_type = db_type.map(ToString::to_string);
         self.current = current;
         self.total_drivers = total_drivers;
+        self
+    }
+
+    pub fn with_operation_id(mut self, operation_id: &str) -> Self {
+        self.operation_id = Some(operation_id.to_string());
         self
     }
 }
@@ -305,10 +320,7 @@ pub fn find_local_agent_jar(db_type: &str) -> Option<PathBuf> {
 
 pub fn install_local_agent(am: &AgentManager, db_type: &str, source: PathBuf) -> Result<(), String> {
     install_local_agent_file(am, db_type, &source)?;
-
-    let mut local_state = am.load_state();
-    record_local_agent_install(&mut local_state, db_type, DEFAULT_JRE_KEY);
-    am.save_state(&local_state)
+    am.mutate_state(|state| record_local_agent_install(state, db_type, DEFAULT_JRE_KEY))
 }
 
 fn install_local_agent_file(am: &AgentManager, db_type: &str, source: &Path) -> Result<(), String> {
@@ -449,7 +461,7 @@ async fn upgrade_all_agent_drivers_with_registry(
     // Run independent driver installs concurrently, with a fixed upper bound
     // so a large registry cannot saturate download and file-system resources.
     let installs = updatable.into_iter().enumerate().map(|(index, db_type)| async move {
-        let result = install_agent_driver_from_registry(
+        let result = install_agent_driver_from_registry_locked(
             am,
             registry,
             source,
@@ -479,7 +491,20 @@ async fn upgrade_all_agent_drivers_with_registry(
     Ok(result)
 }
 
+async fn driver_operation_lock(am: &AgentManager, db_type: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = am.driver_operation_locks.lock().await;
+    locks.entry(db_type.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+}
+
+async fn jre_operation_lock(am: &AgentManager, jre_key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = am.jre_install_locks.lock().await;
+    locks.entry(jre_key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+}
+
 pub async fn uninstall_agent_driver(am: &AgentManager, db_type: &str) -> Result<(), String> {
+    let _installation_guard = am.installation_operation_lock.read().await;
+    let driver_lock = driver_operation_lock(am, db_type).await;
+    let _driver_guard = driver_lock.lock().await;
     prune_driver_download_cache(am, db_type)?;
     let jar_path = am.driver_jar_path(db_type);
     if jar_path.exists() {
@@ -490,9 +515,7 @@ pub async fn uninstall_agent_driver(am: &AgentManager, db_type: &str) -> Result<
             std::fs::remove_dir_all(driver_dir).map_err(|err| err.to_string())?;
         }
     }
-    let mut local_state = am.load_state();
-    local_state.installed_drivers.remove(db_type);
-    am.save_state(&local_state)?;
+    am.mutate_state(|state| state.installed_drivers.remove(db_type))?;
     am.stop_daemon_by_key(db_type).await;
     Ok(())
 }
@@ -502,6 +525,11 @@ pub fn clear_agent_download_cache(am: &AgentManager) -> Result<(), String> {
 }
 
 pub async fn uninstall_agent_jre(am: &AgentManager, jre_key: &str) -> Result<(), String> {
+    // Keep the dependency check and removal atomic with respect to driver
+    // installs/uninstalls that may add or remove a dependency on this JRE.
+    let _installation_guard = am.installation_operation_lock.write().await;
+    let jre_lock = jre_operation_lock(am, jre_key).await;
+    let _jre_guard = jre_lock.lock().await;
     let local_state = am.load_state();
     let dependents: Vec<&str> = local_state
         .installed_drivers
@@ -519,9 +547,7 @@ pub async fn uninstall_agent_jre(am: &AgentManager, jre_key: &str) -> Result<(),
     if let Err(err) = remove_jre_dir_with_retry(&jre_dir) {
         return Err(format_jre_dir_remove_error(&jre_dir, &err));
     }
-    let mut local_state = am.load_state();
-    local_state.jre_versions.remove(jre_key);
-    am.save_state(&local_state)?;
+    am.mutate_state(|state| state.jre_versions.remove(jre_key))?;
     Ok(())
 }
 
@@ -539,6 +565,11 @@ pub async fn reinstall_agent_jre_from(
     source: DownloadSource,
     progress: impl Fn(AgentProgressEvent),
 ) -> Result<(), String> {
+    // Replacing a JRE must not race a driver operation that is using or about
+    // to persist a dependency on the same runtime.
+    let _installation_guard = am.installation_operation_lock.write().await;
+    let jre_lock = jre_operation_lock(am, jre_key).await;
+    let _jre_guard = jre_lock.lock().await;
     let registry = fetch_registry_from(source).await?;
     let jre_info = registry.resolve_jre(jre_key).ok_or_else(|| format!("No JRE definition for version: {jre_key}"))?;
     let platform = AgentManager::current_platform();
@@ -571,9 +602,7 @@ pub async fn reinstall_agent_jre_from(
     persist_pending_jre_cleanup(am, stash.as_ref()).await?;
     extract_tar_gz(&jre_archive, &jre_dir)?;
     std::fs::remove_file(&jre_archive).ok();
-    let mut local_state = am.load_state();
-    local_state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone());
-    am.save_state(&local_state)?;
+    am.mutate_state(|state| state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone()))?;
     cleanup_jre_download_cache_after_success(am, jre_key);
     progress(AgentProgressEvent::step("done"));
     Ok(())
@@ -586,6 +615,7 @@ pub fn import_agents_from_zip(
 ) -> Result<OfflineImportResult, String> {
     import_offline_zip(am, zip_path, |p| {
         progress(AgentProgressEvent {
+            operation_id: None,
             step: p.step,
             downloaded: Some(p.current as u64),
             total: Some(p.total as u64),
@@ -597,6 +627,35 @@ pub fn import_agents_from_zip(
 }
 
 async fn install_agent_driver_with_batch(
+    am: &AgentManager,
+    db_type: &str,
+    source: DownloadSource,
+    progress: &impl Fn(AgentProgressEvent),
+    current: Option<u32>,
+    total_drivers: Option<u32>,
+) -> Result<(), String> {
+    let _installation_guard = am.installation_operation_lock.read().await;
+    let driver_lock = driver_operation_lock(am, db_type).await;
+    let _driver_guard = driver_lock.lock().await;
+    install_agent_driver_with_batch_unlocked(am, db_type, source, progress, current, total_drivers).await
+}
+
+async fn install_agent_driver_from_registry_locked(
+    am: &AgentManager,
+    registry: &AgentRegistry,
+    source: DownloadSource,
+    db_type: &str,
+    progress: &impl Fn(AgentProgressEvent),
+    current: Option<u32>,
+    total_drivers: Option<u32>,
+) -> Result<(), String> {
+    let _installation_guard = am.installation_operation_lock.read().await;
+    let driver_lock = driver_operation_lock(am, db_type).await;
+    let _driver_guard = driver_lock.lock().await;
+    install_agent_driver_from_registry(am, registry, source, db_type, progress, current, total_drivers).await
+}
+
+async fn install_agent_driver_with_batch_unlocked(
     am: &AgentManager,
     db_type: &str,
     source: DownloadSource,
@@ -660,10 +719,7 @@ async fn ensure_jre_from_registry(
 
     // Acquire (or create) the per-JRE-key mutex so that concurrent driver
     // installs sharing the same JRE download it exactly once.
-    let lock = {
-        let mut locks = am.jre_install_locks.lock().await;
-        locks.entry(jre_key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
-    };
+    let lock = jre_operation_lock(am, jre_key).await;
     let _jre_guard = lock.lock().await;
 
     // Double-check: the previous lock holder may have already installed.
@@ -718,12 +774,7 @@ async fn ensure_jre_from_registry(
     // Persist the JRE version after extraction succeeds, while still holding
     // the per-JRE lock.  This guarantees the DCL in another task's
     // jre_needs_install() sees the installed version and skips download.
-    {
-        let _state_guard = am.state_lock.lock().await;
-        let mut state = am.load_state();
-        state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone());
-        am.save_state(&state)?;
-    }
+    am.mutate_state(|state| state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone()))?;
 
     Ok(())
 }
@@ -745,12 +796,11 @@ async fn persist_pending_jre_cleanup(am: &AgentManager, stash: Option<&PathBuf>)
         return Ok(());
     };
 
-    let _state_guard = am.state_lock.lock().await;
-    let mut state = am.load_state();
-    if !state.pending_jre_cleanup.contains(stash_path) {
-        state.pending_jre_cleanup.push(stash_path.clone());
-    }
-    am.save_state(&state)
+    am.mutate_state(|state| {
+        if !state.pending_jre_cleanup.contains(stash_path) {
+            state.pending_jre_cleanup.push(stash_path.clone());
+        }
+    })
 }
 
 async fn persist_local_agent_install_state(
@@ -759,13 +809,12 @@ async fn persist_local_agent_install_state(
     jre_key: &str,
     jre_version: Option<&str>,
 ) -> Result<(), String> {
-    let _state_guard = am.state_lock.lock().await;
-    let mut state = am.load_state();
-    if let Some(version) = jre_version {
-        state.jre_versions.insert(jre_key.to_string(), version.to_string());
-    }
-    record_local_agent_install(&mut state, db_type, jre_key);
-    am.save_state(&state)
+    am.mutate_state(|state| {
+        if let Some(version) = jre_version {
+            state.jre_versions.insert(jre_key.to_string(), version.to_string());
+        }
+        record_local_agent_install(state, db_type, jre_key);
+    })
 }
 
 async fn install_local_agent_with_registry_jre(
@@ -876,23 +925,21 @@ async fn install_agent_driver_from_registry(
         std::fs::remove_file(am.driver_native_path(db_type)).ok();
     }
 
-    let _state_guard = am.state_lock.lock().await;
-    let mut local_state = am.load_state();
-    if requires_java_runtime {
-        if let Some(jre_info) = registry.resolve_jre(jre_key) {
-            local_state.jre_versions.insert(jre_key.clone(), jre_info.version.clone());
+    am.mutate_state(|state| {
+        if requires_java_runtime {
+            if let Some(jre_info) = registry.resolve_jre(jre_key) {
+                state.jre_versions.insert(jre_key.clone(), jre_info.version.clone());
+            }
         }
-    }
-    local_state.installed_drivers.insert(
-        db_type.to_string(),
-        InstalledDriver {
-            version: driver.version.clone(),
-            installed_at: chrono::Utc::now().to_rfc3339(),
-            jre: jre_key.clone(),
-        },
-    );
-    am.save_state(&local_state)?;
-    drop(_state_guard);
+        state.installed_drivers.insert(
+            db_type.to_string(),
+            InstalledDriver {
+                version: driver.version.clone(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                jre: jre_key.clone(),
+            },
+        );
+    })?;
     am.stop_daemon_by_key(db_type).await;
     cleanup_driver_download_cache_after_success(am, db_type);
     progress(AgentProgressEvent::step("done").with_batch(Some(db_type), current, total_drivers));
@@ -1509,7 +1556,23 @@ pub fn import_offline_zip(
         result.drivers_installed.push(db_type.clone());
     }
 
-    am.save_state(&local_state)?;
+    am.mutate_state(|state| {
+        for jre_key in &result.jre_installed {
+            if let Some(version) = local_state.jre_versions.get(jre_key) {
+                state.jre_versions.insert(jre_key.clone(), version.clone());
+            }
+        }
+        for path in &local_state.pending_jre_cleanup {
+            if !state.pending_jre_cleanup.contains(path) {
+                state.pending_jre_cleanup.push(path.clone());
+            }
+        }
+        for db_type in &result.drivers_installed {
+            if let Some(driver) = local_state.installed_drivers.get(db_type) {
+                state.installed_drivers.insert(db_type.clone(), driver.clone());
+            }
+        }
+    })?;
     Ok(result)
 }
 
@@ -1675,16 +1738,16 @@ pub fn import_agent_driver(am: &AgentManager, db_type: &str, source_path: &Path)
     replace_imported_agent_file(&staging_path, &native_path)?;
     std::fs::remove_file(am.driver_jar_path(db_type)).ok();
 
-    let mut local_state = am.load_state();
-    local_state.installed_drivers.insert(
-        db_type.to_string(),
-        InstalledDriver {
-            version: "0.1.0-local".to_string(),
-            installed_at: chrono::Utc::now().to_rfc3339(),
-            jre: DEFAULT_JRE_KEY.to_string(),
-        },
-    );
-    am.save_state(&local_state)
+    am.mutate_state(|state| {
+        state.installed_drivers.insert(
+            db_type.to_string(),
+            InstalledDriver {
+                version: "0.1.0-local".to_string(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                jre: DEFAULT_JRE_KEY.to_string(),
+            },
+        );
+    })
 }
 
 pub fn import_agent_jar(am: &AgentManager, db_type: &str, jar_path: &Path) -> Result<(), String> {
@@ -2208,21 +2271,102 @@ mod agent_registry_install_tests {
         assert_eq!(manager.load_state().pending_jre_cleanup, vec![stash]);
     }
 
-    #[tokio::test]
-    async fn concurrent_local_agent_state_updates_preserve_each_driver() {
+    #[test]
+    fn concurrent_local_agent_state_updates_preserve_each_driver() {
         let manager = test_manager("concurrent-local-agent-state");
-
-        let (oracle, dameng) = tokio::join!(
-            persist_local_agent_install_state(&manager, "oracle", DEFAULT_JRE_KEY, Some("21.0.12")),
-            persist_local_agent_install_state(&manager, "dameng", DEFAULT_JRE_KEY, Some("21.0.12")),
-        );
-        oracle.unwrap();
-        dameng.unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            for db_type in ["oracle", "dameng"] {
+                let start = start.clone();
+                let manager = &manager;
+                scope.spawn(move || {
+                    start.wait();
+                    manager
+                        .mutate_state(|state| {
+                            state.jre_versions.insert(DEFAULT_JRE_KEY.to_string(), "21.0.12".to_string());
+                            record_local_agent_install(state, db_type, DEFAULT_JRE_KEY);
+                        })
+                        .unwrap();
+                });
+            }
+            start.wait();
+        });
 
         let state = manager.load_state();
         assert!(state.installed_drivers.contains_key("oracle"));
         assert!(state.installed_drivers.contains_key("dameng"));
         assert_eq!(state.jre_versions[DEFAULT_JRE_KEY], "21.0.12");
+    }
+
+    #[tokio::test]
+    async fn batch_registry_install_waits_for_an_existing_driver_operation() {
+        let manager = test_manager("batch-driver-operation-lock");
+        let db_type = "oracle";
+        let version = "0.1.31";
+        let native_url = "https://example.com/dbx-agent-oracle";
+        let native_bytes = b"native-agent";
+        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, native_bytes.len() as u64);
+        write_cached_driver_download(
+            &manager,
+            db_type,
+            version,
+            native_url,
+            &manager.driver_native_path(db_type),
+            native_bytes,
+        );
+        let first_lock = driver_operation_lock(&manager, "oracle").await;
+        let first_guard = first_lock.lock().await;
+        let progress = |_| {};
+
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            install_agent_driver_from_registry_locked(
+                &manager,
+                &registry,
+                DownloadSource::Official,
+                db_type,
+                &progress,
+                Some(1),
+                Some(1),
+            )
+            .await
+        })
+        .await;
+        assert!(blocked.is_err(), "batch install entered while another operation owned the driver files");
+
+        drop(first_guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            install_agent_driver_from_registry_locked(
+                &manager,
+                &registry,
+                DownloadSource::Official,
+                db_type,
+                &progress,
+                Some(1),
+                Some(1),
+            ),
+        )
+        .await
+        .expect("batch install did not resume after the driver lock was released")
+        .unwrap();
+        assert_eq!(std::fs::read(manager.driver_native_path(db_type)).unwrap(), native_bytes);
+    }
+
+    #[tokio::test]
+    async fn jre_exclusive_operation_waits_for_in_flight_driver_operation() {
+        let manager = test_manager("jre-exclusive-operation-lock");
+        let driver_guard = manager.installation_operation_lock.read().await;
+
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(50), manager.installation_operation_lock.write())
+                .await;
+        assert!(blocked.is_err(), "JRE replacement entered before an in-flight driver operation completed");
+
+        drop(driver_guard);
+        let _jre_guard =
+            tokio::time::timeout(std::time::Duration::from_secs(1), manager.installation_operation_lock.write())
+                .await
+                .expect("JRE replacement did not resume after driver operations completed");
     }
 
     #[tokio::test]

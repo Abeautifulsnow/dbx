@@ -1,4 +1,5 @@
 export interface DriverInstallProgress {
+  operation_id?: string;
   step: string;
   downloaded?: number;
   total?: number;
@@ -18,6 +19,12 @@ export interface DriverInstallProgressTargetState {
 export type DriverInstallProgressChannel = "agent" | "jdbc-plugin";
 
 const AGENT_PROGRESS_STEPS = new Set(["driver", "jre", "jre-extract", "all-done"]);
+
+export function isDriverInstallProgressForOperation(progress: DriverInstallProgress, operationId: string | null): boolean {
+  // Keep accepting legacy unscoped events, while preventing another active
+  // install's terminal/progress event from mutating this dialog.
+  return !progress.operation_id || progress.operation_id === operationId;
+}
 
 export function driverInstallProgressChannel(progress: DriverInstallProgress): DriverInstallProgressChannel | null {
   if (progress.step === "jdbc-plugin" || progress.step === "jdbc-plugin-extract") return "jdbc-plugin";
