@@ -1,7 +1,10 @@
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+
+use futures::{stream, StreamExt};
 
 use crate::agent_catalog;
 use crate::agent_manager::{
@@ -17,6 +20,10 @@ const JRE_REMOVE_ATTEMPTS: usize = if cfg!(windows) { 6 } else { 1 };
 
 /// Exponential-ish backoff between retries. Total wait ≈ 1.55s on Windows.
 const JRE_REMOVE_BACKOFF_MS: &[u64] = &[50, 100, 200, 400, 400, 400];
+
+/// Keep batch updates concurrent without allowing a large registry to exhaust
+/// the download server, local disk, or the application's file descriptors.
+const MAX_CONCURRENT_AGENT_UPDATES: usize = 4;
 
 /// Delete an old JRE directory, retrying on Windows to cover the daemon-exit
 /// and AV-scan release window. Returns the original `std::io::Error` when all
@@ -93,7 +100,7 @@ fn stash_old_jre_dir(path: &Path) -> std::io::Result<PathBuf> {
 /// path (Some) if the rename fallback was used so the caller can persist it
 /// for startup cleanup, or None if the directory was deleted outright (or
 /// did not exist).
-fn replace_old_jre_dir(am: &AgentManager, path: &Path) -> Result<Option<PathBuf>, String> {
+fn replace_old_jre_dir(path: &Path) -> Result<Option<PathBuf>, String> {
     match remove_jre_dir_with_retry(path) {
         Ok(()) => Ok(None),
         Err(remove_err) => {
@@ -102,13 +109,8 @@ fn replace_old_jre_dir(am: &AgentManager, path: &Path) -> Result<Option<PathBuf>
                 match stash_old_jre_dir(path) {
                     Ok(stash) => {
                         log::warn!("remove_dir_all failed, stashed old JRE at {} ({remove_err})", stash.display());
-                        // Persist immediately so a crash before extraction
-                        // still leaves the stash recorded for cleanup.
-                        let mut state = am.load_state();
-                        state.pending_jre_cleanup.push(stash.clone());
-                        if let Err(save_err) = am.save_state(&state) {
-                            log::warn!("Failed to persist pending_jre_cleanup: {save_err}");
-                        }
+                        // The caller will persist this stash under
+                        // state_lock after extraction succeeds.
                         Ok(Some(stash))
                     }
                     Err(rename_err) => {
@@ -122,7 +124,6 @@ fn replace_old_jre_dir(am: &AgentManager, path: &Path) -> Result<Option<PathBuf>
             }
             #[cfg(not(windows))]
             {
-                let _ = am; // silence unused warning on POSIX
                 Err(format_jre_dir_remove_error(path, &remove_err))
             }
         }
@@ -423,27 +424,47 @@ pub async fn upgrade_all_agent_drivers_from(
     progress: impl Fn(AgentProgressEvent),
 ) -> Result<UpgradeAllAgentDriversResult, String> {
     let registry = fetch_registry_from(source).await?;
+    upgrade_all_agent_drivers_with_registry(am, &registry, source, &progress).await
+}
+
+async fn upgrade_all_agent_drivers_with_registry(
+    am: &AgentManager,
+    registry: &AgentRegistry,
+    source: DownloadSource,
+    progress: &impl Fn(AgentProgressEvent),
+) -> Result<UpgradeAllAgentDriversResult, String> {
     let agents = build_agent_list(am, Some(&registry));
     let updatable: Vec<&AgentDriverInfo> = agents.iter().filter(|agent| agent.update_available).collect();
     let total = updatable.len() as u32;
-    let mut result = UpgradeAllAgentDriversResult::default();
 
-    for (index, agent) in updatable.iter().enumerate() {
-        match install_agent_driver_from_registry(
-            am,
-            &registry,
-            source,
-            &agent.db_type,
-            &progress,
-            Some((index + 1) as u32),
-            Some(total),
-        )
-        .await
-        {
+    // Run independent driver installs concurrently, with a fixed upper bound
+    // so a large registry cannot saturate download and file-system resources.
+    let installs = updatable.into_iter().enumerate().map(|(index, agent)| {
+        let db_type = agent.db_type.clone();
+        async move {
+            let result = install_agent_driver_from_registry(
+                am,
+                registry,
+                source,
+                &db_type,
+                progress,
+                Some((index + 1) as u32),
+                Some(total),
+            )
+            .await;
+            (db_type, result)
+        }
+    });
+
+    let outcomes = stream::iter(installs).buffer_unordered(MAX_CONCURRENT_AGENT_UPDATES).collect::<Vec<_>>().await;
+
+    let mut result = UpgradeAllAgentDriversResult::default();
+    for (db_type, outcome) in outcomes {
+        match outcome {
             Ok(()) => result.upgraded += 1,
             Err(error) => {
-                log::warn!("Failed to update {} agent driver: {}", agent.db_type, error);
-                result.failed.push(AgentDriverUpdateIssue { db_type: agent.db_type.clone(), error });
+                log::warn!("Failed to update {} agent driver: {}", db_type, error);
+                result.failed.push(AgentDriverUpdateIssue { db_type, error });
             }
         }
     }
@@ -540,7 +561,7 @@ pub async fn reinstall_agent_jre_from(
     // handles on Windows (Issue #1100). Falls back to a rename-stash if the
     // directory still cannot be removed.
     am.stop_daemons().await;
-    replace_old_jre_dir(am, &jre_dir)?;
+    replace_old_jre_dir(&jre_dir)?;
     extract_tar_gz(&jre_archive, &jre_dir)?;
     std::fs::remove_file(&jre_archive).ok();
     let mut local_state = am.load_state();
@@ -623,13 +644,33 @@ async fn ensure_jre_from_registry(
     current: Option<u32>,
     total_drivers: Option<u32>,
 ) -> Result<(), String> {
+    // Fast path: already installed — return immediately without acquiring the
+    // per-JRE lock.  The lock is only needed when a download + extract may be
+    // required.
+    if !jre_needs_install(am, registry, jre_key) {
+        return Ok(());
+    }
+
+    // Acquire (or create) the per-JRE-key mutex so that concurrent driver
+    // installs sharing the same JRE download it exactly once.
+    let lock = {
+        let mut locks = am.jre_install_locks.lock().await;
+        locks.entry(jre_key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    };
+    let _jre_guard = lock.lock().await;
+
+    // Double-check: the previous lock holder may have already installed.
+    if !jre_needs_install(am, registry, jre_key) {
+        return Ok(());
+    }
+
     let jre_info = registry.resolve_jre(jre_key).ok_or_else(|| format!("No JRE definition for version: {jre_key}"))?;
     let platform = AgentManager::current_platform();
     let platform_jre = jre_info
         .platforms
         .get(platform)
         .ok_or_else(|| format!("No JRE {jre_key} available for platform: {platform}"))?;
-    let jre_archive = am.base_dir().join("jre-download.tar.gz");
+    let jre_archive = am.base_dir().join(format!("jre-{}-download.tar.gz", jre_key));
     progress(AgentProgressEvent::transfer("jre", 0, platform_jre.size).with_batch(
         Some(db_type),
         current,
@@ -652,13 +693,49 @@ async fn ensure_jre_from_registry(
     .await?;
     progress(AgentProgressEvent::transfer("jre-extract", 0, 0).with_batch(Some(db_type), current, total_drivers));
     let jre_dir = am.jre_dir(jre_key);
-    // Stop daemons first (Windows ERROR_ACCESS_DENIED, Issue #1100).
-    am.stop_daemons().await;
-    replace_old_jre_dir(am, &jre_dir)?;
+    // Stop only daemons that use this JRE before replacing its directory
+    // (Windows ERROR_ACCESS_DENIED, Issue #1100).  In a concurrent
+    // upgrade-all this avoids killing unrelated daemons mid-install.
+    stop_daemons_using_jre(am, jre_key).await;
+    let stash = replace_old_jre_dir(&jre_dir)?;
+
+    // Persist the stash path *before* extraction so that a crash during
+    // extract_tar_gz (or a process kill) doesn't leave the renamed-stash
+    // directory as an orphan that never gets cleaned up.
+    if let Some(stash_path) = &stash {
+        let _state_guard = am.state_lock.lock().await;
+        let mut state = am.load_state();
+        if !state.pending_jre_cleanup.contains(stash_path) {
+            state.pending_jre_cleanup.push(stash_path.clone());
+        }
+        am.save_state(&state)?;
+    }
+
     extract_tar_gz(&jre_archive, &jre_dir)?;
     std::fs::remove_file(&jre_archive).ok();
     cleanup_jre_download_cache_after_success(am, jre_key);
+
+    // Persist the JRE version after extraction succeeds, while still holding
+    // the per-JRE lock.  This guarantees the DCL in another task's
+    // jre_needs_install() sees the installed version and skips download.
+    {
+        let _state_guard = am.state_lock.lock().await;
+        let mut state = am.load_state();
+        state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone());
+        am.save_state(&state)?;
+    }
+
     Ok(())
+}
+
+/// Stop daemons whose installed driver lists `jre_key` as its runtime.
+async fn stop_daemons_using_jre(am: &AgentManager, jre_key: &str) {
+    let state = am.load_state();
+    for (db_type, driver) in &state.installed_drivers {
+        if driver.jre == jre_key {
+            am.stop_daemon_by_key(db_type).await;
+        }
+    }
 }
 
 async fn install_local_agent_with_registry_jre(
@@ -765,6 +842,7 @@ async fn install_agent_driver_from_registry(
         std::fs::remove_file(am.driver_native_path(db_type)).ok();
     }
 
+    let _state_guard = am.state_lock.lock().await;
     let mut local_state = am.load_state();
     if requires_java_runtime {
         if let Some(jre_info) = registry.resolve_jre(jre_key) {
@@ -780,6 +858,7 @@ async fn install_agent_driver_from_registry(
         },
     );
     am.save_state(&local_state)?;
+    drop(_state_guard);
     am.stop_daemon_by_key(db_type).await;
     cleanup_driver_download_cache_after_success(am, db_type);
     progress(AgentProgressEvent::step("done").with_batch(Some(db_type), current, total_drivers));
@@ -1804,7 +1883,7 @@ mod agent_download_url_tests {
 #[cfg(test)]
 mod agent_registry_install_tests {
     use super::*;
-    use crate::agent_manager::{ArtifactInfo, DriverInfo, JavaRuntimeConfig};
+    use crate::agent_manager::{ArtifactInfo, DriverInfo, InstalledDriver, JavaRuntimeConfig, JreInfo};
 
     fn test_manager(name: &str) -> AgentManager {
         let dir = std::env::temp_dir().join(format!("dbx-agent-registry-install-{name}-{}", uuid::Uuid::new_v4()));
@@ -1871,6 +1950,57 @@ mod agent_registry_install_tests {
         cache_path
     }
 
+    fn registry_with_jre(jre_key: &str, version: &str, url: &str, size: u64) -> AgentRegistry {
+        AgentRegistry {
+            jre: None,
+            jres: [(
+                jre_key.to_string(),
+                JreInfo {
+                    version: version.to_string(),
+                    platforms: [(
+                        AgentManager::current_platform().to_string(),
+                        ArtifactInfo { url: url.to_string(), size },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            drivers: std::collections::HashMap::new(),
+        }
+    }
+
+    fn build_jre_archive(am: &AgentManager, jre_key: &str) -> Vec<u8> {
+        let archive_root = am.base_dir().join("jre-test-archive");
+        let payload = archive_root.join("payload");
+        let java_path = am.jre_java_path(jre_key);
+        let relative_java_path = java_path.strip_prefix(am.jre_dir(jre_key)).unwrap();
+        let java_path = payload.join(relative_java_path);
+        std::fs::create_dir_all(java_path.parent().unwrap()).unwrap();
+        std::fs::write(java_path, b"java").unwrap();
+        let archive = archive_root.join("runtime.tar.gz");
+        let status = crate::process::new_std_command("tar")
+            .args(["czf", &archive.to_string_lossy(), "-C", &archive_root.to_string_lossy(), "payload"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::read(archive).unwrap()
+    }
+
+    fn write_cached_jre_download(am: &AgentManager, jre_key: &str, version: &str, url: &str, archive: &[u8]) {
+        let dest = am.base_dir().join(format!("jre-{jre_key}-download.tar.gz"));
+        let cache_path = cached_download_path(
+            am,
+            url,
+            archive.len() as u64,
+            Some(CacheIdentity::Jre { key: jre_key, version }),
+            &dest,
+        );
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(cache_path, archive).unwrap();
+    }
+
     #[tokio::test]
     async fn registry_install_accepts_native_driver_with_legacy_jar_fallback() {
         let manager = test_manager("native-with-jar-fallback");
@@ -1906,6 +2036,132 @@ mod agent_registry_install_tests {
             .unwrap()
             .iter()
             .any(|event| event.step == "done" && event.db_type.as_deref() == Some(db_type)));
+    }
+
+    #[tokio::test]
+    async fn batch_upgrade_preserves_successful_state_and_reports_independent_failure() {
+        let manager = test_manager("batch-upgrade");
+        let oracle_url = "https://example.com/dbx-agent-oracle";
+        let dameng_url = "https://example.com/dbx-agent-dameng";
+        let kingbase_url = "https://example.com/dbx-agent-kingbase.jar";
+        let oracle_bytes = b"oracle-native-agent";
+        let dameng_bytes = b"dameng-native-agent";
+        let corrupt_jar = b"not-a-jar";
+
+        let mut registry =
+            registry_with_native_and_legacy_jar("oracle", "2.0.0", oracle_url, oracle_bytes.len() as u64);
+        registry.drivers.extend(
+            registry_with_native_and_legacy_jar("dameng", "2.0.0", dameng_url, dameng_bytes.len() as u64).drivers,
+        );
+        registry.drivers.extend(registry_with_jar("kingbase", "2.0.0", kingbase_url, corrupt_jar.len() as u64).drivers);
+
+        let mut state = manager.load_state();
+        state.java_runtime = JavaRuntimeConfig { mode: JavaRuntimeMode::System, custom_java_path: None };
+        for (db_type, version) in [("oracle", "1.0.0"), ("dameng", "1.0.0"), ("kingbase", "1.0.0")] {
+            state.installed_drivers.insert(
+                db_type.to_string(),
+                InstalledDriver {
+                    version: version.to_string(),
+                    installed_at: "2026-01-01T00:00:00Z".to_string(),
+                    jre: DEFAULT_JRE_KEY.to_string(),
+                },
+            );
+        }
+        manager.save_state(&state).unwrap();
+
+        write_cached_driver_download(
+            &manager,
+            "oracle",
+            "2.0.0",
+            oracle_url,
+            &manager.driver_native_path("oracle"),
+            oracle_bytes,
+        );
+        write_cached_driver_download(
+            &manager,
+            "dameng",
+            "2.0.0",
+            dameng_url,
+            &manager.driver_native_path("dameng"),
+            dameng_bytes,
+        );
+        write_cached_driver_download(
+            &manager,
+            "kingbase",
+            "2.0.0",
+            kingbase_url,
+            &manager.driver_jar_path("kingbase"),
+            corrupt_jar,
+        );
+        let events = std::sync::Mutex::new(Vec::new());
+        let progress = |event| events.lock().unwrap().push(event);
+
+        let result = upgrade_all_agent_drivers_with_registry(&manager, &registry, DownloadSource::Official, &progress)
+            .await
+            .unwrap();
+
+        assert_eq!(result.upgraded, 2);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].db_type, "kingbase");
+        let state = manager.load_state();
+        assert_eq!(state.installed_drivers["oracle"].version, "2.0.0");
+        assert_eq!(state.installed_drivers["dameng"].version, "2.0.0");
+        assert_eq!(state.installed_drivers["kingbase"].version, "1.0.0");
+        assert_eq!(events.lock().unwrap().iter().filter(|event| event.step == "done").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn shared_jre_is_not_downloaded_again_after_the_first_install_persists_its_version() {
+        let manager = test_manager("shared-jre-deduplication");
+        let jre_key = DEFAULT_JRE_KEY;
+        let version = "21.0.12";
+        let url = "https://example.com/dbx-jre.tar.gz";
+        let archive = build_jre_archive(&manager, jre_key);
+        let registry = registry_with_jre(jre_key, version, url, archive.len() as u64);
+        let events = std::sync::Mutex::new(Vec::new());
+        let progress = |event| events.lock().unwrap().push(event);
+
+        write_cached_jre_download(&manager, jre_key, version, url, &archive);
+        ensure_jre_from_registry(
+            &manager,
+            &registry,
+            DownloadSource::Official,
+            jre_key,
+            "oracle",
+            &progress,
+            Some(1),
+            Some(2),
+        )
+        .await
+        .unwrap();
+
+        // The successful install cleans its cache. Re-add it so the old
+        // implementation fails deterministically by consuming it again.
+        write_cached_jre_download(&manager, jre_key, version, url, &archive);
+        ensure_jre_from_registry(
+            &manager,
+            &registry,
+            DownloadSource::Official,
+            jre_key,
+            "dameng",
+            &progress,
+            Some(2),
+            Some(2),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(manager.load_state().jre_versions[jre_key], version);
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.step == "jre" && event.db_type.as_deref() == Some("oracle")));
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.step == "jre" && event.db_type.as_deref() == Some("dameng")));
     }
 
     #[tokio::test]

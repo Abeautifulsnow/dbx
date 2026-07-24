@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch, nextTick, type Ref } from "vue";
+import { ref, reactive, onMounted, onUnmounted, computed, watch, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { Activity, ExternalLink, Cpu, FolderOpen, FolderSync, MemoryStick, Search, Square, Trash2, Download, RotateCcw, Loader2, RefreshCw, Check, Clock3, FileUp } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -18,7 +18,7 @@ import type { JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, JdbcPlug
 import * as api from "@/lib/backend/api";
 import type { AgentDriverInfo, DriverRuntimeInfo, DriverRuntimeSummary, DriverStoreUsage, JavaRuntimeConfig } from "@/lib/backend/api";
 import { formatRuntimeBytes, formatRuntimeCpu, formatRuntimeUptime, runtimeHealthClass, runtimeStatusClass, runtimeStatusDotClass } from "@/lib/connection/driverRuntimePresentation";
-import { addDriverInstallQueue, driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressTarget, removeDriverInstallQueue, takeNextDriverInstallQueue, updateDriverInstallProgress, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
+import { addDriverInstallQueue, driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressTarget, removeDriverInstallQueue, takeNextDriverInstallQueue, updatePerDriverProgress, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { PRESTOSQL_DRIVER_DB_TYPE, prestoSqlBuiltinDriverRow, prestoSqlMavenBundle } from "@/lib/database/prestoSqlBuiltinDriver";
 import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { isOfflineDriverPackage, webDriverImportAccept } from "@/lib/driverStore/driverImportSelection";
@@ -166,13 +166,12 @@ const drivers = ref<AgentDriverInfo[]>([]);
 const agentDriverSearch = ref("");
 const installing = ref<string | null>(null);
 const upgradingAll = ref(false);
-const upgradingCurrent = ref("");
-const upgradingIndex = ref(0);
+const upgradingCompletedCount = ref(0);
 const upgradingTotal = ref(0);
 const queuedDriverInstalls = ref<string[]>([]);
 const reinstallingJre = ref<string | null>(null);
 const refreshing = ref(false);
-const agentProgress = ref<DriverInstallProgress | null>(null);
+const agentProgressByDbType = reactive<Record<string, DriverInstallProgress | null | undefined>>({});
 const jdbcPluginProgress = ref<DriverInstallProgress | null>(null);
 const javaRuntimeConfig = ref<JavaRuntimeConfig>({ mode: "managed", custom_java_path: null });
 const customJavaPath = ref("");
@@ -188,7 +187,7 @@ const DRIVER_RUNTIME_POLL_MS = 5000;
 const OFFLINE_DRIVER_DOWNLOAD_URL = "https://dbxio.com/cn/drivers";
 
 let unlisten: (() => void) | null = null;
-const lastAgentProgressPercent = ref<number | null>(null);
+const lastAgentProgressPercent: Record<string, number> = {};
 const lastJdbcPluginProgressPercent = ref<number | null>(null);
 
 const installedJres = computed(() => {
@@ -201,7 +200,7 @@ const installedJres = computed(() => {
   return [...jreMap.entries()].map(([key, installed]) => ({ key, installed })).sort((a, b) => b.key.localeCompare(a.key));
 });
 
-function formatProgressText(p: DriverInstallProgress | null, includeBatch: boolean): string {
+function formatProgressText(p: DriverInstallProgress | null | undefined): string {
   if (!p) return "";
   if (p.step === "jre-extract") return t("driverStore.progressJreExtract");
   if (p.step === "jdbc-plugin-extract") return t("driverStore.progressJdbcPluginExtract");
@@ -210,27 +209,49 @@ function formatProgressText(p: DriverInstallProgress | null, includeBatch: boole
   const pct = Math.round(((p.downloaded ?? 0) / p.total) * 100);
   const dl = formatSize(p.downloaded ?? 0);
   const total = formatSize(p.total);
-  const prefix = includeBatch && upgradingAll.value && upgradingCurrent.value ? `[${upgradingIndex.value}/${upgradingTotal.value}] ${upgradingCurrent.value} - ` : "";
-  return `${prefix}${label}  ${dl} / ${total}  (${pct}%)`;
+  return `${label}  ${dl} / ${total}  (${pct}%)`;
 }
 
-const agentProgressText = computed(() => formatProgressText(agentProgress.value, true));
-const jdbcPluginProgressText = computed(() => formatProgressText(jdbcPluginProgress.value, false));
+function getAgentProgressText(dbType: string): string {
+  return formatProgressText(agentProgressByDbType[dbType]);
+}
 
-function progressNumber(progress: DriverInstallProgress | null, lastProgressPercent: Ref<number | null>): number | null {
+function getJdbcPluginProgressTitle(fallback: string): string {
+  return jdbcPluginProgressText.value || fallback;
+}
+
+function getAgentProgressTitle(dbType: string, fallback: string): string {
+  return getAgentProgressText(dbType) || formatProgressText(agentProgressByDbType[dbType]) || fallback;
+}
+
+const jdbcPluginProgressText = computed(() => formatProgressText(jdbcPluginProgress.value));
+
+function getAgentProgressPercent(dbType: string): number | null {
+  const progress = agentProgressByDbType[dbType];
   const next = driverInstallProgressPercent(progress);
   if (next !== null) {
-    lastProgressPercent.value = next;
+    lastAgentProgressPercent[dbType] = next;
   }
-  return next ?? lastProgressPercent.value;
+  return next ?? lastAgentProgressPercent[dbType] ?? null;
 }
 
-const agentProgressNumber = computed(() => progressNumber(agentProgress.value, lastAgentProgressPercent));
-const jdbcPluginProgressNumber = computed(() => progressNumber(jdbcPluginProgress.value, lastJdbcPluginProgressPercent));
+const jdbcPluginProgressNumber = computed(() => {
+  const next = driverInstallProgressPercent(jdbcPluginProgress.value);
+  if (next !== null) {
+    lastJdbcPluginProgressPercent.value = next;
+  }
+  return next ?? lastJdbcPluginProgressPercent.value;
+});
 
 function resetAgentInstallProgress() {
-  agentProgress.value = null;
-  lastAgentProgressPercent.value = null;
+  for (const key of Object.keys(agentProgressByDbType)) {
+    delete agentProgressByDbType[key];
+  }
+  for (const key of Object.keys(lastAgentProgressPercent)) {
+    delete lastAgentProgressPercent[key];
+  }
+  jreReinstallProgress.value = null;
+  lastJreReinstallPercent.value = null;
 }
 
 function resetJdbcPluginInstallProgress() {
@@ -281,7 +302,7 @@ function isDriverProgressActive(dbType: string): boolean {
   return isDriverInstallProgressTarget(dbType, {
     installing: installing.value,
     upgradingAll: upgradingAll.value,
-    progress: agentProgress.value,
+    progressMap: agentProgressByDbType,
   });
 }
 
@@ -289,12 +310,18 @@ function driverRequiresJavaRuntime(driver: AgentDriverInfo): boolean {
   return driver.requires_java_runtime ?? Boolean(driver.jre);
 }
 
-function agentProgressTitle(fallback: string): string {
-  return agentProgressText.value || fallback;
+// JRE reinstall is single-threaded, so a simpler model suffices.
+const jreReinstallProgress = ref<DriverInstallProgress | null>(null);
+const lastJreReinstallPercent = ref<number | null>(null);
+
+function getJreReinstallPercent(): number | null {
+  const next = driverInstallProgressPercent(jreReinstallProgress.value);
+  if (next !== null) lastJreReinstallPercent.value = next;
+  return next ?? lastJreReinstallPercent.value;
 }
 
-function jdbcPluginProgressTitle(fallback: string): string {
-  return jdbcPluginProgressText.value || fallback;
+function getJreReinstallTitle(fallback: string): string {
+  return formatProgressText(jreReinstallProgress.value) || fallback;
 }
 
 function isPrestoSqlBuiltinDriver(dbType: string): boolean {
@@ -450,10 +477,12 @@ async function runQueuedDriverInstalls() {
 
 async function upgradeAll() {
   upgradingAll.value = true;
+  upgradingCompletedCount.value = 0;
   queuedDriverInstalls.value = [];
   resetAgentInstallProgress();
   try {
     const updatableDbTypes = drivers.value.filter((driver) => driver.update_available).map((driver) => driver.db_type);
+    upgradingTotal.value = updatableDbTypes.length;
     const blockers = await api.checkAgentUpdateBlockers(updatableDbTypes);
     if (blockers.length > 0) {
       toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
@@ -471,8 +500,7 @@ async function upgradeAll() {
     toast(t("driverStore.upgradeAllFailed", { error: e }));
   } finally {
     upgradingAll.value = false;
-    upgradingCurrent.value = "";
-    upgradingIndex.value = 0;
+    upgradingCompletedCount.value = 0;
     upgradingTotal.value = 0;
     resetAgentInstallProgress();
   }
@@ -1137,21 +1165,31 @@ onMounted(async () => {
     const jdbcProgressBelongsToPrestoSql = channel === "jdbc-plugin" && installing.value === PRESTOSQL_DRIVER_DB_TYPE && !isInstallingJdbcPlugin.value;
     if (jdbcProgressBelongsToPrestoSql) {
       // PrestoSQL is shown as a built-in driver but installs through the JDBC plugin pipeline.
-      agentProgress.value = updateDriverInstallProgress(agentProgress.value, incoming, "jdbc-plugin");
-    } else {
-      agentProgress.value = updateDriverInstallProgress(agentProgress.value, incoming, "agent");
-      jdbcPluginProgress.value = updateDriverInstallProgress(jdbcPluginProgress.value, incoming, "jdbc-plugin");
+      // Route its events into the per-driver map using the presto key.
+      updatePerDriverProgress(agentProgressByDbType, { ...incoming, db_type: PRESTOSQL_DRIVER_DB_TYPE });
+    } else if (channel === "agent") {
+      if (incoming.db_type) {
+        updatePerDriverProgress(agentProgressByDbType, incoming);
+        // Track completions for the batch counter.
+        if (incoming.step === "done" && upgradingAll.value) {
+          upgradingCompletedCount.value++;
+        }
+      } else {
+        // No db_type — single operation (e.g. JRE reinstall).
+        jreReinstallProgress.value = incoming.step === "done" ? null : incoming;
+      }
+      jdbcPluginProgress.value = null; // clear any stale jdbc-only progress
+    } else if (channel === "jdbc-plugin") {
+      jdbcPluginProgress.value = incoming.step === "done" ? null : incoming;
     }
-    if (payload.db_type && payload.total_drivers) {
-      upgradingCurrent.value = drivers.value.find((d) => d.db_type === payload.db_type)?.label ?? payload.db_type;
-      upgradingIndex.value = payload.current ?? 0;
-      upgradingTotal.value = payload.total_drivers ?? 0;
+    if (payload.total_drivers && !upgradingTotal.value) {
+      upgradingTotal.value = payload.total_drivers;
     }
     // During a batch upgrade, refresh the list as soon as each driver finishes
     // (step="done") so its "Update" button disappears immediately instead of
     // staying disabled until the whole batch completes (step="all-done").
     // Single-driver installs (upgradingAll=false) are refreshed by runDriverInstall.
-    if (upgradingAll.value && payload.step === "done" && channel === "agent") {
+    if (upgradingAll.value && payload.step === "done" && channel === "agent" && payload.db_type) {
       void refreshAgents();
     }
   });
@@ -1256,7 +1294,7 @@ watch(driverStoreTab, (tab) => {
                     </span>
                     <Check v-if="jre.installed" class="h-4 w-4 text-green-600" />
                     <span v-else class="text-xs text-muted-foreground">{{ t("driverStore.notInstalled") }}</span>
-                    <DriverInstallProgressCircle v-if="reinstallingJre === jre.key" :percent="agentProgressNumber" :title="agentProgressTitle(jre.installed ? t('driverStore.reinstalling') : t('driverStore.installing'))" />
+                    <DriverInstallProgressCircle v-if="reinstallingJre === jre.key" :percent="getJreReinstallPercent()" :title="getJreReinstallTitle(jre.installed ? t('driverStore.reinstalling') : t('driverStore.installing'))" />
                     <Button v-else-if="!jre.installed" type="button" variant="default" size="sm" class="h-8 rounded-md text-xs" :disabled="reinstallingJre !== null || installing !== null" @click="reinstallJre(jre.key)">
                       <Download class="h-3.5 w-3.5 mr-1" />
                       {{ t("driverStore.install") }}
@@ -1294,7 +1332,7 @@ watch(driverStoreTab, (tab) => {
                 <Button size="sm" class="h-7 rounded-md text-xs shrink-0 ml-3" :disabled="installing !== null || upgradingAll" @click="upgradeAll">
                   <Loader2 v-if="upgradingAll" class="h-3 w-3 animate-spin mr-1" />
                   <Download v-else class="h-3 w-3 mr-1" />
-                  {{ upgradingAll ? t("driverStore.upgradingProgress", { current: upgradingIndex, total: upgradingTotal }) : t("driverStore.upgradeAll") }}
+                  {{ upgradingAll ? t("driverStore.upgradingProgress", { current: upgradingCompletedCount, total: upgradingTotal }) : t("driverStore.upgradeAll") }}
                 </Button>
               </div>
               <div
@@ -1322,7 +1360,7 @@ watch(driverStoreTab, (tab) => {
                     <Clock3 class="h-3 w-3 mr-1" />
                     {{ t("driverStore.queued") }}
                   </Button>
-                  <DriverInstallProgressCircle v-else-if="!driver.installed && isDriverProgressActive(driver.db_type)" :percent="agentProgressNumber" :title="agentProgressTitle(t('driverStore.installing'))" />
+                  <DriverInstallProgressCircle v-else-if="!driver.installed && isDriverProgressActive(driver.db_type)" :percent="getAgentProgressPercent(driver.db_type)" :title="getAgentProgressTitle(driver.db_type, t('driverStore.installing'))" />
                   <Button v-else-if="!driver.installed" size="sm" class="h-7 rounded-md text-xs" :disabled="upgradingAll" @click="installDriver(driver.db_type)">
                     <Download class="h-3 w-3 mr-1" />
                     {{ t("driverStore.install") }}
@@ -1350,7 +1388,7 @@ watch(driverStoreTab, (tab) => {
                     <Clock3 class="h-3 w-3 mr-1" />
                     {{ t("driverStore.queued") }}
                   </Button>
-                  <DriverInstallProgressCircle v-else-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type)" :percent="agentProgressNumber" :title="agentProgressTitle(t('driverStore.updating'))" />
+                  <DriverInstallProgressCircle v-else-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type)" :percent="getAgentProgressPercent(driver.db_type)" :title="getAgentProgressTitle(driver.db_type, t('driverStore.updating'))" />
                   <Button v-else-if="driver.installed && driver.update_available" size="sm" variant="outline" class="h-7 rounded-md text-xs" :disabled="upgradingAll" @click="installDriver(driver.db_type)">
                     {{ t("driverStore.update") }}
                   </Button>
@@ -1388,7 +1426,7 @@ watch(driverStoreTab, (tab) => {
                     <Clock3 class="h-3 w-3 mr-1" />
                     {{ t("driverStore.queued") }}
                   </Button>
-                  <DriverInstallProgressCircle v-else-if="!driver.installed && isDriverProgressActive(driver.db_type)" :percent="agentProgressNumber" :title="agentProgressTitle(t('driverStore.installing'))" />
+                  <DriverInstallProgressCircle v-else-if="!driver.installed && isDriverProgressActive(driver.db_type)" :percent="getAgentProgressPercent(driver.db_type)" :title="getAgentProgressTitle(driver.db_type, t('driverStore.installing'))" />
                   <Button v-else-if="!driver.installed" size="sm" class="h-7 rounded-md text-xs" :disabled="upgradingAll" @click="installDriver(driver.db_type)">
                     <Download class="h-3 w-3 mr-1" />
                     {{ t("driverStore.install") }}
@@ -1416,7 +1454,7 @@ watch(driverStoreTab, (tab) => {
                     <Clock3 class="h-3 w-3 mr-1" />
                     {{ t("driverStore.queued") }}
                   </Button>
-                  <DriverInstallProgressCircle v-else-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type)" :percent="agentProgressNumber" :title="agentProgressTitle(t('driverStore.updating'))" />
+                  <DriverInstallProgressCircle v-else-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type)" :percent="getAgentProgressPercent(driver.db_type)" :title="getAgentProgressTitle(driver.db_type, t('driverStore.updating'))" />
                   <Button v-else-if="driver.installed && driver.update_available" size="sm" variant="outline" class="h-7 rounded-md text-xs" :disabled="upgradingAll" @click="installDriver(driver.db_type)">
                     {{ t("driverStore.update") }}
                   </Button>
@@ -1440,7 +1478,7 @@ watch(driverStoreTab, (tab) => {
                   </p>
                 </div>
                 <div class="flex shrink-0 items-center gap-3">
-                  <DriverInstallProgressCircle v-if="isInstallingJdbcPlugin" :percent="jdbcPluginProgressNumber" :title="jdbcPluginProgressTitle(t('driverStore.progressDownloadJdbcPlugin'))" />
+                  <DriverInstallProgressCircle v-if="isInstallingJdbcPlugin" :percent="jdbcPluginProgressNumber" :title="getJdbcPluginProgressTitle(t('driverStore.progressDownloadJdbcPlugin'))" />
                   <span v-if="jdbcPluginStatus?.installed" class="text-xs" :class="jdbcPluginStatus.compatible ? 'text-green-600' : 'text-destructive'">
                     {{
                       jdbcPluginStatus.compatible

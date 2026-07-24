@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -435,6 +436,12 @@ pub struct AgentManager {
     pub(crate) connection_runtimes: Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<AgentRuntimeClient>>>>,
     >,
+    /// Serializes `load_state` → modify → `save_state` to prevent lost updates
+    /// when multiple driver installs run concurrently.
+    pub(crate) state_lock: Mutex<()>,
+    /// Per-JRE-key install locks so that concurrent driver installs sharing the
+    /// same JRE download it only once (DCL pattern: lock → re-check installed → download).
+    pub(crate) jre_install_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Default for AgentManager {
@@ -460,6 +467,8 @@ impl AgentManager {
             app_version: app_version.into(),
             daemons: Mutex::new(std::collections::HashMap::new()),
             connection_runtimes: Mutex::new(std::collections::HashMap::new()),
+            state_lock: Mutex::new(()),
+            jre_install_locks: Mutex::new(std::collections::HashMap::new()),
         };
         mgr.migrate_legacy_jre();
         mgr.cleanup_pending_jre_dirs();
