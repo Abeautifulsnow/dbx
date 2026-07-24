@@ -139,17 +139,17 @@ func detectMySQLCompatMode(db *sql.DB) bool {
 		// sql_mode for MySQL syntax toggles such as ANSI_QUOTES.
 		return strings.EqualFold(strings.TrimSpace(databaseMode), "mysql")
 	case errors.Is(err, sql.ErrNoRows):
-		// Older Kingbase versions may not expose database_mode. Fall back to the
-		// legacy sql_mode existence probe in that case.
+		// Older Kingbase versions may not expose database_mode. Probe the syntax
+		// directly because non-MySQL modes can still expose a sql_mode setting.
 	default:
-		// Ignore metadata errors and fall back to the legacy probe below.
+		// Ignore metadata errors and fall back to the syntax probe below.
 	}
-	return mysqlSQLModeExists(db)
+	return supportsBacktickIdentifiers(db)
 }
 
-func mysqlSQLModeExists(db *sql.DB) bool {
+func supportsBacktickIdentifiers(db *sql.DB) bool {
 	var value int
-	return db.QueryRow("SELECT 1 FROM sys_catalog.sys_settings WHERE LOWER(name) = 'sql_mode'").Scan(&value) == nil
+	return db.QueryRow("SELECT 1 AS `dbx_identifier_probe`").Scan(&value) == nil
 }
 
 func (s *server) identifierQuote() string {
@@ -672,6 +672,11 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	tableComment, _ := s.getTableComment(effective, table)
+	return renderTableDDL(effective, table, columns, tableComment), nil
+}
+
+func renderTableDDL(schema, table string, columns []columnInfo, tableComment *string) string {
 	definitions := make([]string, 0, len(columns)+1)
 	primary := []string{}
 	for _, column := range columns {
@@ -683,7 +688,18 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 	if len(primary) > 0 {
 		definitions = append(definitions, "PRIMARY KEY ("+strings.Join(primary, ", ")+")")
 	}
-	return "CREATE TABLE " + quoteIdentifier(effective) + "." + quoteIdentifier(table) + " (\n  " + strings.Join(definitions, ",\n  ") + "\n);", nil
+	qualifiedTable := quoteIdentifier(schema) + "." + quoteIdentifier(table)
+	ddl := "CREATE TABLE " + qualifiedTable + " (\n  " + strings.Join(definitions, ",\n  ") + "\n);"
+	if tableComment != nil && strings.TrimSpace(*tableComment) != "" {
+		ddl += "\nCOMMENT ON TABLE " + qualifiedTable + " IS " + quoteLiteral(*tableComment) + ";"
+	}
+	for _, column := range columns {
+		if column.Comment == nil || strings.TrimSpace(*column.Comment) == "" {
+			continue
+		}
+		ddl += "\nCOMMENT ON COLUMN " + qualifiedTable + "." + quoteIdentifier(column.Name) + " IS " + quoteLiteral(*column.Comment) + ";"
+	}
+	return ddl
 }
 
 func columnDDLDefinition(column columnInfo) string {

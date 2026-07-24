@@ -103,6 +103,7 @@ import {
   nextTransposeState,
   nextTransposeStateForRecordCount,
   restoreDataGridAfterTranspose,
+  shouldAutoTransposeSingleRow,
   transposeRecordIndexesForMode,
   transposeRecordWidthsForDensity,
   transposeFieldWidth,
@@ -176,7 +177,7 @@ import {
 } from "@/lib/dataGrid/dataGridContextMenu";
 
 import { useToast } from "@/composables/useToast";
-import { useDataGridExport } from "@/composables/useDataGridExport";
+import { useDataGridExport, type MongoCopyUpdateTarget } from "@/composables/useDataGridExport";
 import { eventTargetAllowsNativeClipboard, isPlainClipboardShortcut, readTextFromClipboard } from "@/lib/common/clipboard";
 import { claimDataGridPaste, clearDataGridClipboardCopy, parseDataGridClipboard, planDataGridPaste } from "@/lib/dataGrid/dataGridClipboard";
 import { DATA_GRID_ROW_NUM_WIDTH, useDataGridColumnResize } from "@/composables/useDataGridColumnResize";
@@ -269,6 +270,7 @@ interface DataGridProps {
   executionDatabase?: string;
   schema?: string;
   context?: "results" | "table-data";
+  autoTransposeSingleRow?: boolean;
   sourceColumns?: Array<string | undefined>;
   initialWhereInput?: string;
   initialOrderByInput?: string;
@@ -302,14 +304,17 @@ interface DataGridProps {
   allExportResults?: Array<{ sheetName: string; result: QueryResult; sql?: string }>;
   exportFileBaseName?: string;
   customSaveHandler?: import("@/composables/useDataGridEditor").CustomSaveHandler;
+  mongoUpdateTarget?: MongoCopyUpdateTarget;
   queryEditabilityReason?: QueryEditabilityReason;
   allowInsertRows?: boolean;
   allowDeleteRows?: boolean;
 }
 
 const props = withDefaults(defineProps<DataGridProps>(), {
-  // Vue casts absent Boolean props to false unless the default is explicitly
-  // undefined; omitted row-action limits must keep normal table-data editing.
+  // Vue casts absent Boolean props to false unless a default is explicit.
+  // Regular grids have exact totals; document stores opt into lower-bound totals.
+  totalRowCountIsExact: true,
+  // Omitted row-action limits must keep normal table-data editing.
   allowInsertRows: undefined,
   allowDeleteRows: undefined,
 });
@@ -389,6 +394,18 @@ watch(
           loading: props.loading,
         });
       });
+    });
+  },
+  { immediate: true },
+);
+
+watch(
+  () => props.result,
+  (result) => {
+    if (!shouldAutoTransposeSingleRow({ enabled: !!props.autoTransposeSingleRow, preserveTranspose: preserveTransposeOnNextResult.value, rowCount: result.rows.length, columnCount: result.columns.length })) return;
+    nextTick(() => {
+      if (props.result !== result || !props.autoTransposeSingleRow || result.rows.length !== 1 || result.columns.length <= 1) return;
+      applyTransposeState({ showTranspose: true, transposeRowIndex: 0 });
     });
   },
   { immediate: true },
@@ -5087,6 +5104,7 @@ const {
   exportSql: computed(() => props.exportSql),
   tableMeta: computed(() => (props.tableMeta ? { ...props.tableMeta } : undefined)),
   copyInsertTargetLabel: computed(() => props.tableMeta?.tableName ?? props.customSaveHandler?.targetLabel),
+  mongoUpdateTarget: computed(() => props.mongoUpdateTarget),
   databaseType: computed(() => props.databaseType),
   connectionId: computed(() => props.connectionId),
   database: computed(() => props.executionDatabase ?? props.database),
