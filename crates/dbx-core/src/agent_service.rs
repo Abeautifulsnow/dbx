@@ -304,27 +304,35 @@ pub fn find_local_agent_jar(db_type: &str) -> Option<PathBuf> {
 }
 
 pub fn install_local_agent(am: &AgentManager, db_type: &str, source: PathBuf) -> Result<(), String> {
+    install_local_agent_file(am, db_type, &source)?;
+
+    let mut local_state = am.load_state();
+    record_local_agent_install(&mut local_state, db_type, DEFAULT_JRE_KEY);
+    am.save_state(&local_state)
+}
+
+fn install_local_agent_file(am: &AgentManager, db_type: &str, source: &Path) -> Result<(), String> {
     let jar_path = am.driver_jar_path(db_type);
     let parent = jar_path.parent().ok_or_else(|| format!("Invalid driver path: {}", jar_path.display()))?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let staging_path = parent.join(format!(".agent-jar-import-{}", uuid::Uuid::new_v4()));
-    std::fs::copy(&source, &staging_path).map_err(|e| format!("Failed to copy local agent jar: {e}"))?;
+    std::fs::copy(source, &staging_path).map_err(|e| format!("Failed to copy local agent jar: {e}"))?;
     if !is_valid_agent_jar(&staging_path) {
         std::fs::remove_file(&staging_path).ok();
         return Err(format!("Local agent jar is invalid or corrupt: {}", source.display()));
     }
-    replace_imported_agent_file(&staging_path, &jar_path)?;
+    replace_imported_agent_file(&staging_path, &jar_path)
+}
 
-    let mut local_state = am.load_state();
-    local_state.installed_drivers.insert(
+fn record_local_agent_install(state: &mut crate::agent_manager::AgentState, db_type: &str, jre_key: &str) {
+    state.installed_drivers.insert(
         db_type.to_string(),
         InstalledDriver {
             version: "0.1.0-local".to_string(),
             installed_at: chrono::Utc::now().to_rfc3339(),
-            jre: DEFAULT_JRE_KEY.to_string(),
+            jre: jre_key.to_string(),
         },
     );
-    am.save_state(&local_state)
 }
 
 fn is_valid_agent_jar(path: &Path) -> bool {
@@ -559,7 +567,8 @@ pub async fn reinstall_agent_jre_from(
     // handles on Windows (Issue #1100). Falls back to a rename-stash if the
     // directory still cannot be removed.
     am.stop_daemons().await;
-    replace_old_jre_dir(&jre_dir)?;
+    let stash = replace_old_jre_dir(&jre_dir)?;
+    persist_pending_jre_cleanup(am, stash.as_ref()).await?;
     extract_tar_gz(&jre_archive, &jre_dir)?;
     std::fs::remove_file(&jre_archive).ok();
     let mut local_state = am.load_state();
@@ -700,14 +709,7 @@ async fn ensure_jre_from_registry(
     // Persist the stash path *before* extraction so that a crash during
     // extract_tar_gz (or a process kill) doesn't leave the renamed-stash
     // directory as an orphan that never gets cleaned up.
-    if let Some(stash_path) = &stash {
-        let _state_guard = am.state_lock.lock().await;
-        let mut state = am.load_state();
-        if !state.pending_jre_cleanup.contains(stash_path) {
-            state.pending_jre_cleanup.push(stash_path.clone());
-        }
-        am.save_state(&state)?;
-    }
+    persist_pending_jre_cleanup(am, stash.as_ref()).await?;
 
     extract_tar_gz(&jre_archive, &jre_dir)?;
     std::fs::remove_file(&jre_archive).ok();
@@ -736,6 +738,36 @@ async fn stop_daemons_using_jre(am: &AgentManager, jre_key: &str) {
     }
 }
 
+/// Record a rename-stashed JRE before extraction so startup can clean it up
+/// even if the process exits mid-install.
+async fn persist_pending_jre_cleanup(am: &AgentManager, stash: Option<&PathBuf>) -> Result<(), String> {
+    let Some(stash_path) = stash else {
+        return Ok(());
+    };
+
+    let _state_guard = am.state_lock.lock().await;
+    let mut state = am.load_state();
+    if !state.pending_jre_cleanup.contains(stash_path) {
+        state.pending_jre_cleanup.push(stash_path.clone());
+    }
+    am.save_state(&state)
+}
+
+async fn persist_local_agent_install_state(
+    am: &AgentManager,
+    db_type: &str,
+    jre_key: &str,
+    jre_version: Option<&str>,
+) -> Result<(), String> {
+    let _state_guard = am.state_lock.lock().await;
+    let mut state = am.load_state();
+    if let Some(version) = jre_version {
+        state.jre_versions.insert(jre_key.to_string(), version.to_string());
+    }
+    record_local_agent_install(&mut state, db_type, jre_key);
+    am.save_state(&state)
+}
+
 async fn install_local_agent_with_registry_jre(
     am: &AgentManager,
     registry: &AgentRegistry,
@@ -750,12 +782,16 @@ async fn install_local_agent_with_registry_jre(
     if jre_needs_install(am, registry, jre_key) {
         ensure_jre_from_registry(am, registry, source, jre_key, db_type, progress, current, total_drivers).await?;
     }
-    install_local_agent(am, db_type, local_jar)?;
-    if let Some(jre_info) = registry.resolve_jre(jre_key) {
-        let mut local_state = am.load_state();
-        local_state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone());
-        am.save_state(&local_state)?;
-    }
+    install_local_agent_file(am, db_type, &local_jar)?;
+    // This fallback can run for several drivers during upgrade-all. Keep its
+    // driver and JRE updates in one state_lock-protected transaction.
+    persist_local_agent_install_state(
+        am,
+        db_type,
+        jre_key,
+        registry.resolve_jre(jre_key).map(|jre| jre.version.as_str()),
+    )
+    .await?;
     am.stop_daemon_by_key(db_type).await;
     progress(AgentProgressEvent::step("done").with_batch(Some(db_type), current, total_drivers));
     Ok(())
@@ -2160,6 +2196,33 @@ mod agent_registry_install_tests {
             .unwrap()
             .iter()
             .any(|event| event.step == "jre" && event.db_type.as_deref() == Some("dameng")));
+    }
+
+    #[tokio::test]
+    async fn stash_is_recorded_before_jre_extraction() {
+        let manager = test_manager("stash-before-extract");
+        let stash = manager.base_dir().join("jre-21.old-test");
+
+        persist_pending_jre_cleanup(&manager, Some(&stash)).await.unwrap();
+
+        assert_eq!(manager.load_state().pending_jre_cleanup, vec![stash]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_local_agent_state_updates_preserve_each_driver() {
+        let manager = test_manager("concurrent-local-agent-state");
+
+        let (oracle, dameng) = tokio::join!(
+            persist_local_agent_install_state(&manager, "oracle", DEFAULT_JRE_KEY, Some("21.0.12")),
+            persist_local_agent_install_state(&manager, "dameng", DEFAULT_JRE_KEY, Some("21.0.12")),
+        );
+        oracle.unwrap();
+        dameng.unwrap();
+
+        let state = manager.load_state();
+        assert!(state.installed_drivers.contains_key("oracle"));
+        assert!(state.installed_drivers.contains_key("dameng"));
+        assert_eq!(state.jre_versions[DEFAULT_JRE_KEY], "21.0.12");
     }
 
     #[tokio::test]
