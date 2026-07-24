@@ -434,26 +434,24 @@ async fn upgrade_all_agent_drivers_with_registry(
     progress: &impl Fn(AgentProgressEvent),
 ) -> Result<UpgradeAllAgentDriversResult, String> {
     let agents = build_agent_list(am, Some(registry));
-    let updatable: Vec<&AgentDriverInfo> = agents.iter().filter(|agent| agent.update_available).collect();
+    let updatable: Vec<String> =
+        agents.iter().filter(|agent| agent.update_available).map(|agent| agent.db_type.clone()).collect();
     let total = updatable.len() as u32;
 
     // Run independent driver installs concurrently, with a fixed upper bound
     // so a large registry cannot saturate download and file-system resources.
-    let installs = updatable.into_iter().enumerate().map(|(index, agent)| {
-        let db_type = agent.db_type.clone();
-        async move {
-            let result = install_agent_driver_from_registry(
-                am,
-                registry,
-                source,
-                &db_type,
-                progress,
-                Some((index + 1) as u32),
-                Some(total),
-            )
-            .await;
-            (db_type, result)
-        }
+    let installs = updatable.into_iter().enumerate().map(|(index, db_type)| async move {
+        let result = install_agent_driver_from_registry(
+            am,
+            registry,
+            source,
+            &db_type,
+            progress,
+            Some((index + 1) as u32),
+            Some(total),
+        )
+        .await;
+        (db_type, result)
     });
 
     let outcomes = stream::iter(installs).buffer_unordered(MAX_CONCURRENT_AGENT_UPDATES).collect::<Vec<_>>().await;
