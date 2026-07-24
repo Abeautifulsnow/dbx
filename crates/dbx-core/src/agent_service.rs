@@ -433,7 +433,7 @@ async fn upgrade_all_agent_drivers_with_registry(
     source: DownloadSource,
     progress: &impl Fn(AgentProgressEvent),
 ) -> Result<UpgradeAllAgentDriversResult, String> {
-    let agents = build_agent_list(am, Some(&registry));
+    let agents = build_agent_list(am, Some(registry));
     let updatable: Vec<&AgentDriverInfo> = agents.iter().filter(|agent| agent.update_available).collect();
     let total = updatable.len() as u32;
 
