@@ -1735,7 +1735,14 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn import_agent_driver(am: &AgentManager, db_type: &str, source_path: &Path) -> Result<(), String> {
+pub async fn import_agent_driver(am: &AgentManager, db_type: &str, source_path: &Path) -> Result<(), String> {
+    // Manual imports replace the same artifact paths as downloads. Reuse the
+    // install operation and per-driver locks so an import cannot race an
+    // install, Upgrade All, or uninstall for this driver.
+    let _installation_guard = am.installation_operation_lock.read().await;
+    let driver_lock = driver_operation_lock(am, db_type).await;
+    let _driver_guard = driver_lock.lock().await;
+
     if !source_path.is_file() {
         return Err(format!("File not found: {}", source_path.display()));
     }
@@ -1768,8 +1775,8 @@ pub fn import_agent_driver(am: &AgentManager, db_type: &str, source_path: &Path)
     })
 }
 
-pub fn import_agent_jar(am: &AgentManager, db_type: &str, jar_path: &Path) -> Result<(), String> {
-    import_agent_driver(am, db_type, jar_path)
+pub async fn import_agent_jar(am: &AgentManager, db_type: &str, jar_path: &Path) -> Result<(), String> {
+    import_agent_driver(am, db_type, jar_path).await
 }
 
 fn replace_imported_agent_file(staging_path: &Path, target_path: &Path) -> Result<(), String> {
@@ -2003,6 +2010,16 @@ mod agent_registry_install_tests {
     fn test_manager(name: &str) -> AgentManager {
         let dir = std::env::temp_dir().join(format!("dbx-agent-registry-install-{name}-{}", uuid::Uuid::new_v4()));
         AgentManager::new_with_base_dir(dir)
+    }
+
+    fn write_test_agent_jar(path: &Path) {
+        use std::io::Write;
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive.start_file("META-INF/MANIFEST.MF", zip::write::SimpleFileOptions::default()).unwrap();
+        archive.write_all(b"Manifest-Version: 1.0\nMain-Class: com.dbx.Agent\n").unwrap();
+        archive.finish().unwrap();
     }
 
     fn registry_with_native_and_legacy_jar(
@@ -2368,6 +2385,29 @@ mod agent_registry_install_tests {
         .expect("batch install did not resume after the driver lock was released")
         .unwrap();
         assert_eq!(std::fs::read(manager.driver_native_path(db_type)).unwrap(), native_bytes);
+    }
+
+    #[tokio::test]
+    async fn manual_import_waits_for_an_existing_driver_operation() {
+        let manager = test_manager("manual-import-driver-operation-lock");
+        let db_type = "h2";
+        let source = manager.base_dir().join("dbx-agent-h2.jar");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        write_test_agent_jar(&source);
+        let lock = driver_operation_lock(&manager, db_type).await;
+        let first_guard = lock.lock().await;
+
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(50), import_agent_driver(&manager, db_type, &source))
+                .await;
+        assert!(blocked.is_err(), "manual import entered while another operation owned the driver files");
+
+        drop(first_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), import_agent_driver(&manager, db_type, &source))
+            .await
+            .expect("manual import did not resume after the driver lock was released")
+            .unwrap();
+        assert_eq!(std::fs::read(manager.driver_jar_path(db_type)).unwrap(), std::fs::read(source).unwrap());
     }
 
     #[tokio::test]

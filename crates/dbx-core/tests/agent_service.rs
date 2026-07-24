@@ -379,14 +379,14 @@ fn agent_progress_event_serializes_backward_compatible_fields() {
     assert_eq!(value["operation_id"], "upgrade-123");
 }
 
-#[test]
-fn local_jar_import_updates_driver_state() {
+#[tokio::test]
+async fn local_jar_import_updates_driver_state() {
     let manager = test_manager("local-import");
     let source = test_path("local-import-source").join("dbx-agent-h2.jar");
     std::fs::create_dir_all(source.parent().unwrap()).unwrap();
     write_test_agent_jar(&source);
 
-    import_agent_jar(&manager, "h2", &source).unwrap();
+    import_agent_jar(&manager, "h2", &source).await.unwrap();
 
     assert_eq!(std::fs::read(manager.driver_jar_path("h2")).unwrap(), std::fs::read(&source).unwrap());
     let state = manager.load_state();
@@ -395,22 +395,22 @@ fn local_jar_import_updates_driver_state() {
     assert_eq!(installed.jre, DEFAULT_JRE_KEY);
 }
 
-#[test]
-fn local_jar_import_rejects_corrupt_jar() {
+#[tokio::test]
+async fn local_jar_import_rejects_corrupt_jar() {
     let manager = test_manager("local-import-corrupt");
     let source = test_path("local-import-corrupt-source").join("dbx-agent-h2.jar");
     std::fs::create_dir_all(source.parent().unwrap()).unwrap();
     std::fs::write(&source, b"jar").unwrap();
 
-    let err = import_agent_jar(&manager, "h2", &source).unwrap_err();
+    let err = import_agent_jar(&manager, "h2", &source).await.unwrap_err();
 
     assert!(err.contains("invalid or corrupt"));
     assert!(!manager.driver_jar_path("h2").exists());
     assert!(!manager.load_state().installed_drivers.contains_key("h2"));
 }
 
-#[test]
-fn local_native_import_installs_current_platform_executable() {
+#[tokio::test]
+async fn local_native_import_installs_current_platform_executable() {
     let manager = test_manager("local-native-import");
     let source = test_path("local-native-import-source").join(if cfg!(windows) {
         "dbx-agent-kingbase-windows.exe"
@@ -420,35 +420,35 @@ fn local_native_import_installs_current_platform_executable() {
     std::fs::create_dir_all(source.parent().unwrap()).unwrap();
     std::fs::write(&source, current_platform_native_binary()).unwrap();
 
-    import_agent_driver(&manager, "kingbase", &source).unwrap();
+    import_agent_driver(&manager, "kingbase", &source).await.unwrap();
 
     assert_eq!(std::fs::read(manager.driver_native_path("kingbase")).unwrap(), std::fs::read(&source).unwrap());
     assert!(!manager.driver_jar_path("kingbase").exists());
     assert_eq!(manager.load_state().installed_drivers["kingbase"].version, "0.1.0-local");
 }
 
-#[test]
-fn local_native_import_rejects_wrong_platform_binary() {
+#[tokio::test]
+async fn local_native_import_rejects_wrong_platform_binary() {
     let manager = test_manager("local-native-import-invalid");
     let source = test_path("local-native-import-invalid-source").join("dbx-agent-kingbase");
     std::fs::create_dir_all(source.parent().unwrap()).unwrap();
     std::fs::write(&source, b"not-an-executable").unwrap();
 
-    let err = import_agent_driver(&manager, "kingbase", &source).unwrap_err();
+    let err = import_agent_driver(&manager, "kingbase", &source).await.unwrap_err();
 
     assert!(err.contains(AgentManager::current_platform()));
     assert!(!manager.driver_native_path("kingbase").exists());
     assert!(!manager.load_state().installed_drivers.contains_key("kingbase"));
 }
 
-#[test]
-fn local_native_import_rejects_wrong_arch_binary() {
+#[tokio::test]
+async fn local_native_import_rejects_wrong_arch_binary() {
     let manager = test_manager("local-native-wrong-arch");
     let native_path = test_path("local-native-wrong-arch-file").join("agent");
     std::fs::create_dir_all(native_path.parent().unwrap()).unwrap();
     std::fs::write(&native_path, native_binary_for_arch(!cfg!(target_arch = "aarch64"))).unwrap();
 
-    let err = import_agent_driver(&manager, "kingbase", &native_path).unwrap_err();
+    let err = import_agent_driver(&manager, "kingbase", &native_path).await.unwrap_err();
 
     assert!(err.contains("not a"));
     assert!(!manager.driver_native_path("kingbase").exists());

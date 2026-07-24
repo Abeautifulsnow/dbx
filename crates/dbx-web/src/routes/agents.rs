@@ -267,7 +267,7 @@ pub async fn import_agent_driver_file(
 
     let result = async {
         ensure_no_agent_update_blockers(&state.app, std::slice::from_ref(&db_type)).await.map_err(AppError::from)?;
-        import_agent_driver(&state.app.agent_manager, &db_type, &tmp_path).map_err(AppError::from)
+        import_agent_driver(&state.app.agent_manager, &db_type, &tmp_path).await.map_err(AppError::from)
     }
     .await;
     let _ = std::fs::remove_file(&tmp_path);

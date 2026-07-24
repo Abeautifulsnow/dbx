@@ -186,7 +186,7 @@ pub async fn import_agent_driver_cmd(
     path: String,
 ) -> Result<(), String> {
     ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
-    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path))
+    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path)).await
 }
 
 #[tauri::command]
@@ -196,7 +196,7 @@ pub async fn import_agent_jar_cmd(
     path: String,
 ) -> Result<(), String> {
     ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
-    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path))
+    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path)).await
 }
 
 #[tauri::command]
