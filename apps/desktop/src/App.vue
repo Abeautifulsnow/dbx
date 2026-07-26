@@ -100,7 +100,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import type { HistoryEntry } from "@/lib/backend/tauri";
-import type { AiAction } from "@/lib/ai/ai";
+import type { AiAction, AiAssistantMode } from "@/lib/ai/ai";
 
 const AiAssistant = defineAsyncComponent(() => import("@/components/editor/AiAssistant.vue"));
 const QueryHistory = defineAsyncComponent(() => import("@/components/editor/QueryHistory.vue"));
@@ -180,6 +180,8 @@ const showQuickOpen = ref(false);
 const agentDriverUpdateCount = ref(0);
 const showHistory = ref(false);
 const showAiPanel = ref(safeLocalStorageGet("dbx-ai-panel-open") === "true");
+// Keep the user's mode while the AI panel is temporarily unmounted, but reset it on app restart.
+const aiAssistantMode = ref<AiAssistantMode>("ask");
 const showSqlLibraryPanel = ref(safeLocalStorageGet("dbx-sql-library-open") === "true");
 const showSqlFilePanel = ref(safeLocalStorageGet("dbx-sql-file-panel-open") === "true");
 const rightSidebarPanelRefs: Record<RightSidebarPanelId, typeof showAiPanel> = {
@@ -2343,6 +2345,7 @@ onUnmounted(() => {
               <AiAssistant
                 v-if="aiPanelReady"
                 ref="aiAssistantRef"
+                v-model:mode="aiAssistantMode"
                 :tab="activeTab"
                 :connection="activeConnection"
                 @replace-sql="onAiReplaceSql"

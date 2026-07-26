@@ -128,6 +128,7 @@ interface ChatMessage {
 const props = defineProps<{
   tab?: QueryTab;
   connection?: ConnectionConfig;
+  mode?: AiAssistantMode;
 }>();
 
 const emit = defineEmits<{
@@ -138,6 +139,7 @@ const emit = defineEmits<{
   insertRedisCommand: [command: string];
   executeRedisCommand: [command: string];
   openExplainPlan: [sql: string];
+  "update:mode": [mode: AiAssistantMode];
   close: [];
 }>();
 
@@ -146,7 +148,10 @@ const messages = ref<ChatMessage[]>([]);
 const isGenerating = ref(false);
 const scrollRef = ref<InstanceType<typeof ScrollArea> | null>(null);
 const activeAction = ref<AiAction>("general");
-const assistantMode = ref<"ask" | "agent">("ask");
+const assistantMode = computed<AiAssistantMode>({
+  get: () => props.mode ?? "ask",
+  set: (mode) => emit("update:mode", mode),
+});
 const currentSessionId = ref("");
 const conversationId = ref("");
 const conversations = ref<AiConversation[]>([]);
