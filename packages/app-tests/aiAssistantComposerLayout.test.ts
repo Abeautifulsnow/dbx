@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { test } from "vitest";
 import { compileTemplate, parse } from "vue/compiler-sfc";
 
-const aiAssistantPath = "apps/desktop/src/components/editor/AiAssistant.vue";
+const aiAssistantPath = fileURLToPath(new URL("../../apps/desktop/src/components/editor/AiAssistant.vue", import.meta.url));
+const zhCnLocalePath = fileURLToPath(new URL("../../apps/desktop/src/i18n/locales/zh-CN.ts", import.meta.url));
 const source = readFileSync(aiAssistantPath, "utf8");
+const zhCnLocaleSource = readFileSync(zhCnLocalePath, "utf8");
 
 test("AI composer keeps templates in the connection context row", () => {
   const contextRowStart = source.indexOf('v-if="connectionStore.connections.length"');
@@ -15,8 +18,13 @@ test("AI composer keeps templates in the connection context row", () => {
   assert.notEqual(contextRowEnd, -1, "the connection context row should end before mention suggestions");
   assert.match(contextRow, /<Popover v-model:open="showTemplateSelector">/);
   assert.match(contextRow, /max-w-\[40%\]/);
-  assert.match(contextRow, /<span class="truncate">\{\{ templateSelectorLabel \}\}<\/span>/);
-  assert.match(contextRow, /:aria-label="t\('ai\.templateSelectorLabel', \{ label: templateSelectorLabel \}\)"/);
+  assert.match(contextRow, /<span class="truncate">\{\{ templateSelectorTriggerLabel \}\}<\/span>/);
+  assert.match(contextRow, /:aria-label="templateSelectorTriggerLabel"/);
+});
+
+test("AI composer labels an empty template selection explicitly", () => {
+  assert.match(source, /const templateSelectorTriggerLabel = computed\(\(\) => \{[\s\S]*?templateSelectorLabel.*templateSelectorLabel\.value/);
+  assert.match(zhCnLocaleSource, /templateSelectorNone: "未选择"/);
 });
 
 test("AI composer exposes mode and action as one compact selector", () => {
@@ -27,6 +35,7 @@ test("AI composer exposes mode and action as one compact selector", () => {
   assert.notEqual(footerStart, -1, "the combined mode and action selector should exist");
   assert.notEqual(footerEnd, -1, "the model selector should follow the combined selector");
   assert.match(footer, /<Popover v-model:open="modeActionOpen">/);
+  assert.match(footer, /:aria-label="modeActionTriggerLabel"/);
   assert.match(footer, /switchModeActionTab\('ask'\)/);
   assert.match(footer, /switchModeActionTab\('agent'\)/);
   assert.match(footer, /selectModeActionItem\(button\.action\)/);

@@ -1770,7 +1770,7 @@ export default {
     promptTemplateNoTemplates: "No templates yet. Create one to get started.",
     promptTemplateManage: "Manage Templates",
     promptTemplateSavedHint: "Changes are saved automatically.",
-    templateSelectorNone: "None",
+    templateSelectorNone: "Not selected",
     templateSelectorButton: "Templates",
     templateSelectorLabel: "Templates: {label}",
     templateSelectorDeselectAll: "Deselect All",

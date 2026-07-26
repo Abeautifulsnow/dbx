@@ -1649,7 +1649,7 @@ export default withEnglishFallback({
     promptTemplateNoTemplates: "テンプレートがありません。新規作成してください。",
     promptTemplateManage: "テンプレート管理",
     promptTemplateSavedHint: "変更は自動的に保存されます。",
-    templateSelectorNone: "なし",
+    templateSelectorNone: "未選択",
     templateSelectorButton: "テンプレート",
     templateSelectorLabel: "テンプレート: {label}",
     templateSelectorDeselectAll: "すべて解除",

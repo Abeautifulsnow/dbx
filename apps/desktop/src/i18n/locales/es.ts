@@ -1645,7 +1645,7 @@ export default withEnglishFallback({
     promptTemplateNoTemplates: "Aún no hay plantillas. Crea una para empezar.",
     promptTemplateManage: "Gestionar plantillas",
     promptTemplateSavedHint: "Los cambios se guardan automáticamente.",
-    templateSelectorNone: "Ninguna",
+    templateSelectorNone: "Sin seleccionar",
     templateSelectorButton: "Plantillas",
     templateSelectorLabel: "Plantillas: {label}",
     templateSelectorDeselectAll: "Deseleccionar todas",

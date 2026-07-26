@@ -213,6 +213,12 @@ const templateSelectorLabel = computed(() => {
   if (count === 1) return name;
   return `${name} +${count - 1}`;
 });
+const templateSelectorTriggerLabel = computed(() => {
+  if (activeTemplates.value.length === 0) {
+    return t("ai.templateSelectorLabel", { label: templateSelectorLabel.value });
+  }
+  return templateSelectorLabel.value;
+});
 const promptTextareaRef = ref<HTMLTextAreaElement | null>(null);
 const shouldAutoScroll = ref(true);
 const userPausedAutoScroll = ref(false);
@@ -606,7 +612,7 @@ const modeActionTriggerLabel = computed(() => {
 
 function switchModeActionTab(mode: "ask" | "agent") {
   if (assistantMode.value === mode) return;
-  // Switch mode and auto-select the mode's default action
+  // Set the action immediately; the mode watcher is scheduled and must not leave a stale label.
   assistantMode.value = mode;
   activeAction.value = resolveDefaultAction(mode);
 }
@@ -2139,14 +2145,9 @@ async function openExternalUrl(url: string) {
             <!-- Template selector -->
             <Popover v-model:open="showTemplateSelector">
               <PopoverTrigger as-child>
-                <button
-                  type="button"
-                  class="flex min-w-0 max-w-[40%] items-center gap-1 rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
-                  :aria-label="t('ai.templateSelectorLabel', { label: templateSelectorLabel })"
-                  :title="t('ai.templateSelectorLabel', { label: templateSelectorLabel })"
-                >
+                <button type="button" class="flex min-w-0 max-w-[40%] items-center gap-1 rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="templateSelectorTriggerLabel" :title="templateSelectorTriggerLabel">
                   <FileCode class="h-3 w-3" />
-                  <span class="truncate">{{ templateSelectorLabel }}</span>
+                  <span class="truncate">{{ templateSelectorTriggerLabel }}</span>
                   <svg class="h-3 w-3 shrink-0 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" /></svg>
                 </button>
               </PopoverTrigger>
@@ -2260,7 +2261,7 @@ async function openExternalUrl(url: string) {
             <!-- Combined mode + action selector -->
             <Popover v-model:open="modeActionOpen">
               <PopoverTrigger as-child>
-                <button type="button" class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground">
+                <button type="button" class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="modeActionTriggerLabel">
                   <component :is="modeIcon" class="h-3 w-3" />
                   <span>{{ modeActionTriggerLabel }}</span>
                   <svg class="h-3 w-3 shrink-0 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" /></svg>

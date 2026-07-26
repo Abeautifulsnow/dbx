@@ -1771,7 +1771,7 @@ export default withEnglishFallback({
     promptTemplateNoTemplates: "暂无模板，请新建一个。",
     promptTemplateManage: "管理模板",
     promptTemplateSavedHint: "修改后自动保存。",
-    templateSelectorNone: "无",
+    templateSelectorNone: "未选择",
     templateSelectorButton: "模板",
     templateSelectorLabel: "模板: {label}",
     templateSelectorDeselectAll: "全不选",

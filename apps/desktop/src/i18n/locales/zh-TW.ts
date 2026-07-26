@@ -1596,7 +1596,7 @@ export default withEnglishFallback({
     promptTemplateNoTemplates: "尚無範本，請新增一個。",
     promptTemplateManage: "管理範本",
     promptTemplateSavedHint: "修改後自動儲存。",
-    templateSelectorNone: "無",
+    templateSelectorNone: "未選取",
     templateSelectorButton: "範本",
     templateSelectorLabel: "範本: {label}",
     templateSelectorDeselectAll: "取消全選",

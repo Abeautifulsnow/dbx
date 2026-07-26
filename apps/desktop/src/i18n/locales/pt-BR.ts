@@ -1647,7 +1647,7 @@ export default withEnglishFallback({
     promptTemplateNoTemplates: "Nenhum modelo ainda. Crie um para começar.",
     promptTemplateManage: "Gerenciar modelos",
     promptTemplateSavedHint: "As alterações são salvas automaticamente.",
-    templateSelectorNone: "Nenhum",
+    templateSelectorNone: "Não selecionado",
     templateSelectorButton: "Modelos",
     templateSelectorLabel: "Modelos: {label}",
     templateSelectorDeselectAll: "Desmarcar todos",
