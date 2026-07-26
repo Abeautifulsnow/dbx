@@ -128,7 +128,6 @@ interface ChatMessage {
 const props = defineProps<{
   tab?: QueryTab;
   connection?: ConnectionConfig;
-  mode?: AiAssistantMode;
 }>();
 
 const emit = defineEmits<{
@@ -139,7 +138,6 @@ const emit = defineEmits<{
   insertRedisCommand: [command: string];
   executeRedisCommand: [command: string];
   openExplainPlan: [sql: string];
-  "update:mode": [mode: AiAssistantMode];
   close: [];
 }>();
 
@@ -148,10 +146,7 @@ const messages = ref<ChatMessage[]>([]);
 const isGenerating = ref(false);
 const scrollRef = ref<InstanceType<typeof ScrollArea> | null>(null);
 const activeAction = ref<AiAction>("general");
-const assistantMode = computed<AiAssistantMode>({
-  get: () => props.mode ?? "ask",
-  set: (mode) => emit("update:mode", mode),
-});
+const assistantMode = ref<AiAssistantMode>("ask");
 const currentSessionId = ref("");
 const conversationId = ref("");
 const conversations = ref<AiConversation[]>([]);
@@ -1723,6 +1718,9 @@ async function deleteConversation(id: string) {
 function startNewChat() {
   clearMessages();
   showConversationList.value = false;
+  // A fresh conversation always starts from the safe, non-executing default.
+  assistantMode.value = "ask";
+  activeAction.value = resolveDefaultAction("ask");
 }
 
 onMounted(async () => {
