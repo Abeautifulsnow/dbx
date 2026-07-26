@@ -2139,9 +2139,14 @@ async function openExternalUrl(url: string) {
             <!-- Template selector -->
             <Popover v-model:open="showTemplateSelector">
               <PopoverTrigger as-child>
-                <button type="button" class="flex items-center gap-1 whitespace-nowrap rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground">
+                <button
+                  type="button"
+                  class="flex min-w-0 max-w-[40%] items-center gap-1 rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                  :aria-label="t('ai.templateSelectorLabel', { label: templateSelectorLabel })"
+                  :title="t('ai.templateSelectorLabel', { label: templateSelectorLabel })"
+                >
                   <FileCode class="h-3 w-3" />
-                  {{ t("ai.templateSelectorLabel", { label: templateSelectorLabel }) }}
+                  <span class="truncate">{{ templateSelectorLabel }}</span>
                   <svg class="h-3 w-3 shrink-0 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" /></svg>
                 </button>
               </PopoverTrigger>
