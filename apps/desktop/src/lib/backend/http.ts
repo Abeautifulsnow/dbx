@@ -2012,6 +2012,10 @@ export async function redisSetTtl(connectionId: string, db: number, keyRaw: stri
   return post("/api/redis/set-ttl", { connectionId, db, keyRaw, ttl });
 }
 
+export async function redisSetExpireAt(connectionId: string, db: number, keyRaw: string, expireAt: number): Promise<void> {
+  return post("/api/redis/set-expire-at", { connectionId, db, keyRaw, expireAt });
+}
+
 export async function redisDeleteKeys(connectionId: string, db: number, keyRaws: string[]): Promise<number> {
   return post("/api/redis/delete-keys", { connectionId, db, keyRaws });
 }

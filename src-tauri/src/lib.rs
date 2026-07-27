@@ -1535,6 +1535,7 @@ pub fn run() {
             commands::redis_cmd::redis_json_set,
             commands::redis_cmd::redis_check_json_module,
             commands::redis_cmd::redis_set_ttl,
+            commands::redis_cmd::redis_set_expire_at,
             commands::redis_cmd::redis_delete_keys,
             commands::redis_cmd::redis_flush_db,
             commands::redis_cmd::redis_execute_command,
