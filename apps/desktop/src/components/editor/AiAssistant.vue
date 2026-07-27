@@ -611,10 +611,11 @@ const modeActionTriggerLabel = computed(() => {
 });
 
 function switchModeActionTab(mode: "ask" | "agent") {
-  if (assistantMode.value === mode) return;
-  // Set the action immediately; the mode watcher is scheduled and must not leave a stale label.
-  assistantMode.value = mode;
   activeAction.value = resolveDefaultAction(mode);
+  if (assistantMode.value !== mode) {
+    // Set the mode after the action so the tab label and picker stay aligned.
+    assistantMode.value = mode;
+  }
 }
 
 function selectModeActionItem(action: AiAction) {
