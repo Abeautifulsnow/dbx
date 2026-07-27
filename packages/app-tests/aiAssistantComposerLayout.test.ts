@@ -9,13 +9,14 @@ const zhCnLocalePath = fileURLToPath(new URL("../../apps/desktop/src/i18n/locale
 const source = readFileSync(aiAssistantPath, "utf8");
 const zhCnLocaleSource = readFileSync(zhCnLocalePath, "utf8");
 
-test("AI composer keeps templates in the connection context row", () => {
-  const contextRowStart = source.indexOf('v-if="connectionStore.connections.length"');
+test("AI composer keeps templates available without connections", () => {
+  const contextRowStart = source.indexOf('<div class="flex items-center gap-1 mb-1 text-xs text-foreground/80">');
   const contextRowEnd = source.indexOf('v-if="mentionOpen"', contextRowStart);
   const contextRow = source.slice(contextRowStart, contextRowEnd);
 
-  assert.notEqual(contextRowStart, -1, "the connection context row should exist");
+  assert.notEqual(contextRowStart, -1, "the composer context row should exist");
   assert.notEqual(contextRowEnd, -1, "the connection context row should end before mention suggestions");
+  assert.match(contextRow, /<template v-if="connectionStore\.connections\.length">/);
   assert.match(contextRow, /<Popover v-model:open="showTemplateSelector">/);
   assert.match(contextRow, /max-w-\[40%\]/);
   assert.match(contextRow, /<span class="truncate">\{\{ templateSelectorTriggerLabel \}\}<\/span>/);
@@ -40,6 +41,8 @@ test("AI composer exposes mode and action as one compact selector", () => {
   assert.match(footer, /switchModeActionTab\('agent'\)/);
   assert.match(footer, /selectModeActionItem\(button\.action\)/);
   assert.doesNotMatch(footer, /selectAction\(button\.action\)/);
+  assert.match(footer, /<template v-if="showActionButtons">[\s\S]*?<div class="border-t my-1" \/>[\s\S]*?v-for="button in actionButtons"/);
+  assert.match(source, /function selectModeActionItem\(action: AiAction\) \{\s*\/\/ Vector databases[\s\S]*?if \(!showActionButtons\.value\) return;/);
 });
 
 test("AI composer template remains compilable", () => {

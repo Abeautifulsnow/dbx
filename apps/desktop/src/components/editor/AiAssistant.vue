@@ -618,6 +618,8 @@ function switchModeActionTab(mode: "ask" | "agent") {
 }
 
 function selectModeActionItem(action: AiAction) {
+  // Vector databases only support generation; keep this constraint at the selection boundary.
+  if (!showActionButtons.value) return;
   selectAction(action);
   modeActionOpen.value = false;
 }
@@ -2096,53 +2098,55 @@ async function openExternalUrl(url: string) {
       <div ref="promptPanelRef" class="relative rounded-[6px] border bg-background">
         <div class="resize-handle" @mousedown="startResize"></div>
         <div class="px-2 pb-2 pt-1">
-          <div v-if="connectionStore.connections.length" class="flex items-center gap-1 mb-1 text-xs text-foreground/80">
-            <DatabaseIcon v-if="connection" :db-type="connectionIconType(connection)" class="h-3 w-3 shrink-0" />
-            <Server v-else class="h-3 w-3 shrink-0" />
-            <Select
-              :model-value="connection?.id || ''"
-              @update:model-value="
-                (v) => {
-                  if (typeof v === 'string') changeConnection(v);
-                }
-              "
-            >
-              <SelectTrigger class="h-5 w-auto border-0 rounded-md bg-transparent dark:bg-transparent p-0 px-1 text-xs text-foreground/80 shadow-none focus:ring-0 focus-visible:ring-0 [&_svg]:size-3">
-                <SelectValue :placeholder="t('editor.selectConnection')">{{ connection?.name || t("editor.selectConnection") }}</SelectValue>
-              </SelectTrigger>
-              <SelectContent class="min-w-48">
-                <SelectItem v-for="conn in connectionStore.connections" :key="conn.id" :value="conn.id">
-                  <div class="flex min-w-0 items-center gap-2">
-                    <DatabaseIcon :db-type="connectionIconType(conn)" class="h-3.5 w-3.5 shrink-0" />
-                    <ConnectionGroupBadge :connection-id="conn.id" />
-                    <span class="truncate">{{ conn.name }}</span>
-                  </div>
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            <template v-if="connection">
-              <Database class="h-3 w-3 shrink-0 text-foreground/40" />
+          <div class="flex items-center gap-1 mb-1 text-xs text-foreground/80">
+            <template v-if="connectionStore.connections.length">
+              <DatabaseIcon v-if="connection" :db-type="connectionIconType(connection)" class="h-3 w-3 shrink-0" />
+              <Server v-else class="h-3 w-3 shrink-0" />
               <Select
-                :model-value="selectedDatabaseSelectValue"
+                :model-value="connection?.id || ''"
                 @update:model-value="
                   (v) => {
-                    if (typeof v === 'string') changeDatabase(v);
-                  }
-                "
-                @update:open="
-                  (open: boolean) => {
-                    if (open) loadDatabases();
+                    if (typeof v === 'string') changeConnection(v);
                   }
                 "
               >
                 <SelectTrigger class="h-5 w-auto border-0 rounded-md bg-transparent dark:bg-transparent p-0 px-1 text-xs text-foreground/80 shadow-none focus:ring-0 focus-visible:ring-0 [&_svg]:size-3">
-                  <SelectValue :placeholder="t('editor.selectDatabase')">{{ selectedDatabaseLabel }}</SelectValue>
+                  <SelectValue :placeholder="t('editor.selectConnection')">{{ connection?.name || t("editor.selectConnection") }}</SelectValue>
                 </SelectTrigger>
-                <SelectContent>
-                  <SelectItem v-for="option in dbSelectOptions" :key="option.value" :value="option.value">{{ option.label }}</SelectItem>
-                  <SelectItem v-if="!dbSelectOptions.length && connection && tab" :value="selectedDatabaseSelectValue">{{ selectedDatabaseLabel }}</SelectItem>
+                <SelectContent class="min-w-48">
+                  <SelectItem v-for="conn in connectionStore.connections" :key="conn.id" :value="conn.id">
+                    <div class="flex min-w-0 items-center gap-2">
+                      <DatabaseIcon :db-type="connectionIconType(conn)" class="h-3.5 w-3.5 shrink-0" />
+                      <ConnectionGroupBadge :connection-id="conn.id" />
+                      <span class="truncate">{{ conn.name }}</span>
+                    </div>
+                  </SelectItem>
                 </SelectContent>
               </Select>
+              <template v-if="connection">
+                <Database class="h-3 w-3 shrink-0 text-foreground/40" />
+                <Select
+                  :model-value="selectedDatabaseSelectValue"
+                  @update:model-value="
+                    (v) => {
+                      if (typeof v === 'string') changeDatabase(v);
+                    }
+                  "
+                  @update:open="
+                    (open: boolean) => {
+                      if (open) loadDatabases();
+                    }
+                  "
+                >
+                  <SelectTrigger class="h-5 w-auto border-0 rounded-md bg-transparent dark:bg-transparent p-0 px-1 text-xs text-foreground/80 shadow-none focus:ring-0 focus-visible:ring-0 [&_svg]:size-3">
+                    <SelectValue :placeholder="t('editor.selectDatabase')">{{ selectedDatabaseLabel }}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem v-for="option in dbSelectOptions" :key="option.value" :value="option.value">{{ option.label }}</SelectItem>
+                    <SelectItem v-if="!dbSelectOptions.length && connection && tab" :value="selectedDatabaseSelectValue">{{ selectedDatabaseLabel }}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </template>
             </template>
             <span class="min-w-0 flex-1" />
             <!-- Template selector -->
@@ -2292,15 +2296,17 @@ async function openExternalUrl(url: string) {
                     {{ t("ai.modes.agent") }}
                   </button>
                 </div>
-                <div class="border-t my-1" />
-                <!-- Action list -->
-                <div class="max-h-56 overflow-auto">
-                  <button v-for="button in actionButtons" :key="button.action" type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs" :class="activeAction === button.action ? 'bg-accent' : 'hover:bg-muted'" @click="selectModeActionItem(button.action)">
-                    <component :is="button.icon" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                    <span class="flex-1 text-left">{{ t(button.key) }}</span>
-                    <Check v-if="activeAction === button.action" class="h-3.5 w-3.5 shrink-0" />
-                  </button>
-                </div>
+                <template v-if="showActionButtons">
+                  <div class="border-t my-1" />
+                  <!-- Action list -->
+                  <div class="max-h-56 overflow-auto">
+                    <button v-for="button in actionButtons" :key="button.action" type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs" :class="activeAction === button.action ? 'bg-accent' : 'hover:bg-muted'" @click="selectModeActionItem(button.action)">
+                      <component :is="button.icon" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      <span class="flex-1 text-left">{{ t(button.key) }}</span>
+                      <Check v-if="activeAction === button.action" class="h-3.5 w-3.5 shrink-0" />
+                    </button>
+                  </div>
+                </template>
               </PopoverContent>
             </Popover>
             <span class="min-w-0 flex-1" />
