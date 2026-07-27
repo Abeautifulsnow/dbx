@@ -42,9 +42,9 @@ test("catalog falls back from R2 to CNB without using GitHub API", async () => {
       return Response.json({
         drivers: {
           access: {
-            version: "0.1.30",
+            version: "0.1.31",
             jar: {
-              url: "https://github.com/t8y2/dbx/releases/download/agents-v0.2.64/dbx-agent-access-0.1.30.jar",
+              url: "https://github.com/t8y2/dbx/releases/download/agents-v0.2.64/dbx-agent-access-0.1.31.jar",
               size: 1,
             },
           },
