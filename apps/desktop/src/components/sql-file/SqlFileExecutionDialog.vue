@@ -97,14 +97,16 @@ const progressPercent = computed(() => {
   if (current <= 0) return running.value ? 8 : 0;
   return Math.min(95, Math.max(8, Math.round((attempted / current) * 100)));
 });
-const preview = computed(() => previews.value[0] ?? null);
-const previewLineCount = computed(() => preview.value?.preview.split(/\r\n|\r|\n/).length ?? 0);
-const previewLineNumbers = computed(() => Array.from({ length: previewLineCount.value }, (_, index) => index + 1));
-const previewIsTruncated = computed(() => {
-  if (!preview.value) return false;
-  return preview.value.sizeBytes > preview.value.preview.length;
-});
-const previewLineSummary = computed(() => (previewIsTruncated.value ? t("sqlFile.previewingFirstLines", { count: previewLineCount.value }) : t("sqlFile.previewingLines", { count: previewLineCount.value })));
+function previewLineCount(item: SqlFilePreview) {
+  return item.preview.split(/\r\n|\r|\n/).length;
+}
+function previewIsTruncated(item: SqlFilePreview) {
+  return item.sizeBytes > item.preview.length;
+}
+function previewLineSummary(item: SqlFilePreview) {
+  const count = previewLineCount(item);
+  return previewIsTruncated(item) ? t("sqlFile.previewingFirstLines", { count }) : t("sqlFile.previewingLines", { count });
+}
 
 function connectionIconType(id: string) {
   const config = store.getConfig(id);
@@ -485,26 +487,27 @@ watch(
             </Button>
           </div>
 
-          <div v-if="preview" class="min-w-0 max-w-full overflow-hidden rounded-md border">
-            <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs border-b bg-muted/40">
-              <div class="min-w-0 flex items-center gap-2">
-                <FileCode class="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-                <span class="font-medium truncate">{{ preview.fileName }}</span>
-                <span v-if="previews.length > 1" class="shrink-0 text-muted-foreground">(+{{ previews.length - 1 }})</span>
+          <template v-for="(item, index) in previews" :key="item.filePath">
+            <div class="min-w-0 max-w-full overflow-hidden rounded-md border" :class="{ 'mt-3': index > 0 }">
+              <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs border-b bg-muted/40">
+                <div class="min-w-0 flex items-center gap-2">
+                  <FileCode class="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                  <span class="font-medium truncate">{{ item.fileName }}</span>
+                </div>
+                <div class="flex shrink-0 items-center gap-2 text-muted-foreground">
+                  <span>{{ previewLineSummary(item) }}</span>
+                  <span class="h-3 w-px bg-border" />
+                  <span>{{ formatBytes(item.sizeBytes) }}</span>
+                </div>
               </div>
-              <div class="flex shrink-0 items-center gap-2 text-muted-foreground">
-                <span>{{ previewLineSummary }}</span>
-                <span class="h-3 w-px bg-border" />
-                <span>{{ formatBytes(preview.sizeBytes) }}</span>
+              <div class="sql-file-preview-viewer flex max-w-full overflow-auto bg-muted/15 text-xs" :class="previews.length === 1 ? 'min-h-56 max-h-[min(42vh,360px)]' : 'min-h-0 max-h-[min(24vh,220px)]'">
+                <div class="sticky left-0 z-10 select-none border-r bg-background/95 px-2 py-3 text-right font-mono leading-5 text-muted-foreground/70">
+                  <div v-for="n in previewLineCount(item)" :key="n">{{ n }}</div>
+                </div>
+                <pre class="min-w-max flex-1 p-3 font-mono leading-5 whitespace-pre" v-html="highlight(item.preview)"></pre>
               </div>
             </div>
-            <div class="sql-file-preview-viewer flex min-h-56 max-h-[min(42vh,360px)] max-w-full overflow-auto bg-muted/15 text-xs">
-              <div class="sticky left-0 z-10 select-none border-r bg-background/95 px-2 py-3 text-right font-mono leading-5 text-muted-foreground/70">
-                <div v-for="lineNumber in previewLineNumbers" :key="lineNumber">{{ lineNumber }}</div>
-              </div>
-              <pre class="min-w-max flex-1 p-3 font-mono leading-5 whitespace-pre" v-html="highlight(preview.preview)"></pre>
-            </div>
-          </div>
+          </template>
         </div>
 
         <div class="min-w-0 space-y-3">
