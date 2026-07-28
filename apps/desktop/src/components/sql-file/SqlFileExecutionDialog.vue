@@ -54,6 +54,41 @@ watch(previews, (list) => {
 const activePreview = computed<SqlFilePreview | null>(() => {
   return previews.value.find((item) => item.filePath === activePreviewPath.value) ?? previews.value[0] ?? null;
 });
+
+// When multiple files share the same fileName (e.g. migration/create.sql and
+// seed/create.sql), disambiguate by prepending parent directory segments until
+// each file gets a unique label.  Single-name files stay as just fileName.
+const displayFileNames = computed(() => {
+  const items = previews.value;
+  const byFileName = new Map<string, SqlFilePreview[]>();
+  for (const item of items) {
+    const list = byFileName.get(item.fileName) ?? [];
+    list.push(item);
+    byFileName.set(item.fileName, list);
+  }
+  const result = new Map<string, string>();
+  for (const [, group] of byFileName) {
+    if (group.length === 1) {
+      result.set(group[0]!.filePath, group[0]!.fileName);
+      continue;
+    }
+    for (const item of group) {
+      const parts = item.filePath.replace(/\\/g, "/").split("/");
+      for (let depth = 2; depth <= parts.length; depth++) {
+        const candidate = parts.slice(parts.length - depth).join("/");
+        const isUnique = !group.some((o) => o.filePath !== item.filePath && o.filePath.replace(/\\/g, "/").split("/").slice(-depth).join("/") === candidate);
+        if (isUnique) {
+          result.set(item.filePath, candidate);
+          break;
+        }
+      }
+      if (!result.has(item.filePath)) {
+        result.set(item.filePath, item.filePath.replace(/\\/g, "/"));
+      }
+    }
+  }
+  return result;
+});
 const selectingFile = ref(false);
 const loadingPreview = ref(false);
 const connectionId = ref("");
@@ -515,10 +550,10 @@ watch(
                   <TooltipTrigger as-child>
                     <button type="button" class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs" :class="item.filePath === activePreviewPath ? 'bg-primary/10 text-primary font-medium' : 'text-muted-foreground hover:bg-muted'" @click="activePreviewPath = item.filePath">
                       <FileCode class="w-3.5 h-3.5 shrink-0" />
-                      <span class="min-w-0 flex-1 truncate">{{ item.fileName }}</span>
+                      <span class="min-w-0 flex-1 truncate">{{ displayFileNames.get(item.filePath) ?? item.fileName }}</span>
                     </button>
                   </TooltipTrigger>
-                  <TooltipContent side="right" class="max-w-[320px] break-all">{{ item.fileName }}</TooltipContent>
+                  <TooltipContent side="right" class="max-w-[360px] break-all">{{ item.filePath }}</TooltipContent>
                 </Tooltip>
               </div>
             </div>
@@ -527,7 +562,7 @@ watch(
               <div class="flex items-center justify-between gap-3 rounded-t-md border border-b-0 px-3 py-2 text-xs bg-muted/40">
                 <div class="min-w-0 flex items-center gap-2">
                   <FileCode class="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-                  <span class="font-medium truncate">{{ activePreview.fileName }}</span>
+                  <span class="font-medium truncate">{{ displayFileNames.get(activePreview.filePath) ?? activePreview.fileName }}</span>
                 </div>
                 <div class="flex shrink-0 items-center gap-2 text-muted-foreground">
                   <span>{{ previewLineSummary(activePreview) }}</span>
