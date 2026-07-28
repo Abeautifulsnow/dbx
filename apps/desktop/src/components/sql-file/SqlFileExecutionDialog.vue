@@ -19,6 +19,7 @@ import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { fetchSqlFileTargetOptions } from "@/composables/useDatabaseOptions";
 import { requiresSqlFileTargetDatabaseSelection } from "@/lib/connection/connectionLevelDatabaseBootstrap";
 import { cancelSqlFileExecution, executeSqlFiles, listenSqlFileProgress, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus } from "@/lib/backend/api";
+import { buildDisplayFileNames, tooltipText as computeTooltipText } from "./sqlFilePreviewLabel";
 import { useExportTracker } from "@/composables/useExportTracker";
 import { Check, CheckSquare, FileCode, FolderOpen, Loader2, Play, Square, X } from "@lucide/vue";
 
@@ -36,9 +37,10 @@ const props = defineProps<{
 
 const store = useConnectionStore();
 const productionSafetyStore = useProductionSafetyStore();
+// Tauri = real filesystem paths; Web = browser File.name (no path) + server temp paths.
+const isDesktopRuntime = isTauriRuntime();
 
 const fileInput = ref<HTMLInputElement | null>(null);
-const filePath = ref("");
 const previews = ref<SqlFilePreview[]>([]);
 const activePreviewPath = ref("");
 // Only the active file's preview body is mounted (reka-ui unmounts inactive
@@ -55,40 +57,25 @@ const activePreview = computed<SqlFilePreview | null>(() => {
   return previews.value.find((item) => item.filePath === activePreviewPath.value) ?? previews.value[0] ?? null;
 });
 
-// When multiple files share the same fileName (e.g. migration/create.sql and
-// seed/create.sql), disambiguate by prepending parent directory segments until
-// each file gets a unique label.  Single-name files stay as just fileName.
-const displayFileNames = computed(() => {
-  const items = previews.value;
-  const byFileName = new Map<string, SqlFilePreview[]>();
-  for (const item of items) {
-    const list = byFileName.get(item.fileName) ?? [];
-    list.push(item);
-    byFileName.set(item.fileName, list);
-  }
-  const result = new Map<string, string>();
-  for (const [, group] of byFileName) {
-    if (group.length === 1) {
-      result.set(group[0]!.filePath, group[0]!.fileName);
-      continue;
-    }
-    for (const item of group) {
-      const parts = item.filePath.replace(/\\/g, "/").split("/");
-      for (let depth = 2; depth <= parts.length; depth++) {
-        const candidate = parts.slice(parts.length - depth).join("/");
-        const isUnique = !group.some((o) => o.filePath !== item.filePath && o.filePath.replace(/\\/g, "/").split("/").slice(-depth).join("/") === candidate);
-        if (isUnique) {
-          result.set(item.filePath, candidate);
-          break;
-        }
-      }
-      if (!result.has(item.filePath)) {
-        result.set(item.filePath, item.filePath.replace(/\\/g, "/"));
-      }
-    }
-  }
-  return result;
+// Disambiguate files that share the same fileName.
+// Desktop: prepend parent directory segments until unique (e.g. migration/create.sql).
+// Web: browser File.name has no path, so use a stable 1-based index suffix.
+const displayFileNames = computed(() => buildDisplayFileNames(previews.value, isDesktopRuntime));
+
+// Display-only text for the file-path input. In Web mode this shows user-facing
+// labels instead of server temp paths (which contain meaningless UUIDs).
+// Execution always uses previews[].filePath directly.
+const filePathDisplay = computed(() => {
+  if (previews.value.length === 0) return "";
+  if (isDesktopRuntime) return previews.value.map((item) => item.filePath).join("; ");
+  return previews.value.map((item) => displayFileNames.value.get(item.filePath) ?? item.fileName).join("; ");
 });
+
+// Desktop tooltip shows the real file path; Web tooltip shows the user-facing
+// label only — never the server temp path (which contains a meaningless UUID).
+function tooltipText(item: SqlFilePreview): string {
+  return computeTooltipText(item, displayFileNames.value, isDesktopRuntime);
+}
 const selectingFile = ref(false);
 const loadingPreview = ref(false);
 const connectionId = ref("");
@@ -217,7 +204,6 @@ function resetExecution() {
 }
 
 function resetState() {
-  filePath.value = "";
   previews.value = [];
   selectingFile.value = false;
   loadingPreview.value = false;
@@ -276,7 +262,6 @@ async function previewSelectedSqlFile(fileOrPath: string | File) {
 async function loadPreviews(filesOrPaths: Array<string | File>) {
   loadingPreview.value = true;
   previews.value = [];
-  filePath.value = "";
   resetExecution();
   try {
     const nextPreviews: SqlFilePreview[] = [];
@@ -284,7 +269,6 @@ async function loadPreviews(filesOrPaths: Array<string | File>) {
       nextPreviews.push(await previewSelectedSqlFile(fileOrPath));
     }
     previews.value = nextPreviews;
-    filePath.value = nextPreviews.map((item) => item.filePath).join("; ");
   } catch (e: any) {
     toast(e?.message || String(e), 5000);
   } finally {
@@ -379,7 +363,7 @@ async function startExecution() {
   terminalError.value = "";
   progress.value = null;
   const taskLabel = previews.value.length === 1 ? previews.value[0]!.fileName : `${previews.value[0]!.fileName} (+${previews.value.length - 1})`;
-  addSqlFileTask(batchId, taskLabel, filePath.value);
+  addSqlFileTask(batchId, taskLabel, filePathDisplay.value);
 
   try {
     await store.ensureConnected(connectionId.value);
@@ -529,7 +513,7 @@ watch(
 
           <div class="flex items-center gap-2">
             <input ref="fileInput" type="file" accept=".sql,text/sql" multiple class="hidden" @change="handleFileInputChange" />
-            <Input :model-value="filePath" readonly class="h-8 text-xs font-mono" :placeholder="t('sqlFile.selectSqlFile')" />
+            <Input :model-value="filePathDisplay" readonly class="h-8 text-xs font-mono" :placeholder="t('sqlFile.selectSqlFile')" />
             <Button variant="outline" size="sm" class="h-8 shrink-0" :disabled="running || selectingFile" @click="selectFile">
               <Loader2 v-if="selectingFile || loadingPreview" class="w-3.5 h-3.5 mr-1.5 animate-spin" />
               <FolderOpen v-else class="w-3.5 h-3.5 mr-1.5" />
@@ -553,7 +537,7 @@ watch(
                       <span class="min-w-0 flex-1 truncate">{{ displayFileNames.get(item.filePath) ?? item.fileName }}</span>
                     </button>
                   </TooltipTrigger>
-                  <TooltipContent side="right" class="max-w-[360px] break-all">{{ item.filePath }}</TooltipContent>
+                  <TooltipContent side="right" class="max-w-[360px] break-all">{{ tooltipText(item) }}</TooltipContent>
                 </Tooltip>
               </div>
             </div>
