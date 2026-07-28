@@ -5,6 +5,7 @@ import { useI18n } from "vue-i18n";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { Dialog, DialogFooter, DialogHeader, DialogScrollContent, DialogTitle } from "@/components/ui/dialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -39,6 +40,20 @@ const productionSafetyStore = useProductionSafetyStore();
 const fileInput = ref<HTMLInputElement | null>(null);
 const filePath = ref("");
 const previews = ref<SqlFilePreview[]>([]);
+const activePreviewPath = ref("");
+// Only the active file's preview body is mounted (reka-ui unmounts inactive
+// TabsContent), so switching files keeps the DOM small even with many files.
+watch(previews, (list) => {
+  if (list.length === 0) {
+    activePreviewPath.value = "";
+  } else if (!list.some((item) => item.filePath === activePreviewPath.value)) {
+    activePreviewPath.value = list[0]!.filePath;
+  }
+});
+
+const activePreview = computed<SqlFilePreview | null>(() => {
+  return previews.value.find((item) => item.filePath === activePreviewPath.value) ?? previews.value[0] ?? null;
+});
 const selectingFile = ref(false);
 const loadingPreview = ref(false);
 const connectionId = ref("");
@@ -487,27 +502,47 @@ watch(
             </Button>
           </div>
 
-          <template v-for="(item, index) in previews" :key="item.filePath">
-            <div class="min-w-0 max-w-full overflow-hidden rounded-md border" :class="{ 'mt-3': index > 0 }">
-              <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs border-b bg-muted/40">
-                <div class="min-w-0 flex items-center gap-2">
-                  <FileCode class="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-                  <span class="font-medium truncate">{{ item.fileName }}</span>
-                </div>
-                <div class="flex shrink-0 items-center gap-2 text-muted-foreground">
-                  <span>{{ previewLineSummary(item) }}</span>
-                  <span class="h-3 w-px bg-border" />
-                  <span>{{ formatBytes(item.sizeBytes) }}</span>
-                </div>
+          <div v-if="previews.length" class="flex min-w-0 gap-3">
+            <div v-if="previews.length > 1" class="flex w-48 shrink-0 flex-col rounded-md border bg-muted/20">
+              <div class="flex shrink-0 items-center gap-2 rounded-t-md border-b bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                <FileCode class="w-3.5 h-3.5 shrink-0" />
+                <span class="font-medium">{{ previews.length }}</span>
               </div>
-              <div class="sql-file-preview-viewer flex max-w-full overflow-auto bg-muted/15 text-xs" :class="previews.length === 1 ? 'min-h-56 max-h-[min(42vh,360px)]' : 'min-h-0 max-h-[min(24vh,220px)]'">
-                <div class="sticky left-0 z-10 select-none border-r bg-background/95 px-2 py-3 text-right font-mono leading-5 text-muted-foreground/70">
-                  <div v-for="n in previewLineCount(item)" :key="n">{{ n }}</div>
-                </div>
-                <pre class="min-w-max flex-1 p-3 font-mono leading-5 whitespace-pre" v-html="highlight(item.preview)"></pre>
+              <!-- Keep this max-height in sync with the preview viewer so the list
+                   matches the preview pane height and scrolls internally. -->
+              <div class="max-h-[min(46vh,420px)] min-h-0 overflow-y-auto p-1">
+                <Tooltip v-for="item in previews" :key="item.filePath">
+                  <TooltipTrigger as-child>
+                    <button type="button" class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs" :class="item.filePath === activePreviewPath ? 'bg-primary/10 text-primary font-medium' : 'text-muted-foreground hover:bg-muted'" @click="activePreviewPath = item.filePath">
+                      <FileCode class="w-3.5 h-3.5 shrink-0" />
+                      <span class="min-w-0 flex-1 truncate">{{ item.fileName }}</span>
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="right" class="max-w-[320px] break-all">{{ item.fileName }}</TooltipContent>
+                </Tooltip>
               </div>
             </div>
-          </template>
+
+            <div v-if="activePreview" class="min-w-0 flex-1 flex flex-col">
+              <div class="flex items-center justify-between gap-3 rounded-t-md border border-b-0 px-3 py-2 text-xs bg-muted/40">
+                <div class="min-w-0 flex items-center gap-2">
+                  <FileCode class="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                  <span class="font-medium truncate">{{ activePreview.fileName }}</span>
+                </div>
+                <div class="flex shrink-0 items-center gap-2 text-muted-foreground">
+                  <span>{{ previewLineSummary(activePreview) }}</span>
+                  <span class="h-3 w-px bg-border" />
+                  <span>{{ formatBytes(activePreview.sizeBytes) }}</span>
+                </div>
+              </div>
+              <div class="sql-file-preview-viewer flex max-w-full overflow-auto bg-muted/15 text-xs rounded-b-md border border-t-0" :class="previews.length === 1 ? 'min-h-56 max-h-[min(46vh,420px)]' : 'min-h-0 max-h-[min(46vh,420px)]'">
+                <div class="sticky left-0 z-10 select-none border-r bg-background/95 px-2 py-3 text-right font-mono leading-5 text-muted-foreground/70">
+                  <div v-for="n in previewLineCount(activePreview)" :key="n">{{ n }}</div>
+                </div>
+                <pre class="min-w-max flex-1 p-3 font-mono leading-5 whitespace-pre" v-html="highlight(activePreview.preview)"></pre>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div class="min-w-0 space-y-3">
