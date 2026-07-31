@@ -439,7 +439,7 @@ impl<W: Write + Seek> StreamingXlsxWriter<W> {
                 rows: &sheet.rows,
                 numeric_column_right_align: sheet.numeric_column_right_align,
             };
-            self.zip.write_all(worksheet_xml(&segment).as_bytes()).map_err(|err| err.to_string())?;
+            write_worksheet_xml(&mut self.zip, &segment)?;
         }
 
         // 3. Write metadata files. These appear AFTER sheet data in the ZIP
@@ -691,58 +691,53 @@ fn typed_cell_xml(
     cell_xml(value, row_index, col_index, style)
 }
 
-fn worksheet_xml(segment: &WorksheetSegment) -> String {
+fn write_worksheet_xml<W: Write>(writer: &mut W, segment: &WorksheetSegment) -> Result<(), String> {
     let total_rows = segment.rows.len() + 1;
     let range = sheet_range(segment.columns.len(), total_rows);
     let widths = estimate_column_widths(segment.columns, segment.column_comments, segment.rows);
 
-    let cols_xml = widths
-        .iter()
-        .enumerate()
-        .map(|(index, width)| {
-            format!("<col min=\"{}\" max=\"{}\" width=\"{}\" customWidth=\"1\"/>", index + 1, index + 1, width)
-        })
-        .collect::<String>();
-
-    let header_xml = header_row_xml(segment.columns, segment.column_comments);
-
-    let body_xml = segment
-        .rows
-        .iter()
-        .enumerate()
-        .map(|(row_index, row)| {
-            let excel_row = row_index + 2;
-            let cells = segment
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(col_index, _)| {
-                    let col_type = segment.column_types.get(col_index);
-                    let align_style = numeric_column_style(col_type, segment.numeric_column_right_align);
-                    typed_cell_xml(row.get(col_index), col_type, excel_row - 1, col_index, align_style, None)
-                })
-                .collect::<String>();
-            format!("<row r=\"{excel_row}\">{cells}</row>")
-        })
-        .collect::<String>();
-
-    format!(
+    writer
+        .write_all(
+            format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
             "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">",
             "<dimension ref=\"{range}\"/>",
             "<sheetViews><sheetView workbookViewId=\"0\"><pane ySplit=\"1\" topLeftCell=\"A2\" activePane=\"bottomLeft\" state=\"frozen\"/></sheetView></sheetViews>",
             "<sheetFormatPr defaultRowHeight=\"15\"/>",
-            "<cols>{cols_xml}</cols>",
-            "<sheetData>{header_xml}{body_xml}</sheetData>",
-            "<autoFilter ref=\"{range}\"/>",
-            "</worksheet>"
+            "<cols>{cols}</cols>",
+            "<sheetData>"
         ),
         range = range,
-        cols_xml = cols_xml,
-        header_xml = header_xml,
-        body_xml = body_xml,
+        cols = cols_xml(&widths),
     )
+            .as_bytes(),
+        )
+        .map_err(|err| err.to_string())?;
+    writer
+        .write_all(header_row_xml(segment.columns, segment.column_comments).as_bytes())
+        .map_err(|err| err.to_string())?;
+
+    for (row_index, row) in segment.rows.iter().enumerate() {
+        let excel_row = row_index + 2;
+        writer
+            .write_all(
+                data_row_xml_with_date_time_format(
+                    excel_row,
+                    segment.columns,
+                    segment.column_types,
+                    row,
+                    None,
+                    segment.numeric_column_right_align,
+                )
+                .as_bytes(),
+            )
+            .map_err(|err| err.to_string())?;
+    }
+
+    writer
+        .write_all(format!("</sheetData><autoFilter ref=\"{range}\"/></worksheet>").as_bytes())
+        .map_err(|err| err.to_string())
 }
 
 fn content_types_xml_for_sheet_count(sheet_count: usize) -> String {
@@ -912,7 +907,7 @@ fn styles_xml(date_time_format: Option<&str>) -> String {
 }
 
 /// A borrow-only view of a worksheet's schema plus a row range, produced by
-/// [`split_sheets_for_max_rows`] and consumed by [`worksheet_xml`]. Rows are
+/// [`split_sheets_for_max_rows`] and consumed by [`write_worksheet_xml`]. Rows are
 /// referenced as slices of the original [`XlsxWorksheetData`] rather than
 /// deep-copied, so splitting an oversized worksheet into multiple sheets does
 /// not duplicate cell data in memory.
@@ -1038,7 +1033,7 @@ pub(crate) fn build_xlsx_workbook_multi_with_max_rows(
     }
     for (index, segment) in segments.iter().enumerate() {
         zip.start_file(format!("xl/worksheets/sheet{}.xml", index + 1), options).map_err(|err| err.to_string())?;
-        zip.write_all(worksheet_xml(segment).as_bytes()).map_err(|err| err.to_string())?;
+        write_worksheet_xml(&mut zip, segment)?;
     }
 
     let output = zip.finish().map_err(|err| err.to_string())?;
@@ -1051,12 +1046,32 @@ mod tests {
         build_xlsx_workbook, build_xlsx_workbook_multi, build_xlsx_workbook_multi_with_max_rows,
         is_numeric_column_type, start_streaming_xlsx_workbook, start_streaming_xlsx_workbook_with_max_rows,
         start_streaming_xlsx_workbook_with_options, start_streaming_xlsx_workbook_with_trailing_sheets,
-        XlsxWorksheetData,
+        write_worksheet_xml, WorksheetSegment, XlsxWorksheetData,
     };
     use calamine::{open_workbook_auto, Reader};
     use serde_json::{json, Value};
     use std::fs;
-    use std::io::Read;
+    use std::io::{Read, Write};
+
+    #[derive(Default)]
+    struct WriteStats {
+        bytes_written: usize,
+        largest_write: usize,
+        write_calls: usize,
+    }
+
+    impl Write for WriteStats {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes_written += buffer.len();
+            self.largest_write = self.largest_write.max(buffer.len());
+            self.write_calls += 1;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     /// Read and decompress a single entry from an in-memory XLSX (ZIP) buffer.
     fn read_zip_entry(bytes: &[u8], path: &str) -> String {
@@ -1772,6 +1787,60 @@ mod tests {
         assert_eq!(row_elems(&sheet1), 3, "sheet1: {sheet1}");
         assert_eq!(row_elems(&sheet2), 3, "sheet2: {sheet2}");
         assert_eq!(row_elems(&sheet3), 2, "sheet3: {sheet3}");
+    }
+
+    #[test]
+    fn large_in_memory_worksheet_is_written_in_bounded_chunks() {
+        let rows: Vec<Vec<Value>> = (1..=25_000)
+            .map(|index| {
+                vec![
+                    json!(index),
+                    json!(format!("user_{index}")),
+                    json!(format!("user_{index}@example.com")),
+                    json!(index % 2 == 0),
+                    json!(format!("note-{index:06}-{}", "x".repeat(128))),
+                ]
+            })
+            .collect();
+        let worksheet = XlsxWorksheetData {
+            sheet_name: Some("Users".to_string()),
+            columns: vec![
+                "id".to_string(),
+                "name".to_string(),
+                "email".to_string(),
+                "active".to_string(),
+                "notes".to_string(),
+            ],
+            column_types: vec![
+                "integer".to_string(),
+                "text".to_string(),
+                "text".to_string(),
+                "boolean".to_string(),
+                "text".to_string(),
+            ],
+            column_comments: vec![],
+            rows,
+            numeric_column_right_align: true,
+        };
+        let segment = WorksheetSegment {
+            name: worksheet.sheet_name.clone(),
+            columns: &worksheet.columns,
+            column_types: &worksheet.column_types,
+            column_comments: &worksheet.column_comments,
+            rows: &worksheet.rows,
+            numeric_column_right_align: worksheet.numeric_column_right_align,
+        };
+        let mut stats = WriteStats::default();
+
+        write_worksheet_xml(&mut stats, &segment).expect("write large worksheet");
+
+        assert!(stats.bytes_written > 10_000_000, "expected realistic worksheet size, got {}", stats.bytes_written);
+        assert!(
+            stats.largest_write < 16 * 1024,
+            "worksheet should be streamed row-by-row, largest write was {}",
+            stats.largest_write
+        );
+        assert!(stats.write_calls >= worksheet.rows.len(), "expected at least one bounded write per row");
     }
 
     #[test]
