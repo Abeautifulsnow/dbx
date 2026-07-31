@@ -1423,7 +1423,6 @@ export default withEnglishFallback({
     truncatedHint: "{count}행 로드 후 결과가 잘렸습니다. 로드된 데이터를 탐색하려면 푸터 페이지 매김을 사용하세요. 전체 결과를 내보내면 데이터베이스 쿼리를 다시 실행합니다.",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX는 최대 {limit}개의 데이터 행을 지원합니다. 전체 결과는 CSV 내보내기를 사용하세요.",
     streamingUnsupported: "이 쿼리는 스트리밍 내보내기를 지원하지 않습니다. 쿼리를 단순화하거나 지원되는 드라이버를 사용하세요.",
     agentSessionMissing: "스트리밍 내보내기에는 결과 집합 세션이 필요하지, 이 드라이버는 session_id를 반환하지 않았습니다.",
     title: "테이블 데이터 내보내는 중",

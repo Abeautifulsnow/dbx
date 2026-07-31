@@ -1385,7 +1385,6 @@ export default withEnglishFallback({
     xlsxHeaderComment: "Intestazione con commento",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX supporta al massimo {limit} righe di dati. Usa l'esportazione CSV per il risultato completo.",
     streamingUnsupported: "L'esportazione in streaming non è supportata per questa query. Semplificala o usa un driver supportato.",
     agentSessionMissing: "L'esportazione in streaming richiede una sessione del set di risultati, ma questo driver non ha restituito session_id.",
     title: "Esportazione Dati Tabella",

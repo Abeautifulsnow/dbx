@@ -1387,7 +1387,6 @@ export default withEnglishFallback({
     xlsxHeaderComment: "Cabeçalho usa comentário",
   },
   exportProgress: {
-    xlsxRowLimit: "O XLSX suporta no máximo {limit} linhas de dados. Use a exportação CSV para obter o resultado completo.",
     streamingUnsupported: "A exportação em streaming não é compatível com esta consulta. Simplifique-a ou use um driver compatível.",
     agentSessionMissing: "A exportação em streaming requer uma sessão de conjunto de resultados, mas este driver não retornou session_id.",
     title: "Exportando Dados da Tabela",

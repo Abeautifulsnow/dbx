@@ -1445,7 +1445,6 @@ export default withEnglishFallback({
     truncatedHint: "结果已截断，已加载前 {count} 行。可通过底部分页浏览已加载数据；导出完整结果时会重新查询数据库。",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX 最多支持 {limit} 行数据，请改用 CSV 导出完整结果。",
     streamingUnsupported: "当前查询暂不支持流式导出，请简化查询或使用受支持的驱动。",
     agentSessionMissing: "流式导出需要结果集会话，但当前驱动未返回 session_id。",
     title: "导出表数据",

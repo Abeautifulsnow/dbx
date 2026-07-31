@@ -1387,7 +1387,6 @@ export default withEnglishFallback({
     xlsxHeaderComment: "Encabezado usando comentarios",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX admite como máximo {limit} filas de datos. Use la exportación CSV para obtener el resultado completo.",
     streamingUnsupported: "La exportación en streaming no es compatible con esta consulta. Simplifíquela o use un controlador compatible.",
     agentSessionMissing: "La exportación en streaming requiere una sesión de conjunto de resultados, pero este controlador no devolvió session_id.",
     title: "Exportando datos de la tabla",

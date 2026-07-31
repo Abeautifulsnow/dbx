@@ -1386,7 +1386,6 @@ export default withEnglishFallback({
     xlsxHeaderComment: "表頭使用註解",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX 最多支援 {limit} 列資料，請改用 CSV 匯出完整結果。",
     streamingUnsupported: "目前查詢暫不支援串流匯出，請簡化查詢或使用支援的驅動程式。",
     agentSessionMissing: "串流匯出需要結果集工作階段，但目前驅動程式未回傳 session_id。",
     title: "匯出資料表資料",

@@ -1444,7 +1444,6 @@ export default {
     truncatedHint: "Results were truncated after loading {count} rows. Use the footer pagination to browse loaded data; exporting the full result reruns the database query.",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX supports at most {limit} data rows. Use CSV export for the full result.",
     streamingUnsupported: "Streaming export is unsupported for this query. Simplify it or use a supported driver.",
     agentSessionMissing: "Streaming export needs a result-set session, but this driver returned no session_id.",
     title: "Exporting Table Data",

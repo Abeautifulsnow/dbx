@@ -1386,7 +1386,6 @@ export default withEnglishFallback({
     xlsxHeaderComment: "ヘッダーにコメントを使用",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX は最大 {limit} 行のデータに対応しています。完全な結果を得るには CSV エクスポートを使用してください。",
     streamingUnsupported: "このクエリはストリーミングエクスポートに対応していません。クエリを簡略化するか、対応しているドライバーを使用してください。",
     agentSessionMissing: "ストリーミングエクスポートには結果セットのセッションが必要ですが、このドライバーは session_id を返しませんでした。",
     title: "テーブルデータをエクスポート中",
