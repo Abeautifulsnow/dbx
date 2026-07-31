@@ -19,7 +19,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { clampSearchSplitWidth } from "@/lib/dataGrid/dataGridSearchSplit";
 import { documentViewerFontStyle } from "@/lib/document/documentViewerFontStyle";
 import { clampDocumentPage, documentPageRequestLimit, resetElasticsearchDocumentTotals, resolveElasticsearchDocumentTotals } from "@/lib/document/elasticsearchDocumentTotals";
-import { canGoNextDocumentPage, resolveDocumentQueryTotals } from "@/lib/document/documentQueryTotals";
+import { canGoNextDocumentPage, isSameDocumentQueryTotalCountRequest, resolveDocumentQueryTotals, type DocumentQueryTotalCountRequest } from "@/lib/document/documentQueryTotals";
 import {
   arrayObjectAncestorPathForDocumentField,
   buildDocumentFilterCondition,
@@ -45,6 +45,7 @@ import {
   type DocumentFieldPathNode,
   type DocumentFilterMode,
   type DocumentFilterRule,
+  type DocumentStoreKind,
   type ElasticsearchBoolClause,
   type ElasticsearchQueryType,
 } from "@/lib/app/documentStoreProvider";
@@ -144,6 +145,9 @@ let elasticsearchExactTotal: number | undefined;
 let elasticsearchPaginationLowerBound: number | undefined;
 let elasticsearchCountExecutionId = "";
 let elasticsearchCountGeneration = 0;
+type LoadedDocumentQueryTotalCountRequest = DocumentQueryTotalCountRequest & { storeKind: DocumentStoreKind };
+let loadedDocumentQueryTotalCountRequest: LoadedDocumentQueryTotalCountRequest | undefined;
+let documentRequestGeneration = 0;
 const documentStoreProvider = computed(() => documentStoreProviderFor(props.databaseType));
 const documentColumnLayoutScopeKey = computed(() =>
   documentDataGridColumnLayoutScopeKey({
@@ -772,6 +776,13 @@ function elasticsearchCountFilterKey(filter: string | undefined): string {
   return JSON.stringify([props.connectionId, props.database, props.collection, filter ?? ""]);
 }
 
+function isCurrentDocumentQueryTotalCountRequest(request: LoadedDocumentQueryTotalCountRequest): boolean {
+  if (request.generation !== documentRequestGeneration || request.connectionId !== props.connectionId || request.database !== props.database || request.collection !== props.collection || request.storeKind !== documentStoreProvider.value.kind) {
+    return false;
+  }
+  return loadedDocumentQueryTotalCountRequest !== undefined && isSameDocumentQueryTotalCountRequest(request, loadedDocumentQueryTotalCountRequest) && request.storeKind === loadedDocumentQueryTotalCountRequest.storeKind;
+}
+
 function cancelElasticsearchCount() {
   elasticsearchCountGeneration++;
   const executionId = elasticsearchCountExecutionId;
@@ -790,13 +801,12 @@ function resetElasticsearchTotals(options: { preservePaginationTotal?: boolean }
   totalIsExact.value = nextTotals.totalIsExact;
 }
 
-function clampPageToPaginationTotal(): boolean {
+function clampPageToPaginationTotal(): number | undefined {
   const cap = paginationTotal.value;
-  if (cap === undefined) return false;
+  if (cap === undefined) return undefined;
   const nextPage = clampDocumentPage(page.value, pageSize.value, cap);
-  if (page.value === nextPage) return false;
-  page.value = nextPage;
-  return true;
+  if (page.value === nextPage) return undefined;
+  return nextPage;
 }
 
 function startElasticsearchExactCount(filter: string | undefined) {
@@ -817,7 +827,8 @@ function startElasticsearchExactCount(filter: string | undefined) {
       total.value = totals.total;
       totalIsExact.value = totals.totalIsExact;
       paginationTotal.value = totals.paginationTotal;
-      if (clampPageToPaginationTotal()) void load();
+      const clampedPage = clampPageToPaginationTotal();
+      if (clampedPage !== undefined) void load({ page: clampedPage });
     })
     .catch(() => {
       // The lower-bound result remains truthful when a background count fails.
@@ -862,27 +873,35 @@ function applyElasticsearchSearchTotal(searchTotal: number, isExact: boolean, fi
   startElasticsearchExactCount(filter);
 }
 
-async function load() {
+async function load(options: { page?: number } = {}) {
   if (documentLoadExecutionId.value) void api.cancelQuery(documentLoadExecutionId.value);
+  const requestGeneration = ++documentRequestGeneration;
   const executionId = uuid();
   loading.value = true;
   documentLoadExecutionId.value = executionId;
   documentLoadCancelling.value = false;
   startDocumentLoadingTimer();
   error.value = "";
+  const requestPage = options.page ?? page.value;
   const previousSelectedIdx = selectedIdx.value;
   const previousSelectedId = previousSelectedIdx === null ? null : documentIdentity(documents.value[previousSelectedIdx]);
   try {
+    const connectionId = props.connectionId;
+    const database = props.database;
+    const collection = props.collection;
+    const storeKind = documentStoreProvider.value.kind;
     const filter = currentDocumentFilter();
-    if (documentStoreProvider.value.kind === "elasticsearch" && elasticsearchCountKey !== null && elasticsearchCountKey !== elasticsearchCountFilterKey(filter)) {
+    const countRequest: LoadedDocumentQueryTotalCountRequest = { connectionId, database, collection, filter, generation: requestGeneration, storeKind };
+    if (storeKind === "elasticsearch" && elasticsearchCountKey !== null && elasticsearchCountKey !== elasticsearchCountFilterKey(filter)) {
       resetElasticsearchTotals();
     }
     const sort = currentDocumentSortJson(sortInput.value);
-    const skip = page.value * pageSize.value;
-    const result = await api.documentFindDocuments(props.connectionId, props.database, props.collection, skip, documentRequestLimit.value, filter, undefined, sort, executionId);
+    const skip = requestPage * pageSize.value;
+    const result = await api.documentFindDocuments(connectionId, database, collection, skip, documentRequestLimit.value, filter, undefined, sort, executionId);
     if (documentLoadExecutionId.value !== executionId) return;
+    if (connectionId !== props.connectionId || database !== props.database || collection !== props.collection || storeKind !== documentStoreProvider.value.kind) return;
     const nextDocuments =
-      documentStoreProvider.value.kind === "elasticsearch" && result.raw_documents?.length === result.documents.length
+      storeKind === "elasticsearch" && result.raw_documents?.length === result.documents.length
         ? result.raw_documents.map((raw, index) => {
             try {
               return asRecord(parseJsonPreservingLargeNumbers(raw));
@@ -893,9 +912,12 @@ async function load() {
         : result.documents.map(asRecord);
     const hasTypePreservingCopyDocuments = result.extended_documents?.length === nextDocuments.length;
     const nextCopyDocuments = hasTypePreservingCopyDocuments ? result.extended_documents!.map(asRecord) : nextDocuments;
+    // Commit page + rows together so stale rows never briefly show last-page indexes.
+    if (options.page !== undefined) page.value = options.page;
     documents.value = nextDocuments;
     copyDocuments.value = nextCopyDocuments;
     mongoCopyDocumentsAvailable.value = hasTypePreservingCopyDocuments;
+    loadedDocumentQueryTotalCountRequest = countRequest;
     if (nextDocuments.length > 0) {
       const keySet = new Set<string>();
       keySet.add("_id");
@@ -906,11 +928,15 @@ async function load() {
       }
       lastGridColumns.value = [...keySet];
     }
-    if (documentStoreProvider.value.kind === "elasticsearch") {
+    if (storeKind === "elasticsearch") {
       applyElasticsearchSearchTotal(result.total, result.total_is_exact !== false, filter);
     } else {
       cancelElasticsearchCount();
-      const totals = resolveDocumentQueryTotals(result.total, result.total_is_exact !== false);
+      const totals = resolveDocumentQueryTotals(result.total, result.total_is_exact !== false, {
+        page: requestPage,
+        pageSize: pageSize.value,
+        rowCount: nextDocuments.length,
+      });
       total.value = totals.total;
       totalIsExact.value = totals.totalIsExact;
       paginationTotal.value = totals.paginationTotal;
@@ -926,6 +952,34 @@ async function load() {
       stopDocumentLoadingTimer();
     }
   }
+}
+
+async function countExactDocumentTotal(): Promise<number | undefined> {
+  const request = loadedDocumentQueryTotalCountRequest;
+  if (!request || !isCurrentDocumentQueryTotalCountRequest(request)) return undefined;
+  if (request.storeKind === "elasticsearch") {
+    const exactCount = await api.elasticsearchCountDocuments(request.connectionId, request.collection, request.filter);
+    if (!isCurrentDocumentQueryTotalCountRequest(request)) return undefined;
+    if (!Number.isFinite(exactCount) || exactCount < 0) {
+      throw new Error("invalid count");
+    }
+    elasticsearchExactTotal = exactCount;
+    const totals = resolveElasticsearchDocumentTotals(elasticsearchPaginationLowerBound ?? exactCount, false, exactCount);
+    total.value = totals.total;
+    totalIsExact.value = totals.totalIsExact;
+    paginationTotal.value = totals.paginationTotal;
+    return exactCount;
+  }
+  const exactCount = await api.mongoCountDocuments(request.connectionId, request.database, request.collection, request.filter, "accurate");
+  if (!isCurrentDocumentQueryTotalCountRequest(request)) return undefined;
+  if (!Number.isFinite(exactCount) || exactCount < 0) {
+    throw new Error("invalid count");
+  }
+  const totals = resolveDocumentQueryTotals(exactCount, true);
+  total.value = totals.total;
+  totalIsExact.value = totals.totalIsExact;
+  paginationTotal.value = totals.paginationTotal;
+  return exactCount;
 }
 
 async function refreshDocuments() {
@@ -959,8 +1013,8 @@ function paginate(offset: number, limit: number) {
   const normalizedLimit = normalizeResultPageSize(limit, pageSize.value);
   pageSize.value = normalizedLimit;
   const requestedPage = Math.floor(Math.max(0, offset) / normalizedLimit);
-  page.value = clampDocumentPage(requestedPage, normalizedLimit, paginationTotal.value);
-  void load();
+  const nextPage = clampDocumentPage(requestedPage, normalizedLimit, paginationTotal.value);
+  void load({ page: nextPage });
 }
 
 function onSort(column: string, _columnIndex: number, direction: "asc" | "desc" | null) {
@@ -1475,6 +1529,8 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener("pointerdown", handleDocumentBrowserPointerDown, true);
   if (documentLoadExecutionId.value) void api.cancelQuery(documentLoadExecutionId.value);
+  documentRequestGeneration++;
+  loadedDocumentQueryTotalCountRequest = undefined;
   cancelElasticsearchCount();
   stopDocumentLoadingTimer();
   endTableSearchSplitResize();
@@ -1616,7 +1672,9 @@ defineExpose({ focusSearch });
       :page-limit="pageSize"
       :total-row-count="total"
       :total-row-count-is-exact="totalIsExact"
+      :inexact-total-row-count-mode="documentStoreProvider.kind === 'mongodb' ? 'estimated' : 'at-least'"
       :pagination-total-row-count="pageTotal"
+      :count-total-rows="countExactDocumentTotal"
       @sort="onSort"
       @reload="refreshDocuments"
       @paginate="(offset: number, limit: number) => paginate(offset, limit)"

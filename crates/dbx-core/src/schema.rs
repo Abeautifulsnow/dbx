@@ -1,5 +1,6 @@
 use crate::connection::{
-    connection_url_for_endpoint, database_connection_config, task_client_session_id, AppState, MysqlMode, PoolKind,
+    connection_url_for_endpoint, database_connection_config, gaussdb_uses_m_jdbc_driver, task_client_session_id,
+    AppState, MysqlMode, PoolKind,
 };
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
@@ -559,6 +560,7 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
         PoolKind::Postgres(p) => db::postgres::list_databases(p).await,
         PoolKind::Sqlite(p) => db::sqlite::list_databases(p).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::list_databases(client).await,
+        PoolKind::Turso(client) => db::turso_driver::list_databases(client).await,
         PoolKind::HBase(client) => db::hbase_driver::list_namespaces(client).await,
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => {
@@ -2051,6 +2053,9 @@ async fn list_tables_once(
         PoolKind::Rqlite(client) => db::rqlite_driver::list_tables(client, schema)
             .await
             .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter)),
+        PoolKind::Turso(client) => db::turso_driver::list_tables(client, schema)
+            .await
+            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter)),
         PoolKind::MongoDb(client) => db::mongo_driver::list_collections(client, database)
             .await
             .map(|names| collection_names_to_tables(names, "COLLECTION"))
@@ -2461,7 +2466,7 @@ mod tests {
     use super::{
         clickhouse_metadata_database, dameng_object_statistics_dba_segments_sql,
         dameng_object_statistics_rows_only_sql, dameng_object_statistics_user_segments_sql, deduplicate_column_infos,
-        ephemeral_agent_metadata_session_id, filter_mongodb_agent_collections,
+        ephemeral_agent_metadata_session_id, external_driver_uses_mysql_ddl, filter_mongodb_agent_collections,
         filter_mysql_system_databases_for_config, filter_object_infos, filter_table_infos, filter_visible_schema_names,
         gbase8a_object_statistics_sql, is_agent_postgres_metadata_fallback_config, is_mysql_external_driver_config,
         is_retryable_metadata_error, metadata_name_or_comment_matches, mysql_external_driver_ddl_from_query_result,
@@ -2477,8 +2482,84 @@ mod tests {
         uses_mongodb_agent_collection_listing, visible_schema_filter, TableNameFilter, TDENGINE_COMMENT_SEARCH_TIMEOUT,
         TDENGINE_LIKE_PATTERN_MAX_BYTES,
     };
+    use super::{list_databases_core, list_tables_core};
+    use crate::connection::{AppState, PoolKind};
     use crate::models::connection::{ConnectionConfig, DatabaseType};
+    use crate::storage::Storage;
     use std::collections::HashMap;
+    use std::time::Duration;
+
+    async fn spawn_turso_table_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut saw_table_query = false;
+            while !saw_table_query {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let header_end = loop {
+                    if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "request ended before headers were complete");
+                    request.extend_from_slice(&chunk[..read]);
+                };
+                let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                while request.len() < header_end + content_length {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "request ended before body was complete");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+
+                assert!(headers.starts_with("POST /v2/pipeline HTTP/1.1"));
+                assert!(headers.to_ascii_lowercase().contains("authorization: bearer test-token"));
+                let request_body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+                let sql = request_body["requests"][0]["stmt"]["sql"].as_str().unwrap();
+                let is_table_query = sql.contains("sqlite_master");
+                saw_table_query |= is_table_query;
+
+                let body = if is_table_query {
+                    r#"{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"name","decltype":"TEXT"},{"name":"type","decltype":"TEXT"}],"rows":[[{"type":"text","value":"dbx_test_records"},{"type":"text","value":"table"}]],"rows_read":1,"rows_written":0}}}]}"#
+                } else {
+                    r#"{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"1","decltype":"INTEGER"}],"rows":[[{"type":"integer","value":"1"}]],"rows_read":1,"rows_written":0}}}]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        (format!("http://{address}"), server)
+    }
+
+    async fn turso_test_state(base_url: &str) -> (AppState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dbx-turso-schema-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let mut config = test_connection_config(DatabaseType::Turso);
+        config.database = Some("main".to_string());
+        config.host = base_url.to_string();
+        state.configs.write().await.insert(config.id.clone(), config);
+        let client = db::turso_driver::TursoClient::new(base_url, "test-token", false, Duration::from_secs(2)).unwrap();
+        state.connections.write().await.insert("test".to_string(), PoolKind::Turso(client));
+        (state, dir)
+    }
 
     fn test_column(name: &str, comment: Option<&str>, is_primary_key: bool) -> super::db::ColumnInfo {
         super::db::ColumnInfo {
@@ -2554,6 +2635,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn turso_schema_dispatch_lists_databases_and_tables() {
+        let (base_url, server) = spawn_turso_table_server().await;
+        let (state, dir) = turso_test_state(&base_url).await;
+
+        let databases = list_databases_core(&state, "test").await.unwrap();
+        assert_eq!(databases.into_iter().map(|database| database.name).collect::<Vec<_>>(), ["main"]);
+
+        let tables = list_tables_core(&state, "test", "main", "main", None, None, None, None, None).await.unwrap();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name, "dbx_test_records");
+        assert_eq!(tables[0].table_type, "BASE TABLE");
+
+        server.await.unwrap();
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn agent_metadata_uses_unique_ephemeral_sessions_only_for_agents() {
         let oracle = test_connection_config(DatabaseType::Oracle);
@@ -2589,6 +2688,22 @@ mod tests {
 
         config.jdbc_driver_class = Some("org.mariadb.jdbc.Driver".to_string());
         assert!(!is_mysql_external_driver_config(&config));
+    }
+
+    #[test]
+    fn gaussdb_m_external_driver_uses_mysql_style_ddl() {
+        let mut config = test_connection_config(DatabaseType::Gaussdb);
+        config.driver_profile = Some("gaussdb-m".to_string());
+        config.jdbc_driver_class = Some("com.huawei.gaussdb.jdbc.Driver".to_string());
+
+        assert!(external_driver_uses_mysql_ddl(&config));
+        assert_eq!(
+            mysql_external_driver_ddl_sql("app", "app_schema", "order"),
+            "SHOW CREATE TABLE `app_schema`.`order`"
+        );
+
+        config.driver_profile = Some("gaussdb".to_string());
+        assert!(!external_driver_uses_mysql_ddl(&config));
     }
 
     #[test]
@@ -4863,6 +4978,9 @@ async fn get_columns_core_for_session_inner(
             PoolKind::Rqlite(client) => {
                 db::rqlite_driver::get_columns(client, schema, table).await.map(deduplicate_column_infos)
             }
+            PoolKind::Turso(client) => {
+                db::turso_driver::get_columns(client, schema, table).await.map(deduplicate_column_infos)
+            }
             PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::get_columns(client, schema, table)
                 .await
                 .map(deduplicate_column_infos),
@@ -5010,6 +5128,7 @@ async fn list_indexes_core_for_session(
             PoolKind::Postgres(p) => db::postgres::list_indexes(p, schema, table).await,
             PoolKind::Sqlite(p) => db::sqlite::list_indexes(p, schema, table).await,
             PoolKind::Rqlite(client) => db::rqlite_driver::list_indexes(client, schema, table).await,
+            PoolKind::Turso(client) => db::turso_driver::list_indexes(client, schema, table).await,
             PoolKind::MongoDb(client) => db::mongo_driver::list_indexes(client, database, table).await,
             PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_indexes(client, schema, table).await,
             _ => Ok(vec![]),
@@ -5081,6 +5200,7 @@ async fn list_foreign_keys_core_for_session(
             PoolKind::Postgres(p) => db::postgres::list_foreign_keys(p, schema, table).await,
             PoolKind::Sqlite(p) => db::sqlite::list_foreign_keys(p, schema, table).await,
             PoolKind::Rqlite(client) => db::rqlite_driver::list_foreign_keys(client, schema, table).await,
+            PoolKind::Turso(client) => db::turso_driver::list_foreign_keys(client, schema, table).await,
             PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_foreign_keys(client, schema, table).await,
             _ => Ok(vec![]),
         }
@@ -5126,6 +5246,7 @@ pub async fn list_triggers_core(
             PoolKind::Postgres(p) => db::postgres::list_triggers(p, schema, table).await,
             PoolKind::Sqlite(p) => db::sqlite::list_triggers(p, schema, table).await,
             PoolKind::Rqlite(client) => db::rqlite_driver::list_triggers(client, schema, table).await,
+            PoolKind::Turso(client) => db::turso_driver::list_triggers(client, schema, table).await,
             PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_triggers(client, schema, table).await,
             _ => Ok(vec![]),
         }
@@ -5418,7 +5539,7 @@ async fn get_table_ddl_core_with_options(
     {
         let connections = state.connections.read().await;
         if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
-            if is_mysql_external_driver_config(config.as_ref()) {
+            if external_driver_uses_mysql_ddl(config.as_ref()) {
                 let config = config.clone();
                 let session = session.clone();
                 drop(connections);
@@ -5537,6 +5658,7 @@ async fn get_table_ddl_core_with_options(
         PoolKind::Postgres(p) => pg_ddl(p, schema, table).await,
         PoolKind::Sqlite(p) => sqlite_ddl(p, schema, table).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::table_ddl(client, table).await,
+        PoolKind::Turso(client) => db::turso_driver::table_ddl(client, table).await,
         PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::table_ddl(client, table).await,
         _ => Err("DDL not supported for this database type".to_string()),
     }
@@ -5675,6 +5797,10 @@ fn is_mysql_external_driver_config(config: &ConnectionConfig) -> bool {
         (None, Some(driver_matches)) => driver_matches,
         (None, None) => false,
     }
+}
+
+fn external_driver_uses_mysql_ddl(config: &ConnectionConfig) -> bool {
+    is_mysql_external_driver_config(config) || gaussdb_uses_m_jdbc_driver(config)
 }
 
 fn mysql_external_driver_ddl_sql(database: &str, schema: &str, table: &str) -> String {
@@ -6261,6 +6387,9 @@ async fn get_object_source_once(
                 }
                 PoolKind::Rqlite(client) => {
                     return db::rqlite_driver::object_source(client, name, &object_type).await;
+                }
+                PoolKind::Turso(client) => {
+                    return db::turso_driver::object_source(client, name, &object_type).await;
                 }
                 PoolKind::ClickHouse(client) if matches!(object_type, db::ObjectSourceKind::View) => {
                     let result = db::clickhouse_driver::execute_query(

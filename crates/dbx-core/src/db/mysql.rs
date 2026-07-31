@@ -142,8 +142,10 @@ fn nonblank(value: String) -> Option<String> {
 }
 
 async fn query_first_nonblank_string(conn: &mut mysql_async::Conn, sql: &str) -> Option<String> {
-    match conn.query_first::<String, _>(sql).await {
-        Ok(Some(value)) => nonblank(value),
+    // MySQL reports nullable metadata such as TABLE_COLLATION as NULL for views.
+    // Reading it as String makes mysql_async panic during row conversion.
+    match conn.query_first::<Option<String>, _>(sql).await {
+        Ok(Some(value)) => value.and_then(nonblank),
         Ok(None) => None,
         Err(error) => {
             log::debug!("Failed to read optional MySQL database information with `{sql}`: {error}");
@@ -4949,6 +4951,14 @@ mod tests {
         assert!(sql.contains("COLUMN_TYPE"));
         assert!(!sql.contains("COLLATE"));
         assert!(!sql.contains("AS ENUM_VALUES"));
+    }
+
+    #[test]
+    fn mysql_nullable_table_collation_uses_optional_string_conversion() {
+        let collation = mysql_async::from_value_opt::<Option<String>>(mysql_async::Value::NULL)
+            .expect("Option<String> must accept NULL MySQL metadata values");
+
+        assert_eq!(collation, None);
     }
 
     #[test]

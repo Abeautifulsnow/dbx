@@ -343,7 +343,7 @@ function requestActiveEditorExecuteInNewResultTab() {
 
 const dialogs = useDialogSources();
 const { getDatabaseOptions } = useDatabaseOptions();
-const { openLineageTarget, openDatabaseSearchTarget, openDiagramTarget, onStructureEditorSaved, openTableTarget } = useNavigationTargets(dialogs);
+const { openLineageTarget, openDatabaseSearchTarget, openDiagramTarget, openObjectBrowserTableTarget, onStructureEditorSaved, openTableTarget } = useNavigationTargets(dialogs);
 const { onExecuteSql, onReloadData, onPaginate, onSort } = useDataGridActions(activeTab);
 const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
   openTableTarget,
@@ -1510,6 +1510,7 @@ async function onOpenObjectSource(table: SqlObjectNavigationTarget, initialEditi
 function onQueryEditorObjectSourceSaved() {
   const target = queryEditorObjectSourceTarget.value;
   if (!target) return;
+  connectionStore.invalidateMetadataCache(target.connectionId, target.database, target.schema, target.name);
   connectionStore.invalidateCompletionCache(target.connectionId, target.database);
   contentAreaRef.value?.refreshQueryEditorCompletionCache();
 }
@@ -2371,7 +2372,7 @@ onUnmounted(() => {
                     @open-object-table="
                       (target) =>
                         activeTab &&
-                        openTableTarget({
+                        openObjectBrowserTableTarget({
                           connectionId: activeTab.connectionId,
                           database: activeTab.database,
                           schema: target.schema,
