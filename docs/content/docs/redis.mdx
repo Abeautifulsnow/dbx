@@ -30,13 +30,15 @@ Value search reads matching content and applies type-aware matching for String, 
 
 | Type | Main capabilities |
 | --- | --- |
-| String | Text, JSON, and multiple display formats; gzip/zlib/deflate-compressed values can be viewed decompressed via a Gzip badge or the Decompressed format; binary strings are shown as escaped read-only text |
+| String | Text, JSON, and multiple display formats; gzip and zlib values can be opened in the read-only Decompressed format, while raw DEFLATE requires **Retry as DEFLATE** after the initial attempt fails; decompressed output is limited to 50 MiB; binary strings are shown as escaped read-only text |
 | Hash | Field/value table, search, sorting, add, edit, and delete |
 | List | Paged elements with index, add, edit, and delete |
 | Set | Member browsing, add, and delete |
 | Sorted Set | Member and score browsing, editing, and deletion |
 | Stream | Entries, consumer groups, consumers, pending messages, lag, and delivery details |
 | RedisJSON | JSON tree/source editing, formatting, and compact saves; requires the RedisJSON server module |
+
+List, Set, Hash, Sorted Set, and Stream member details provide the same Decompressed format and Gzip shortcut for compressed member values.
 
 Large collection types load in pages and display total and loaded counts where available.
 
