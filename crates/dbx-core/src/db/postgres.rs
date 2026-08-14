@@ -1068,6 +1068,14 @@ fn should_retry_postgres_stale_cache_fields(sqlstate: Option<&str>, routine: Opt
 /// connection error that triggers a blind reconnect + re-run.
 pub(crate) const POSTGRES_METADATA_QUERY_TIMEOUT: &str = "PostgreSQL metadata query timed out";
 
+/// Bounded fallback for the metadata query budget, aligned with the default
+/// query timeout (`default_query_timeout_secs() = 60`). Pool wait/create/
+/// recycle timeouts are configured from the CONNECT timeout (default 10s), so
+/// they are far below the query timeout for slow-but-valid cloud metadata
+/// queries. The metadata budget floors at this constant so a metadata query
+/// between the connect timeout and the query timeout is not killed.
+pub(crate) const POSTGRES_METADATA_QUERY_BUDGET_FALLBACK: Duration = Duration::from_secs(60);
+
 /// Derive a per-query budget for a single metadata statement from the client's
 /// pool timeout configuration. A half-open connection (e.g. a cloud LB
 /// silently evicting an idle connection, or a proxy accepting TCP but stalling
@@ -1081,13 +1089,44 @@ fn postgres_metadata_query_budget(client: &deadpool_postgres::Client) -> Duratio
     postgres_metadata_query_budget_from_timeouts(&pool.timeouts())
 }
 
+/// Metadata query budget for callers that cannot resolve a config-derived
+/// budget (non-schema callers such as transfer / database_export / cloudberry).
+pub fn postgres_default_metadata_query_budget(pool: &Pool) -> Duration {
+    postgres_metadata_query_budget_from_timeouts(&pool.timeouts())
+}
+
+/// Metadata budget derived from the pool timeouts (which are the connect
+/// timeouts). Floors at the query-timeout-aligned fallback so the default
+/// budget is `max(connect_timeout, POSTGRES_METADATA_QUERY_BUDGET_FALLBACK)`.
 fn postgres_metadata_query_budget_from_timeouts(timeouts: &deadpool_postgres::Timeouts) -> Duration {
-    let fallback = super::connection_timeout();
-    [timeouts.wait, timeouts.create, timeouts.recycle].into_iter().flatten().fold(fallback, std::cmp::max)
+    let floor = super::connection_timeout();
+    [timeouts.wait, timeouts.create, timeouts.recycle]
+        .into_iter()
+        .flatten()
+        .fold(floor, std::cmp::max)
+        .max(POSTGRES_METADATA_QUERY_BUDGET_FALLBACK)
 }
 
 fn postgres_metadata_query_timeout_message(budget: Duration) -> String {
     format!("{POSTGRES_METADATA_QUERY_TIMEOUT} after {}s (connection evicted)", budget.as_secs())
+}
+
+/// Best-effort server-side cancellation on a metadata timeout. Only sends a
+/// real `CancelToken` cancel when a TLS cancel context is available; when it is
+/// `None` (e.g. a non-TLS connection or an unknown URL), we skip the NoTls
+/// cancel attempt because cancel_query(NoTls) against a TLS connection is not
+/// equivalent evidence of server-side cancellation.
+async fn postgres_metadata_timeout_error(
+    client: &deadpool_postgres::Client,
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> String {
+    log::warn!("[postgres][metadata:timeout] query exceeded {}s budget", budget.as_secs());
+    if let Some(cancel_context) = cancel_context {
+        let token = client.cancel_token();
+        cancel_postgres_query(token, Some(cancel_context), Duration::from_secs(5)).await;
+    }
+    postgres_metadata_query_timeout_message(budget)
 }
 
 async fn postgres_query_cached_inner(
@@ -1119,13 +1158,24 @@ async fn postgres_query_cached(
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<Vec<Row>, String> {
     let budget = postgres_metadata_query_budget(client);
+    postgres_query_cached_with_budget(client, sql, params, budget, None).await
+}
+
+/// Metadata SELECT helper with an explicit budget and TLS cancel context.
+/// Threaded from the public metadata functions so the config-derived query
+/// timeout bounds the whole operation and, on timeout, a real `CancelToken`
+/// cancel is sent server-side when a TLS cancel context is available.
+pub(crate) async fn postgres_query_cached_with_budget(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<Row>, String> {
     match tokio::time::timeout(budget, postgres_query_cached_inner(client, sql, params)).await {
         Ok(Ok(rows)) => Ok(rows),
         Ok(Err(err)) => Err(pg_metadata_error_to_string(err)),
-        Err(_) => {
-            log::warn!("[postgres][metadata:timeout] query exceeded {}s budget", budget.as_secs());
-            Err(postgres_metadata_query_timeout_message(budget))
-        }
+        Err(_) => Err(postgres_metadata_timeout_error(client, budget, cancel_context).await),
     }
 }
 
@@ -1150,19 +1200,34 @@ async fn postgres_query_one_cached_inner(
     }
 }
 
+/// Default-budget scalar metadata probe. Currently no internal caller needs the
+/// default path because every scalar probe is reachable from a threaded public
+/// function and forwards its budget; kept as the default-path sibling of
+/// `postgres_query_cached` (used by `list_database_storage`) for non-threaded
+/// callers.
+#[allow(dead_code)]
 async fn postgres_query_one_cached(
     client: &deadpool_postgres::Client,
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<Row, String> {
     let budget = postgres_metadata_query_budget(client);
+    postgres_query_one_cached_with_budget(client, sql, params, budget, None).await
+}
+
+/// Metadata scalar-probe helper with an explicit budget and TLS cancel context
+/// (see `postgres_query_cached_with_budget`).
+pub(crate) async fn postgres_query_one_cached_with_budget(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Row, String> {
     match tokio::time::timeout(budget, postgres_query_one_cached_inner(client, sql, params)).await {
         Ok(Ok(row)) => Ok(row),
         Ok(Err(err)) => Err(pg_metadata_error_to_string(err)),
-        Err(_) => {
-            log::warn!("[postgres][metadata:timeout] query exceeded {}s budget", budget.as_secs());
-            Err(postgres_metadata_query_timeout_message(budget))
-        }
+        Err(_) => Err(postgres_metadata_timeout_error(client, budget, cancel_context).await),
     }
 }
 
@@ -2483,16 +2548,27 @@ fn database_storage_sql() -> &'static str {
      ORDER BY d.datname"
 }
 
-pub async fn list_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
+pub async fn list_databases(
+    pool: &Pool,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<DatabaseInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, list_databases_sql(), &[]).await?;
+    let rows =
+        postgres_query_cached_with_budget(&client, list_databases_sql(), &[], metadata_budget, cancel_context).await?;
 
     Ok(rows.iter().map(|row| DatabaseInfo { name: pg_row_try_string(row, 0), ..Default::default() }).collect())
 }
 
-pub async fn list_database_metadata(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
+pub async fn list_database_metadata(
+    pool: &Pool,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<DatabaseInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, database_metadata_sql(), &[]).await?;
+    let rows =
+        postgres_query_cached_with_budget(&client, database_metadata_sql(), &[], metadata_budget, cancel_context)
+            .await?;
     Ok(rows
         .iter()
         .map(|row| DatabaseInfo {
@@ -2524,8 +2600,13 @@ pub async fn list_database_storage(pool: &Pool, database_names: &[String]) -> Re
         .collect())
 }
 
-pub async fn list_tables(pool: &Pool, schema: &str) -> Result<Vec<TableInfo>, String> {
-    list_tables_filtered(pool, schema, None, None, None).await
+pub async fn list_tables(
+    pool: &Pool,
+    schema: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<TableInfo>, String> {
+    list_tables_filtered(pool, schema, None, None, None, metadata_budget, cancel_context).await
 }
 
 pub async fn list_tables_filtered(
@@ -2534,6 +2615,8 @@ pub async fn list_tables_filtered(
     filter: Option<&str>,
     limit: Option<usize>,
     offset: Option<usize>,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Vec<TableInfo>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let filter = filter.unwrap_or("").trim();
@@ -2548,14 +2631,10 @@ pub async fn list_tables_filtered(
         &[(&schema, Type::VARCHAR), (&filter_pattern, Type::VARCHAR), (&fuzzy_filter_pattern, Type::VARCHAR)];
     // The pagination literals make this SQL vary by page. Use an unnamed typed
     // query so each load stays one round trip without growing the statement cache.
-    let budget = postgres_metadata_query_budget(&client);
-    let rows = match tokio::time::timeout(budget, client.query_typed(&sql, params)).await {
+    let rows = match tokio::time::timeout(metadata_budget, client.query_typed(&sql, params)).await {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => return Err(pg_metadata_error_to_string(err)),
-        Err(_) => {
-            log::warn!("[postgres][metadata:timeout] query exceeded {}s budget", budget.as_secs());
-            return Err(postgres_metadata_query_timeout_message(budget));
-        }
+        Err(_) => return Err(postgres_metadata_timeout_error(&client, metadata_budget, cancel_context).await),
     };
 
     Ok(rows
@@ -2573,6 +2652,8 @@ pub async fn list_tables_filtered(
 pub async fn completion_assistant_search(
     pool: &Pool,
     request: &CompletionAssistantRequest,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<CompletionAssistantResponse, String> {
     let schema = request.schema.as_deref().or(request.parent_schema.as_deref());
     let routine_schema = schema.unwrap_or("public");
@@ -2587,13 +2668,15 @@ pub async fn completion_assistant_search(
     let mut candidates = Vec::new();
 
     if kinds.iter().any(|kind| matches!(kind, CompletionAssistantObjectKind::Schema)) {
-        for row in postgres_query_cached(
+        for row in postgres_query_cached_with_budget(
             &client,
             "SELECT nspname FROM pg_catalog.pg_namespace \
              WHERE nspname NOT LIKE 'pg_%' AND nspname <> 'information_schema' \
                AND ($1 = '%%' OR nspname ILIKE $1 ESCAPE '~') \
              ORDER BY nspname LIMIT $2",
             &[&pattern, &(limit as i64)],
+            metadata_budget,
+            cancel_context,
         )
         .await?
         {
@@ -2614,10 +2697,12 @@ pub async fn completion_assistant_search(
 
     if candidates.len() < limit && kinds.iter().any(CompletionAssistantObjectKind::is_table_like) {
         let relkinds = postgres_completion_relkinds(&kinds);
-        let rows = postgres_query_cached(
+        let rows = postgres_query_cached_with_budget(
             &client,
             postgres_completion_tables_sql(),
             &[&schema, &pattern, &relkinds, &((limit - candidates.len()) as i64)],
+            metadata_budget,
+            cancel_context,
         )
         .await?;
         for row in rows {
@@ -2642,10 +2727,12 @@ pub async fn completion_assistant_search(
 
     if candidates.len() < limit && kinds.iter().any(CompletionAssistantObjectKind::is_routine_like) {
         let prokinds = postgres_completion_prokinds(&kinds);
-        let rows = postgres_query_cached(
+        let rows = postgres_query_cached_with_budget(
             &client,
             postgres_completion_routines_sql(),
             &[&routine_schema, &pattern, &prokinds, &((limit - candidates.len()) as i64)],
+            metadata_budget,
+            cancel_context,
         )
         .await?;
         for row in rows {
@@ -2669,10 +2756,12 @@ pub async fn completion_assistant_search(
     }
 
     if candidates.len() < limit && kinds.iter().any(|kind| matches!(kind, CompletionAssistantObjectKind::Sequence)) {
-        let rows = postgres_query_cached(
+        let rows = postgres_query_cached_with_budget(
             &client,
             postgres_completion_sequences_sql(),
             &[&schema, &pattern, &request.case_sensitive, &((limit - candidates.len()) as i64)],
+            metadata_budget,
+            cancel_context,
         )
         .await?;
         for row in rows {
@@ -2697,18 +2786,26 @@ pub async fn completion_assistant_search(
             // metadata must use the same visible relation instead of assuming public.
             let resolved_schema = match schema {
                 Some(schema) => Some(schema.to_string()),
-                None => postgres_query_cached(&client, postgres_visible_table_schema_sql(), &[&table])
-                    .await?
-                    .first()
-                    .map(|row| pg_row_try_string(row, 0)),
+                None => postgres_query_cached_with_budget(
+                    &client,
+                    postgres_visible_table_schema_sql(),
+                    &[&table],
+                    metadata_budget,
+                    cancel_context,
+                )
+                .await?
+                .first()
+                .map(|row| pg_row_try_string(row, 0)),
             };
             let Some(resolved_schema) = resolved_schema else {
                 return Ok(CompletionAssistantResponse { incomplete: false, candidates, fallback_used: false });
             };
-            let rows = postgres_query_cached(
+            let rows = postgres_query_cached_with_budget(
                 &client,
                 postgres_completion_columns_sql(),
                 &[&resolved_schema, &table, &pattern, &((limit - candidates.len()) as i64)],
+                metadata_budget,
+                cancel_context,
             )
             .await?;
             for row in rows {
@@ -2831,10 +2928,23 @@ fn postgres_completion_like_pattern(value: &str, mode: Option<&CompletionAssista
     }
 }
 
-pub async fn get_table_comment(pool: &Pool, schema: &str, table: &str) -> Result<Option<String>, String> {
+pub async fn get_table_comment(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Option<String>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_table_comment_sql(), &[&schema, &table]).await?;
+    let rows = postgres_query_cached_with_budget(
+        &client,
+        postgres_table_comment_sql(),
+        &[&schema, &table],
+        metadata_budget,
+        cancel_context,
+    )
+    .await?;
     Ok(rows.first().and_then(|row| row.try_get::<_, Option<String>>(0).ok().flatten()).filter(|s| !s.is_empty()))
 }
 
@@ -2842,11 +2952,19 @@ pub async fn get_table_partition_info(
     pool: &Pool,
     schema: &str,
     table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<PostgresTablePartitionInfo, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let relation_rows =
-        postgres_query_cached(&client, postgres_table_partition_relation_sql(), &[&schema, &table]).await?;
+    let relation_rows = postgres_query_cached_with_budget(
+        &client,
+        postgres_table_partition_relation_sql(),
+        &[&schema, &table],
+        metadata_budget,
+        cancel_context,
+    )
+    .await?;
     let Some(relation) = relation_rows.first() else {
         return Ok(PostgresTablePartitionInfo::default());
     };
@@ -2856,7 +2974,14 @@ pub async fn get_table_partition_info(
         return Ok(PostgresTablePartitionInfo::default());
     }
 
-    let rows = postgres_query_cached(&client, postgres_table_partition_info_sql(), &[&schema, &table]).await?;
+    let rows = postgres_query_cached_with_budget(
+        &client,
+        postgres_table_partition_info_sql(),
+        &[&schema, &table],
+        metadata_budget,
+        cancel_context,
+    )
+    .await?;
     let Some(row) = rows.first() else {
         return Ok(PostgresTablePartitionInfo { is_partition, ..Default::default() });
     };
@@ -2870,17 +2995,27 @@ pub async fn get_table_partition_info(
 }
 
 pub async fn get_table_partition_key(pool: &Pool, schema: &str, table: &str) -> Result<Option<String>, String> {
-    Ok(get_table_partition_info(pool, schema, table).await?.key)
+    let budget = postgres_default_metadata_query_budget(pool);
+    Ok(get_table_partition_info(pool, schema, table, budget, None).await?.key)
 }
 
 pub async fn get_table_partition_local_objects(
     pool: &Pool,
     schema: &str,
     table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<PostgresTablePartitionLocalObjects, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_table_partition_local_objects_sql(), &[&schema, &table]).await?;
+    let rows = postgres_query_cached_with_budget(
+        &client,
+        postgres_table_partition_local_objects_sql(),
+        &[&schema, &table],
+        metadata_budget,
+        cancel_context,
+    )
+    .await?;
     let mut result = PostgresTablePartitionLocalObjects::default();
     for row in rows {
         let object_kind = row.try_get::<_, String>(0).unwrap_or_default();
@@ -3287,8 +3422,19 @@ fn postgres_has_function_identity_arguments_sql() -> &'static str {
      )"
 }
 
-async fn postgres_has_function_identity_arguments(client: &deadpool_postgres::Client) -> Result<bool, String> {
-    let row = postgres_query_one_cached(client, postgres_has_function_identity_arguments_sql(), &[]).await?;
+async fn postgres_has_function_identity_arguments(
+    client: &deadpool_postgres::Client,
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<bool, String> {
+    let row = postgres_query_one_cached_with_budget(
+        client,
+        postgres_has_function_identity_arguments_sql(),
+        &[],
+        budget,
+        cancel_context,
+    )
+    .await?;
     Ok(pg_row_try_bool(&row, 0).unwrap_or(false))
 }
 
@@ -3302,8 +3448,14 @@ fn postgres_proc_has_prokind_sql() -> &'static str {
      )"
 }
 
-async fn postgres_proc_has_prokind(client: &deadpool_postgres::Client) -> Result<bool, String> {
-    let row = postgres_query_one_cached(client, postgres_proc_has_prokind_sql(), &[]).await?;
+async fn postgres_proc_has_prokind(
+    client: &deadpool_postgres::Client,
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<bool, String> {
+    let row =
+        postgres_query_one_cached_with_budget(client, postgres_proc_has_prokind_sql(), &[], budget, cancel_context)
+            .await?;
     Ok(pg_row_try_bool(&row, 0).unwrap_or(false))
 }
 
@@ -3317,8 +3469,13 @@ fn postgres_proc_has_prosp_sql() -> &'static str {
      )"
 }
 
-async fn postgres_proc_has_prosp(client: &deadpool_postgres::Client) -> Result<bool, String> {
-    let row = postgres_query_one_cached(client, postgres_proc_has_prosp_sql(), &[]).await?;
+async fn postgres_proc_has_prosp(
+    client: &deadpool_postgres::Client,
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<bool, String> {
+    let row = postgres_query_one_cached_with_budget(client, postgres_proc_has_prosp_sql(), &[], budget, cancel_context)
+        .await?;
     Ok(pg_row_try_bool(&row, 0).unwrap_or(false))
 }
 
@@ -3332,6 +3489,8 @@ async fn list_objects_rows(
     include_relations: bool,
     include_routines: bool,
     include_custom_types: bool,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Vec<Row>, String> {
     let sql = list_objects_sql(
         include_timestamps,
@@ -3347,7 +3506,7 @@ async fn list_objects_rows(
         // cannot serve); skip the round-trip instead of executing empty SQL.
         return Ok(Vec::new());
     }
-    postgres_query_cached(client, &sql, &[&schema]).await
+    postgres_query_cached_with_budget(client, &sql, &[&schema], metadata_budget, cancel_context).await
 }
 
 pub async fn list_objects(
@@ -3356,6 +3515,8 @@ pub async fn list_objects(
     include_relations: bool,
     include_routines: bool,
     include_custom_types: bool,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Vec<ObjectInfo>, String> {
     // System schemas may be visible in the schema tree, but their catalog
     // types are implementation details and are never custom types.
@@ -3366,11 +3527,12 @@ pub async fn list_objects(
     // pg_proc/pg_attribute round-trips and keeps compatible catalogs that lack
     // prokind/prosp from breaking a plain type listing.
     let (has_proc_prokind, has_proc_prosp, has_function_identity_arguments) = if include_routines {
-        let has_proc_prokind = postgres_proc_has_prokind(&client).await?;
+        let has_proc_prokind = postgres_proc_has_prokind(&client, metadata_budget, cancel_context).await?;
         // Some GaussDB-compatible catalogs expose prosp alongside, or instead of,
         // PostgreSQL 11's prokind. Treat prosp as an extra procedure signal.
-        let has_proc_prosp = postgres_proc_has_prosp(&client).await?;
-        let has_function_identity_arguments = postgres_has_function_identity_arguments(&client).await?;
+        let has_proc_prosp = postgres_proc_has_prosp(&client, metadata_budget, cancel_context).await?;
+        let has_function_identity_arguments =
+            postgres_has_function_identity_arguments(&client, metadata_budget, cancel_context).await?;
         (has_proc_prokind, has_proc_prosp, has_function_identity_arguments)
     } else {
         (false, false, false)
@@ -3385,6 +3547,8 @@ pub async fn list_objects(
         include_relations,
         include_routines,
         include_custom_types,
+        metadata_budget,
+        cancel_context,
     )
     .await
     {
@@ -3401,6 +3565,8 @@ pub async fn list_objects(
                 include_relations,
                 include_routines,
                 include_custom_types,
+                metadata_budget,
+                cancel_context,
             )
             .await
             {
@@ -3517,10 +3683,18 @@ async fn custom_type_general_info(
     client: &deadpool_postgres::Client,
     schema: &str,
     name: &str,
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<CustomTypeGeneralInfo, String> {
-    let rows = postgres_query_cached(client, custom_type_general_info_sql(), &[&schema, &name])
-        .await
-        .map_err(|e| format!("failed to locate custom type {schema}.{name}: {e}"))?;
+    let rows = postgres_query_cached_with_budget(
+        client,
+        custom_type_general_info_sql(),
+        &[&schema, &name],
+        budget,
+        cancel_context,
+    )
+    .await
+    .map_err(|e| format!("failed to locate custom type {schema}.{name}: {e}"))?;
     let row = rows.first().ok_or_else(|| format!("custom type {schema}.{name} does not exist"))?;
     Ok(CustomTypeGeneralInfo {
         oid: row.try_get::<_, u32>(0).unwrap_or(0),
@@ -3552,12 +3726,16 @@ async fn custom_type_general_info(
 async fn custom_type_rendered_domain_default(
     client: &deadpool_postgres::Client,
     oid: u32,
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Option<String>, String> {
-    let rows = postgres_query_cached(
+    let rows = postgres_query_cached_with_budget(
         client,
         "SELECT pg_catalog.pg_get_expr(t.typdefaultbin, 0) \
          FROM pg_catalog.pg_type t WHERE t.oid = $1",
         &[&oid],
+        budget,
+        cancel_context,
     )
     .await
     .map_err(|error| format!("failed to render domain default: {error}"))?;
@@ -3592,14 +3770,18 @@ fn custom_type_kind_for(typtype: &str) -> Option<CustomTypeKind> {
 async fn custom_type_enum_members(
     client: &deadpool_postgres::Client,
     oid: u32,
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Vec<CustomTypeMember>, String> {
-    let rows = postgres_query_cached(
+    let rows = postgres_query_cached_with_budget(
         client,
         "SELECT e.enumlabel, e.enumsortorder \
          FROM pg_catalog.pg_enum e \
          WHERE e.enumtypid = $1 \
          ORDER BY e.enumsortorder",
         &[&oid],
+        budget,
+        cancel_context,
     )
     .await
     .map_err(|e| format!("failed to read enum values: {e}"))?;
@@ -3624,10 +3806,12 @@ async fn custom_type_enum_members(
 async fn custom_type_composite_members(
     client: &deadpool_postgres::Client,
     typrelid: u32,
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Vec<CustomTypeMember>, String> {
     let data_type =
         postgres_qualified_format_type_expression("at", "atn", "elem", "elem_n", "a.atttypid", "a.atttypmod");
-    let rows = postgres_query_cached(
+    let rows = postgres_query_cached_with_budget(
         client,
         &format!(
             "SELECT a.attname, {data_type} AS data_type, \
@@ -3645,6 +3829,8 @@ async fn custom_type_composite_members(
          ORDER BY a.attnum"
         ),
         &[&typrelid],
+        budget,
+        cancel_context,
     )
     .await
     .map_err(|e| format!("failed to read composite fields: {e}"))?;
@@ -3704,11 +3890,13 @@ async fn custom_type_domain_attributes(
     client: &deadpool_postgres::Client,
     info: &CustomTypeGeneralInfo,
     properties: &mut CustomTypeProperties,
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     let base_type_expression =
         postgres_qualified_format_type_expression("t", "n", "elem", "elem_n", "t.oid", "$2::int4");
-    let base_type = postgres_query_cached(
+    let base_type = postgres_query_cached_with_budget(
         client,
         &format!(
             "SELECT {base_type_expression} \
@@ -3719,6 +3907,8 @@ async fn custom_type_domain_attributes(
              WHERE t.oid = $1"
         ),
         &[&info.typbasetype, &info.typtypmod],
+        budget,
+        cancel_context,
     )
     .await
     .ok()
@@ -3729,8 +3919,9 @@ async fn custom_type_domain_attributes(
     properties.not_null = Some(info.typnotnull);
     properties.default = info.typdefault.clone().filter(|value| !value.is_empty());
     if properties.default.is_none() && info.typdefaultbin.as_deref().is_some_and(|value| !value.is_empty()) {
-        let (default, warning) =
-            domain_default_from_render_result(custom_type_rendered_domain_default(client, info.oid).await);
+        let (default, warning) = domain_default_from_render_result(
+            custom_type_rendered_domain_default(client, info.oid, budget, cancel_context).await,
+        );
         properties.default = default;
         if let Some(warning) = warning {
             warnings.push(warning);
@@ -3739,13 +3930,15 @@ async fn custom_type_domain_attributes(
     if info.typcollation != 0 {
         properties.collation = info.collation.clone();
     }
-    match postgres_query_cached(
+    match postgres_query_cached_with_budget(
         client,
         "SELECT c.conname, pg_get_constraintdef(c.oid, true) AS definition \
          FROM pg_catalog.pg_constraint c \
          WHERE c.contypid = $1 \
          ORDER BY c.conname",
         &[&info.oid],
+        budget,
+        cancel_context,
     )
     .await
     {
@@ -3787,13 +3980,15 @@ async fn custom_type_range_attributes(
     oid: u32,
     is_multirange: bool,
     properties: &mut CustomTypeProperties,
+    budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Vec<String> {
     // pg_range.rngtypid always stores the RANGE oid. A multirange view must
     // first resolve its owning range through rngmultitypid.
     let range_oid_clause = if is_multirange { "WHERE r.rngmultitypid = $1" } else { "WHERE r.rngtypid = $1" };
     let subtype =
         postgres_qualified_format_type_expression("st", "stn", "elem", "elem_n", "r.rngsubtype", "NULL::integer");
-    let rows = match postgres_query_cached(
+    let rows = match postgres_query_cached_with_budget(
         client,
         &format!(
             "SELECT {subtype} AS subtype, \
@@ -3814,6 +4009,8 @@ async fn custom_type_range_attributes(
          {range_oid_clause}"
         ),
         &[&oid],
+        budget,
+        cancel_context,
     )
     .await
     {
@@ -3842,13 +4039,15 @@ async fn custom_type_range_attributes(
         warnings.push("range attributes returned no rows".to_string());
     }
     // Optional PG 13+ multirange companion; older kernels simply have no column.
-    match postgres_query_cached(
+    match postgres_query_cached_with_budget(
         client,
         "SELECT mt.typname \
          FROM pg_catalog.pg_range r \
          JOIN pg_catalog.pg_type mt ON mt.oid = r.rngmultitypid \
          WHERE r.rngtypid = $1",
         &[&oid],
+        budget,
+        cancel_context,
     )
     .await
     {
@@ -4034,7 +4233,13 @@ fn custom_type_common_properties(info: &CustomTypeGeneralInfo) -> CustomTypeProp
 /// PostgreSQL-family database; this function validates that the target object
 /// is an independent user-defined type (never a relation row type, an array
 /// companion, an undefined type or a system-schema type).
-pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> Result<CustomTypeDetails, String> {
+pub async fn get_custom_type_details(
+    pool: &Pool,
+    schema: &str,
+    name: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<CustomTypeDetails, String> {
     let schema = schema.trim();
     let name = name.trim();
     if schema.is_empty() || name.is_empty() {
@@ -4044,7 +4249,7 @@ pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> R
         return Err(format!("system schema {schema} is not supported for custom type details"));
     }
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let info = custom_type_general_info(&client, schema, name).await?;
+    let info = custom_type_general_info(&client, schema, name, metadata_budget, cancel_context).await?;
     if !info.typisdefined {
         return Err(format!("custom type {schema}.{name} is not fully defined"));
     }
@@ -4067,19 +4272,34 @@ pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> R
     let mut warnings = Vec::new();
     match kind {
         CustomTypeKind::Enum => {
-            members = custom_type_enum_members(&client, info.oid).await?;
+            members = custom_type_enum_members(&client, info.oid, metadata_budget, cancel_context).await?;
         }
         CustomTypeKind::Composite => {
-            members = custom_type_composite_members(&client, info.typrelid).await?;
+            members = custom_type_composite_members(&client, info.typrelid, metadata_budget, cancel_context).await?;
         }
         CustomTypeKind::Domain => {
-            warnings.extend(custom_type_domain_attributes(&client, &info, &mut properties).await);
+            warnings.extend(
+                custom_type_domain_attributes(&client, &info, &mut properties, metadata_budget, cancel_context).await,
+            );
         }
         CustomTypeKind::Range => {
-            warnings.extend(custom_type_range_attributes(&client, info.oid, false, &mut properties).await);
+            warnings.extend(
+                custom_type_range_attributes(
+                    &client,
+                    info.oid,
+                    false,
+                    &mut properties,
+                    metadata_budget,
+                    cancel_context,
+                )
+                .await,
+            );
         }
         CustomTypeKind::Multirange => {
-            warnings.extend(custom_type_range_attributes(&client, info.oid, true, &mut properties).await);
+            warnings.extend(
+                custom_type_range_attributes(&client, info.oid, true, &mut properties, metadata_budget, cancel_context)
+                    .await,
+            );
         }
         CustomTypeKind::Base => {}
     }
@@ -4096,10 +4316,15 @@ pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> R
     })
 }
 
-pub async fn list_object_statistics(pool: &Pool, schema: &str) -> Result<Vec<ObjectStatistics>, String> {
+pub async fn list_object_statistics(
+    pool: &Pool,
+    schema: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<ObjectStatistics>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(
+    let rows = postgres_query_cached_with_budget(
         &client,
         "SELECT c.relname, \
                 GREATEST(c.reltuples, 0)::bigint AS estimated_rows, \
@@ -4109,6 +4334,8 @@ pub async fn list_object_statistics(pool: &Pool, schema: &str) -> Result<Vec<Obj
          WHERE n.nspname = $1 AND c.relkind IN ('r','m','f','p') \
          ORDER BY c.relname",
         &[&schema],
+        metadata_budget,
+        cancel_context,
     )
     .await?;
     Ok(rows
@@ -4123,15 +4350,26 @@ pub async fn list_object_statistics(pool: &Pool, schema: &str) -> Result<Vec<Obj
 }
 
 pub async fn list_schemas(pool: &Pool) -> Result<Vec<String>, String> {
-    list_schemas_with_system(pool, false).await
+    let budget = postgres_default_metadata_query_budget(pool);
+    list_schemas_with_system(pool, false, budget, None).await
 }
 
 pub async fn list_schema_infos(pool: &Pool) -> Result<Vec<SchemaInfo>, String> {
-    list_schema_infos_with_system(pool, false).await
+    let budget = postgres_default_metadata_query_budget(pool);
+    list_schema_infos_with_system(pool, false, budget, None).await
 }
 
-pub async fn list_schemas_with_system(pool: &Pool, show_system_schemas: bool) -> Result<Vec<String>, String> {
-    Ok(list_schema_infos_with_system(pool, show_system_schemas).await?.into_iter().map(|schema| schema.name).collect())
+pub async fn list_schemas_with_system(
+    pool: &Pool,
+    show_system_schemas: bool,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<String>, String> {
+    Ok(list_schema_infos_with_system(pool, show_system_schemas, metadata_budget, cancel_context)
+        .await?
+        .into_iter()
+        .map(|schema| schema.name)
+        .collect())
 }
 
 const POSTGRES_SCHEMA_INFOS_SQL: &str = "SELECT n.nspname AS schema_name, d.description AS schema_comment \
@@ -4161,9 +4399,21 @@ fn postgres_schema_infos_sql(show_system_schemas: bool) -> &'static str {
     }
 }
 
-pub async fn list_schema_infos_with_system(pool: &Pool, show_system_schemas: bool) -> Result<Vec<SchemaInfo>, String> {
+pub async fn list_schema_infos_with_system(
+    pool: &Pool,
+    show_system_schemas: bool,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<SchemaInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_schema_infos_sql(show_system_schemas), &[]).await?;
+    let rows = postgres_query_cached_with_budget(
+        &client,
+        postgres_schema_infos_sql(show_system_schemas),
+        &[],
+        metadata_budget,
+        cancel_context,
+    )
+    .await?;
 
     Ok(rows
         .iter()
@@ -4373,34 +4623,63 @@ async fn get_columns_with_sql(
     sql: &str,
     schema: &str,
     table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Vec<ColumnInfo>, String> {
-    let rows = postgres_query_cached(client, sql, &[&schema, &table]).await?;
+    let rows =
+        postgres_query_cached_with_budget(client, sql, &[&schema, &table], metadata_budget, cancel_context).await?;
 
     Ok(rows.iter().map(column_info_from_row).collect())
 }
 
-pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
+pub async fn get_columns(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<ColumnInfo>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    match get_columns_with_sql(&client, POSTGRES_COLUMNS_SQL, schema, table).await {
+    match get_columns_with_sql(&client, POSTGRES_COLUMNS_SQL, schema, table, metadata_budget, cancel_context).await {
         Ok(columns) => Ok(columns),
-        Err(primary_error) => match get_columns_with_sql(&client, POSTGRES_COLUMNS_COMPAT_SQL, schema, table).await {
-            Ok(columns) => Ok(columns),
-            Err(fallback_error) => {
-                match get_columns_with_sql(&client, POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL, schema, table).await {
-                    Ok(columns) => Ok(columns),
-                    Err(information_schema_error) => {
-                        log::debug!(
-                            "[postgres][get_columns:compat-failed] primary_error={} fallback_error={} information_schema_error={}",
-                            primary_error,
-                            fallback_error,
-                            information_schema_error
-                        );
-                        Err(information_schema_error)
+        Err(primary_error) => {
+            match get_columns_with_sql(
+                &client,
+                POSTGRES_COLUMNS_COMPAT_SQL,
+                schema,
+                table,
+                metadata_budget,
+                cancel_context,
+            )
+            .await
+            {
+                Ok(columns) => Ok(columns),
+                Err(fallback_error) => {
+                    match get_columns_with_sql(
+                        &client,
+                        POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL,
+                        schema,
+                        table,
+                        metadata_budget,
+                        cancel_context,
+                    )
+                    .await
+                    {
+                        Ok(columns) => Ok(columns),
+                        Err(information_schema_error) => {
+                            log::debug!(
+                                "[postgres][get_columns:compat-failed] primary_error={} fallback_error={} information_schema_error={}",
+                                primary_error,
+                                fallback_error,
+                                information_schema_error
+                            );
+                            Err(information_schema_error)
+                        }
                     }
                 }
             }
-        },
+        }
     }
 }
 
@@ -4461,18 +4740,35 @@ fn redshift_columns_from_query_result(result: QueryResult) -> Vec<ColumnInfo> {
         .collect()
 }
 
-pub async fn get_redshift_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
+pub async fn get_redshift_columns(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<ColumnInfo>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let result = execute_select_text(
-        &client,
-        &redshift_columns_sql(schema, table),
-        Instant::now(),
-        crate::query::MAX_ROWS,
-        None,
-        None,
+    // Redshift needs the text protocol for column metadata, so this goes through
+    // the execution path. Bound the whole operation with the metadata budget and
+    // send a real server-side cancel on timeout.
+    let result = match tokio::time::timeout(
+        metadata_budget,
+        execute_select_text(
+            &client,
+            &redshift_columns_sql(schema, table),
+            Instant::now(),
+            crate::query::MAX_ROWS,
+            None,
+            None,
+        ),
     )
-    .await?;
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => return Err(err),
+        Err(_) => return Err(postgres_metadata_timeout_error(&client, metadata_budget, cancel_context).await),
+    };
     Ok(redshift_columns_from_query_result(result))
 }
 
@@ -5417,8 +5713,11 @@ async fn list_indexes_with_sql(
     sql: &str,
     schema: &str,
     table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Vec<IndexInfo>, String> {
-    let rows = postgres_query_cached(client, sql, &[&schema, &table]).await?;
+    let rows =
+        postgres_query_cached_with_budget(client, sql, &[&schema, &table], metadata_budget, cancel_context).await?;
 
     Ok(rows
         .iter()
@@ -5442,21 +5741,38 @@ async fn list_indexes_with_sql(
         .collect())
 }
 
-pub async fn list_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
+pub async fn list_indexes(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<IndexInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    match list_indexes_with_sql(&client, POSTGRES_INDEXES_SQL, schema, table).await {
+    match list_indexes_with_sql(&client, POSTGRES_INDEXES_SQL, schema, table, metadata_budget, cancel_context).await {
         Ok(indexes) => Ok(indexes),
-        Err(primary_error) => match list_indexes_with_sql(&client, POSTGRES_INDEXES_COMPAT_SQL, schema, table).await {
-            Ok(indexes) => Ok(indexes),
-            Err(fallback_error) => {
-                log::debug!(
-                    "[postgres][list_indexes:compat-failed] primary_error={} fallback_error={}",
-                    primary_error,
-                    fallback_error
-                );
-                Err(fallback_error)
+        Err(primary_error) => {
+            match list_indexes_with_sql(
+                &client,
+                POSTGRES_INDEXES_COMPAT_SQL,
+                schema,
+                table,
+                metadata_budget,
+                cancel_context,
+            )
+            .await
+            {
+                Ok(indexes) => Ok(indexes),
+                Err(fallback_error) => {
+                    log::debug!(
+                        "[postgres][list_indexes:compat-failed] primary_error={} fallback_error={}",
+                        primary_error,
+                        fallback_error
+                    );
+                    Err(fallback_error)
+                }
             }
-        },
+        }
     }
 }
 
@@ -5491,9 +5807,22 @@ fn postgres_foreign_key_action(value: String) -> Option<String> {
     }
 }
 
-pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
+pub async fn list_foreign_keys(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<ForeignKeyInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_foreign_keys_sql(), &[&schema, &table]).await?;
+    let rows = postgres_query_cached_with_budget(
+        &client,
+        postgres_foreign_keys_sql(),
+        &[&schema, &table],
+        metadata_budget,
+        cancel_context,
+    )
+    .await?;
 
     Ok(rows
         .iter()
@@ -5524,22 +5853,42 @@ fn postgres_table_dependencies_sql() -> &'static str {
 
 /// Fetch all same-schema table dependencies in one round trip. Whole-database
 /// exports use this instead of issuing one information_schema query per table.
-pub async fn list_table_dependencies(pool: &Pool, schema: &str) -> Result<Vec<(String, String)>, String> {
+pub async fn list_table_dependencies(
+    pool: &Pool,
+    schema: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<(String, String)>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_table_dependencies_sql(), &[&schema]).await?;
+    let rows = postgres_query_cached_with_budget(
+        &client,
+        postgres_table_dependencies_sql(),
+        &[&schema],
+        metadata_budget,
+        cancel_context,
+    )
+    .await?;
 
     Ok(rows.iter().map(|row| (pg_row_try_string(row, 0), pg_row_try_string(row, 1))).collect())
 }
 
-pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec<TriggerInfo>, String> {
+pub async fn list_triggers(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<TriggerInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(
+    let rows = postgres_query_cached_with_budget(
         &client,
         "SELECT trigger_name, event_manipulation, action_timing \
          FROM information_schema.triggers \
          WHERE trigger_schema = $1 AND event_object_table = $2 \
          ORDER BY trigger_name",
         &[&schema, &table],
+        metadata_budget,
+        cancel_context,
     )
     .await?;
 
@@ -5561,9 +5910,22 @@ pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec
         .collect())
 }
 
-pub async fn list_trigger_definitions(pool: &Pool, schema: &str, table: &str) -> Result<Vec<String>, String> {
+pub async fn list_trigger_definitions(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<String>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_trigger_definitions_sql(), &[&schema, &table]).await?;
+    let rows = postgres_query_cached_with_budget(
+        &client,
+        postgres_trigger_definitions_sql(),
+        &[&schema, &table],
+        metadata_budget,
+        cancel_context,
+    )
+    .await?;
 
     Ok(rows.iter().map(|row| pg_row_try_string(row, 0)).filter(|definition| !definition.trim().is_empty()).collect())
 }
@@ -5603,13 +5965,25 @@ fn postgres_functions_sql(has_proc_prokind: bool) -> &'static str {
              ORDER BY p.proname"
 }
 
-pub async fn list_functions(pool: &Pool, schema: &str) -> Result<Vec<FunctionInfo>, String> {
+pub async fn list_functions(
+    pool: &Pool,
+    schema: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<FunctionInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     // Use pg_proc + pg_get_functiondef() instead of information_schema.routines
     // for reliable function definition retrieval (information_schema.routines.routine_definition
     // is NULL for non-SQL functions like plpgsql)
-    let has_proc_prokind = postgres_proc_has_prokind(&client).await?;
-    let rows = postgres_query_cached(&client, postgres_functions_sql(has_proc_prokind), &[&schema]).await?;
+    let has_proc_prokind = postgres_proc_has_prokind(&client, metadata_budget, cancel_context).await?;
+    let rows = postgres_query_cached_with_budget(
+        &client,
+        postgres_functions_sql(has_proc_prokind),
+        &[&schema],
+        metadata_budget,
+        cancel_context,
+    )
+    .await?;
 
     Ok(rows
         .iter()
@@ -5682,9 +6056,12 @@ async fn list_sequences_with_sql(
     with_last_values: bool,
     metadata_sql: &str,
     last_values_sql: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Vec<SequenceInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, metadata_sql, &[&schema]).await?;
+    let rows =
+        postgres_query_cached_with_budget(&client, metadata_sql, &[&schema], metadata_budget, cancel_context).await?;
 
     let mut sequences: Vec<SequenceInfo> = rows
         .iter()
@@ -5701,7 +6078,10 @@ async fn list_sequences_with_sql(
         .collect();
 
     if with_last_values {
-        if let Ok(rows) = postgres_query_cached(&client, last_values_sql, &[&schema]).await {
+        if let Ok(rows) =
+            postgres_query_cached_with_budget(&client, last_values_sql, &[&schema], metadata_budget, cancel_context)
+                .await
+        {
             for row in rows {
                 let name: String = pg_row_try_string(&row, 0);
                 if let Ok(Some(value)) = row.try_get::<_, Option<String>>(1) {
@@ -5716,7 +6096,13 @@ async fn list_sequences_with_sql(
     Ok(sequences)
 }
 
-pub async fn list_sequences(pool: &Pool, schema: &str, with_last_values: bool) -> Result<Vec<SequenceInfo>, String> {
+pub async fn list_sequences(
+    pool: &Pool,
+    schema: &str,
+    with_last_values: bool,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<SequenceInfo>, String> {
     // PostgreSQL 10+ stores sequence properties in pg_sequence.
     list_sequences_with_sql(
         pool,
@@ -5724,6 +6110,8 @@ pub async fn list_sequences(pool: &Pool, schema: &str, with_last_values: bool) -
         with_last_values,
         postgres_sequences_sql(),
         postgres_sequence_last_values_sql(),
+        metadata_budget,
+        cancel_context,
     )
     .await
 }
@@ -5732,6 +6120,8 @@ pub async fn list_opengauss_sequences(
     pool: &Pool,
     schema: &str,
     with_last_values: bool,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Vec<SequenceInfo>, String> {
     // openGauss does not expose PostgreSQL 10's pg_sequence catalog. Its
     // information_schema view contains the portable sequence properties, while
@@ -5742,19 +6132,28 @@ pub async fn list_opengauss_sequences(
         with_last_values,
         opengauss_sequences_sql(),
         opengauss_sequence_last_values_sql(),
+        metadata_budget,
+        cancel_context,
     )
     .await
 }
 
-pub async fn list_rules(pool: &Pool, schema: &str) -> Result<Vec<RuleInfo>, String> {
+pub async fn list_rules(
+    pool: &Pool,
+    schema: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<RuleInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(
+    let rows = postgres_query_cached_with_budget(
         &client,
         "SELECT schemaname, tablename, rulename, definition \
          FROM pg_rules \
          WHERE schemaname = $1 \
          ORDER BY rulename",
         &[&schema],
+        metadata_budget,
+        cancel_context,
     )
     .await?;
 
@@ -5768,10 +6167,15 @@ pub async fn list_rules(pool: &Pool, schema: &str) -> Result<Vec<RuleInfo>, Stri
         .collect())
 }
 
-pub async fn list_extensions(pool: &Pool, schema: Option<&str>) -> Result<Vec<ExtensionInfo>, String> {
+pub async fn list_extensions(
+    pool: &Pool,
+    schema: Option<&str>,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<ExtensionInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let rows = if let Some(schema) = schema.filter(|value| !value.is_empty()) {
-        postgres_query_cached(
+        postgres_query_cached_with_budget(
             &client,
             "SELECT e.extname, COALESCE(e.extversion, '') AS extversion, d.description, n.nspname \
              FROM pg_catalog.pg_extension e \
@@ -5780,10 +6184,12 @@ pub async fn list_extensions(pool: &Pool, schema: Option<&str>) -> Result<Vec<Ex
              WHERE n.nspname = $1 \
              ORDER BY e.extname",
             &[&schema],
+            metadata_budget,
+            cancel_context,
         )
         .await
     } else {
-        postgres_query_cached(
+        postgres_query_cached_with_budget(
             &client,
             "SELECT e.extname, COALESCE(e.extversion, '') AS extversion, d.description, n.nspname \
              FROM pg_catalog.pg_extension e \
@@ -5791,6 +6197,8 @@ pub async fn list_extensions(pool: &Pool, schema: Option<&str>) -> Result<Vec<Ex
              LEFT JOIN pg_catalog.pg_description d ON d.objoid = e.oid AND d.classoid = 'pg_extension'::regclass \
              ORDER BY n.nspname, e.extname",
             &[],
+            metadata_budget,
+            cancel_context,
         )
         .await
     }?;
@@ -5832,16 +6240,29 @@ fn list_extension_member_objects_sql() -> &'static str {
        )"
 }
 
-pub async fn list_extension_member_objects(pool: &Pool, schema: &str) -> Result<Vec<(String, String, String)>, String> {
+pub async fn list_extension_member_objects(
+    pool: &Pool,
+    schema: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<(String, String, String)>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = match postgres_query_cached(&client, list_extension_member_objects_sql(), &[&schema]).await {
+    let rows = match postgres_query_cached_with_budget(
+        &client,
+        list_extension_member_objects_sql(),
+        &[&schema],
+        metadata_budget,
+        cancel_context,
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(primary_error) => {
             // PostgreSQL-compatible servers before the identity-argument
             // formatter can still be filtered using their legacy formatter.
             let fallback_sql = list_extension_member_objects_sql()
                 .replace("pg_get_function_identity_arguments(p.oid)", "pg_get_function_arguments(p.oid)");
-            postgres_query_cached(&client, &fallback_sql, &[&schema])
+            postgres_query_cached_with_budget(&client, &fallback_sql, &[&schema], metadata_budget, cancel_context)
                 .await
                 .map_err(|fallback_error| format!("{primary_error}; legacy fallback failed: {fallback_error}"))?
         }
@@ -5853,15 +6274,21 @@ pub async fn list_extension_member_objects(pool: &Pool, schema: &str) -> Result<
         .collect())
 }
 
-pub async fn list_available_extensions(pool: &Pool) -> Result<Vec<ExtensionInfo>, String> {
+pub async fn list_available_extensions(
+    pool: &Pool,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<ExtensionInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(
+    let rows = postgres_query_cached_with_budget(
         &client,
         "SELECT name, default_version, comment \
          FROM pg_catalog.pg_available_extensions \
          WHERE installed_version IS NULL \
          ORDER BY name",
         &[],
+        metadata_budget,
+        cancel_context,
     )
     .await?;
 
@@ -5876,9 +6303,16 @@ pub async fn list_available_extensions(pool: &Pool) -> Result<Vec<ExtensionInfo>
         .collect())
 }
 
-pub async fn list_owners(pool: &Pool, schema: &str) -> Result<Vec<OwnerInfo>, String> {
+pub async fn list_owners(
+    pool: &Pool,
+    schema: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<OwnerInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, POSTGRES_OWNERS_SQL, &[&schema]).await?;
+    let rows =
+        postgres_query_cached_with_budget(&client, POSTGRES_OWNERS_SQL, &[&schema], metadata_budget, cancel_context)
+            .await?;
 
     Ok(rows
         .iter()
@@ -5893,10 +6327,18 @@ pub async fn list_owners(pool: &Pool, schema: &str) -> Result<Vec<OwnerInfo>, St
         .collect())
 }
 
-pub async fn get_table_access(pool: &Pool, schema: &str, table: &str) -> Result<PostgresTableAccessInfo, String> {
+pub async fn get_table_access(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<PostgresTableAccessInfo, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
-    let owner_rows = postgres_query_cached(&client, POSTGRES_TABLE_OWNER_SQL, &params).await?;
+    let owner_rows =
+        postgres_query_cached_with_budget(&client, POSTGRES_TABLE_OWNER_SQL, &params, metadata_budget, cancel_context)
+            .await?;
     let owner_row = owner_rows.first().ok_or_else(|| "Table owner not found".to_string())?;
     let owner = pg_row_try_string(owner_row, 0);
     if owner.is_empty() {
@@ -5908,8 +6350,20 @@ pub async fn get_table_access(pool: &Pool, schema: &str, table: &str) -> Result<
     }
 
     let (table_privileges, column_privileges) = tokio::try_join!(
-        postgres_query_cached(&client, POSTGRES_TABLE_ACL_PRIVILEGES_SQL, &params),
-        postgres_query_cached(&client, POSTGRES_COLUMN_ACL_PRIVILEGES_SQL, &params),
+        postgres_query_cached_with_budget(
+            &client,
+            POSTGRES_TABLE_ACL_PRIVILEGES_SQL,
+            &params,
+            metadata_budget,
+            cancel_context
+        ),
+        postgres_query_cached_with_budget(
+            &client,
+            POSTGRES_COLUMN_ACL_PRIVILEGES_SQL,
+            &params,
+            metadata_budget,
+            cancel_context
+        ),
     )?;
 
     let privileges = table_privileges
@@ -6962,8 +7416,8 @@ mod tests {
                 &format!("CREATE TABLE {orders_table} (id bigint, state {status_type}, ship_to {address_type})"),
             )
             .await?;
-            let custom = list_objects(&pool, &schema, false, false, true).await?;
-            let all = list_objects(&pool, &schema, true, true, true).await?;
+            let custom = list_objects(&pool, &schema, false, false, true, Duration::from_secs(60), None).await?;
+            let all = list_objects(&pool, &schema, true, true, true, Duration::from_secs(60), None).await?;
             Ok::<_, String>((custom, all))
         }
         .await;
@@ -7013,8 +7467,8 @@ mod tests {
                 &format!("CREATE TABLE {orders_table} (id bigint, state {status_type}, ship_to {address_type})"),
             )
             .await?;
-            let custom = list_objects(&pool, &schema, false, false, true).await?;
-            let all = list_objects(&pool, &schema, true, true, true).await?;
+            let custom = list_objects(&pool, &schema, false, false, true, Duration::from_secs(60), None).await?;
+            let all = list_objects(&pool, &schema, true, true, true, Duration::from_secs(60), None).await?;
             Ok::<_, String>((custom, all))
         }
         .await;
@@ -7073,12 +7527,15 @@ mod tests {
                 ),
             )
             .await?;
-            let status = get_custom_type_details(&pool, &schema, "status").await?;
-            let email = get_custom_type_details(&pool, &schema, "email").await?;
-            let address = get_custom_type_details(&pool, &schema, "address").await?;
-            let price_range = get_custom_type_details(&pool, &schema, "price_range").await?;
-            let row_type_error = get_custom_type_details(&pool, &schema, "orders").await.err();
-            let array_type_error = get_custom_type_details(&pool, &schema, "_status").await.err();
+            let status = get_custom_type_details(&pool, &schema, "status", Duration::from_secs(60), None).await?;
+            let email = get_custom_type_details(&pool, &schema, "email", Duration::from_secs(60), None).await?;
+            let address = get_custom_type_details(&pool, &schema, "address", Duration::from_secs(60), None).await?;
+            let price_range =
+                get_custom_type_details(&pool, &schema, "price_range", Duration::from_secs(60), None).await?;
+            let row_type_error =
+                get_custom_type_details(&pool, &schema, "orders", Duration::from_secs(60), None).await.err();
+            let array_type_error =
+                get_custom_type_details(&pool, &schema, "_status", Duration::from_secs(60), None).await.err();
             Ok::<_, String>((status, email, address, price_range, row_type_error, array_type_error))
         }
         .await;
@@ -7157,11 +7614,14 @@ mod tests {
             execute_query(&pool, &format!("CREATE TYPE {price_range_type} AS RANGE (subtype = numeric)")).await?;
             execute_query(&pool, &format!("CREATE TABLE {orders_table} (state {status_type}, address {address_type})"))
                 .await?;
-            let status = get_custom_type_details(&pool, &schema, "status").await?;
-            let address = get_custom_type_details(&pool, &schema, "address").await?;
-            let price_range = get_custom_type_details(&pool, &schema, "price_range").await?;
-            let row_type_error = get_custom_type_details(&pool, &schema, "orders").await.err();
-            let array_type_error = get_custom_type_details(&pool, &schema, "_status").await.err();
+            let status = get_custom_type_details(&pool, &schema, "status", Duration::from_secs(60), None).await?;
+            let address = get_custom_type_details(&pool, &schema, "address", Duration::from_secs(60), None).await?;
+            let price_range =
+                get_custom_type_details(&pool, &schema, "price_range", Duration::from_secs(60), None).await?;
+            let row_type_error =
+                get_custom_type_details(&pool, &schema, "orders", Duration::from_secs(60), None).await.err();
+            let array_type_error =
+                get_custom_type_details(&pool, &schema, "_status", Duration::from_secs(60), None).await.err();
             Ok::<_, String>((status, address, price_range, row_type_error, array_type_error))
         }
         .await;
@@ -7929,11 +8389,37 @@ mod tests {
             create: Some(Duration::from_secs(9)),
             recycle: Some(Duration::from_secs(11)),
         };
-        assert_eq!(postgres_metadata_query_budget_from_timeouts(&timeouts), Duration::from_secs(11));
+        // Pool timeouts below the query-timeout-aligned fallback floor at 60s.
+        assert_eq!(postgres_metadata_query_budget_from_timeouts(&timeouts), POSTGRES_METADATA_QUERY_BUDGET_FALLBACK);
 
-        // No configured pool timeouts: fall back to the 5s connection timeout.
-        assert_eq!(postgres_metadata_query_budget_from_timeouts(&Timeouts::new()), crate::db::connection_timeout());
-        assert_eq!(crate::db::connection_timeout(), Duration::from_secs(5));
+        // No configured pool timeouts: floor at the 60s fallback (not the 5s
+        // connection timeout, which is below the default query timeout).
+        assert_eq!(
+            postgres_metadata_query_budget_from_timeouts(&Timeouts::new()),
+            POSTGRES_METADATA_QUERY_BUDGET_FALLBACK
+        );
+        assert_eq!(POSTGRES_METADATA_QUERY_BUDGET_FALLBACK, Duration::from_secs(60));
+
+        // A 10s-connect-timeout pool (the default) yields a 60s metadata budget,
+        // so a slow-but-valid cloud metadata query between connect_timeout (10s)
+        // and query_timeout (60s) is NOT killed by the budget.
+        let connect_timeout_pool = Timeouts {
+            wait: Some(Duration::from_secs(10)),
+            create: Some(Duration::from_secs(10)),
+            recycle: Some(Duration::from_secs(10)),
+        };
+        assert_eq!(
+            postgres_metadata_query_budget_from_timeouts(&connect_timeout_pool),
+            POSTGRES_METADATA_QUERY_BUDGET_FALLBACK
+        );
+
+        // When the pool timeouts exceed the fallback, the pool wins.
+        let large_pool = Timeouts {
+            wait: Some(Duration::from_secs(120)),
+            create: Some(Duration::from_secs(120)),
+            recycle: Some(Duration::from_secs(120)),
+        };
+        assert_eq!(postgres_metadata_query_budget_from_timeouts(&large_pool), Duration::from_secs(120));
     }
 
     #[test]
@@ -8173,7 +8659,9 @@ mod tests {
             checkout_postgres_client(&pool, None, crate::db::connection_timeout()).await.expect("checkout client");
 
         let columns =
-            get_columns_with_sql(&client, POSTGRES_COLUMNS_SQL, &schema, "orders").await.expect("primary columns");
+            get_columns_with_sql(&client, POSTGRES_COLUMNS_SQL, &schema, "orders", Duration::from_secs(60), None)
+                .await
+                .expect("primary columns");
         assert_eq!(
             state_enum_values(&columns),
             Some(vec!["pending".to_string(), "active".to_string(), "archived".to_string()])
@@ -8248,7 +8736,9 @@ mod tests {
         drop(client);
 
         let partition_info =
-            get_table_partition_info(&pool, &schema, "child").await.expect("classify PostgreSQL 9.x inherited table");
+            get_table_partition_info(&pool, &schema, "child", postgres_default_metadata_query_budget(&pool), None)
+                .await
+                .expect("classify PostgreSQL 9.x inherited table");
         let ddl = crate::schema::pg_ddl(&pool, &schema, "child").await;
         execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE"))
             .await
@@ -8295,16 +8785,50 @@ mod tests {
             .await
             .expect("create partitioned tables");
 
-        let parent_info = get_table_partition_info(&pool, &schema, "parent").await.expect("parent metadata");
-        let child_info = get_table_partition_info(&pool, &schema, "child").await.expect("child metadata");
-        let default_info = get_table_partition_info(&pool, &schema, "child_default").await.expect("default metadata");
-        let subpartition_info =
-            get_table_partition_info(&pool, &schema, "subpartition").await.expect("subpartition metadata");
-        let child_local_objects =
-            get_table_partition_local_objects(&pool, &schema, "child").await.expect("child local objects");
-        let inherited_child_local_objects = get_table_partition_local_objects(&pool, &schema, "inherited_child")
-            .await
-            .expect("inherited child local objects");
+        let parent_info =
+            get_table_partition_info(&pool, &schema, "parent", postgres_default_metadata_query_budget(&pool), None)
+                .await
+                .expect("parent metadata");
+        let child_info =
+            get_table_partition_info(&pool, &schema, "child", postgres_default_metadata_query_budget(&pool), None)
+                .await
+                .expect("child metadata");
+        let default_info = get_table_partition_info(
+            &pool,
+            &schema,
+            "child_default",
+            postgres_default_metadata_query_budget(&pool),
+            None,
+        )
+        .await
+        .expect("default metadata");
+        let subpartition_info = get_table_partition_info(
+            &pool,
+            &schema,
+            "subpartition",
+            postgres_default_metadata_query_budget(&pool),
+            None,
+        )
+        .await
+        .expect("subpartition metadata");
+        let child_local_objects = get_table_partition_local_objects(
+            &pool,
+            &schema,
+            "child",
+            postgres_default_metadata_query_budget(&pool),
+            None,
+        )
+        .await
+        .expect("child local objects");
+        let inherited_child_local_objects = get_table_partition_local_objects(
+            &pool,
+            &schema,
+            "inherited_child",
+            postgres_default_metadata_query_budget(&pool),
+            None,
+        )
+        .await
+        .expect("inherited child local objects");
         let parent_ddl = crate::schema::pg_ddl(&pool, &schema, "parent").await.expect("parent ddl");
         let child_ddl = crate::schema::pg_ddl(&pool, &schema, "child").await.expect("child ddl");
         let default_ddl = crate::schema::pg_ddl(&pool, &schema, "child_default").await.expect("default ddl");
@@ -9344,24 +9868,57 @@ mod tests {
             .expect("create live table fixtures");
         drop(client);
 
-        let all_tables = list_tables(&pool, "public").await.expect("expand complete table list");
-        let first_page = list_tables_filtered(&pool, "public", Some("dbx_issue_5584_live_page_"), Some(1), Some(0))
+        let all_tables = list_tables(&pool, "public", postgres_default_metadata_query_budget(&pool), None)
             .await
-            .expect("list first table page");
-        let second_page = list_tables_filtered(&pool, "public", Some("dbx_issue_5584_live_page_"), Some(1), Some(1))
-            .await
-            .expect("list second table page");
-        let wildcard_match =
-            list_tables_filtered(&pool, "public", Some("dbx_issue_5584_live_order_100%"), Some(10), Some(0))
+            .expect("expand complete table list");
+        let first_page = list_tables_filtered(
+            &pool,
+            "public",
+            Some("dbx_issue_5584_live_page_"),
+            Some(1),
+            Some(0),
+            Duration::from_secs(60),
+            None,
+        )
+        .await
+        .expect("list first table page");
+        let second_page = list_tables_filtered(
+            &pool,
+            "public",
+            Some("dbx_issue_5584_live_page_"),
+            Some(1),
+            Some(1),
+            Duration::from_secs(60),
+            None,
+        )
+        .await
+        .expect("list second table page");
+        let wildcard_match = list_tables_filtered(
+            &pool,
+            "public",
+            Some("dbx_issue_5584_live_order_100%"),
+            Some(10),
+            Some(0),
+            Duration::from_secs(60),
+            None,
+        )
+        .await
+        .expect("filter table with wildcard characters");
+        let backslash_match = list_tables_filtered(
+            &pool,
+            "public",
+            Some(r"dbx_issue_5584_live_back\slash"),
+            Some(10),
+            Some(0),
+            Duration::from_secs(60),
+            None,
+        )
+        .await
+        .expect("filter table with backslash");
+        let fuzzy_match =
+            list_tables_filtered(&pool, "public", Some("i5584su"), Some(10), Some(0), Duration::from_secs(60), None)
                 .await
-                .expect("filter table with wildcard characters");
-        let backslash_match =
-            list_tables_filtered(&pool, "public", Some(r"dbx_issue_5584_live_back\slash"), Some(10), Some(0))
-                .await
-                .expect("filter table with backslash");
-        let fuzzy_match = list_tables_filtered(&pool, "public", Some("i5584su"), Some(10), Some(0))
-            .await
-            .expect("fuzzy filter table name");
+                .expect("fuzzy filter table name");
 
         assert!(all_tables.iter().any(|table| table.name == "dbx_issue_5584_live_page_a"));
         assert!(all_tables.iter().any(|table| table.name == "dbx_issue_5584_live_page_b"));
@@ -9439,6 +9996,8 @@ mod tests {
                 parent_name: None,
                 match_mode: Some(CompletionAssistantMatchMode::Prefix),
             },
+            Duration::from_secs(60),
+            None,
         )
         .await
         .expect("complete visible sequence");
@@ -9468,6 +10027,8 @@ mod tests {
                 parent_name: None,
                 match_mode: Some(CompletionAssistantMatchMode::Prefix),
             },
+            Duration::from_secs(60),
+            None,
         )
         .await
         .expect("complete qualified mixed-case sequence");

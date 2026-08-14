@@ -170,6 +170,20 @@ fn agent_metadata_timeout(config: Option<&ConnectionConfig>) -> Option<Duration>
     }
 }
 
+/// Config-derived budget for native PostgreSQL metadata queries. Bounded:
+/// `query_timeout_secs == 0` (unlimited for user queries) maps to the 60s
+/// fallback so metadata can never hang indefinitely, and `None` config uses the
+/// same fallback.
+fn native_postgres_metadata_budget(config: Option<&ConnectionConfig>) -> Duration {
+    let Some(config) = config else {
+        return db::postgres::POSTGRES_METADATA_QUERY_BUDGET_FALLBACK;
+    };
+    match config.effective_query_timeout_secs() {
+        0 => db::postgres::POSTGRES_METADATA_QUERY_BUDGET_FALLBACK, // bounded fallback for "unlimited"
+        secs => Duration::from_secs(secs),
+    }
+}
+
 pub async fn list_databases_core(state: &AppState, connection_id: &str) -> Result<Vec<db::DatabaseInfo>, String> {
     retry_metadata_connection(state, connection_id, None, || list_databases_once(state, connection_id)).await
 }
@@ -626,7 +640,11 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
                 .map(|databases| filter_mysql_system_databases_for_config(databases, db_config.as_ref()))
         }
         PoolKind::Mysql(p, mode) => dispatch_mysql!(p, mode, db::mysql::list_databases, db::ob_oracle::list_databases),
-        PoolKind::Postgres(p) => db::postgres::list_databases(p).await,
+        PoolKind::Postgres(p) => {
+            let budget = native_postgres_metadata_budget(db_config.as_ref());
+            let cancel_context = state.get_postgres_cancel_context(connection_id).await;
+            db::postgres::list_databases(p, budget, cancel_context.as_ref()).await
+        }
         PoolKind::Sqlite(p) => db::sqlite::list_databases(p).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::list_databases(client).await,
         PoolKind::Turso(client) => db::turso_driver::list_databases(client).await,
@@ -664,8 +682,10 @@ async fn list_database_metadata_once(state: &AppState, connection_id: &str) -> R
         };
     }
     if let Some(pool) = extract_pool!(&connections, connection_id, Postgres) {
+        let budget = native_postgres_metadata_budget(config.as_ref());
+        let cancel_context = state.get_postgres_cancel_context(connection_id).await;
         drop(connections);
-        return db::postgres::list_database_metadata(&pool).await;
+        return db::postgres::list_database_metadata(&pool, budget, cancel_context.as_ref()).await;
     }
     drop(connections);
     list_databases_once(state, connection_id).await
@@ -709,7 +729,15 @@ async fn list_schema_infos_once(
     {
         let connections = state.connections.read().await;
         if let Some(PoolKind::Postgres(pool)) = connections.get(&pool_key) {
-            return db::postgres::list_schema_infos_with_system(pool, show_system_schemas).await;
+            let budget = native_postgres_metadata_budget(db_config.as_ref());
+            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+            return db::postgres::list_schema_infos_with_system(
+                pool,
+                show_system_schemas,
+                budget,
+                cancel_context.as_ref(),
+            )
+            .await;
         }
     }
 
@@ -814,9 +842,16 @@ async fn list_schemas_once(
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
                             Ok(Some(pool)) => {
-                                return db::postgres::list_schemas_with_system(&pool, show_system_schemas).await.map(
-                                    |schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()),
+                                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                                return db::postgres::list_schemas_with_system(
+                                    &pool,
+                                    show_system_schemas,
+                                    budget,
+                                    cancel_context.as_ref(),
                                 )
+                                .await
+                                .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()));
                             }
                             Ok(None) => {
                                 return Ok(filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
@@ -838,15 +873,22 @@ async fn list_schemas_once(
                         if let Some(pool) =
                             native_postgres_metadata_pool(state, connection_id, database, config).await?
                         {
-                            return db::postgres::list_schemas_with_system(&pool, show_system_schemas)
-                                .await
-                                .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
-                                .map_err(|fallback_error| {
-                                    crate::db::agent_driver::append_legacy_error_context(
-                                        &agent_error,
-                                        &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
-                                    )
-                                });
+                            let budget = native_postgres_metadata_budget(db_config.as_ref());
+                            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                            return db::postgres::list_schemas_with_system(
+                                &pool,
+                                show_system_schemas,
+                                budget,
+                                cancel_context.as_ref(),
+                            )
+                            .await
+                            .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
+                            .map_err(|fallback_error| {
+                                crate::db::agent_driver::append_legacy_error_context(
+                                    &agent_error,
+                                    &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
+                                )
+                            });
                         }
                     }
                     return Err(agent_error);
@@ -862,9 +904,13 @@ async fn list_schemas_once(
         PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => db::ob_oracle::list_schemas(p)
             .await
             .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
-        PoolKind::Postgres(p) => db::postgres::list_schemas_with_system(p, show_system_schemas)
-            .await
-            .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
+        PoolKind::Postgres(p) => {
+            let budget = native_postgres_metadata_budget(db_config.as_ref());
+            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+            db::postgres::list_schemas_with_system(p, show_system_schemas, budget, cancel_context.as_ref())
+                .await
+                .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
+        }
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => {
             let client = client.clone();
@@ -1086,7 +1132,9 @@ async fn get_table_comment_core_for_session(
                 db::mysql::get_table_comment(p, database, table).await
             }
             PoolKind::Postgres(p) if !db_config.as_ref().is_some_and(is_questdb_config) => {
-                db::postgres::get_table_comment(p, schema, table).await
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::get_table_comment(p, schema, table, budget, cancel_context.as_ref()).await
             }
             _ => Err("Table comment lookup is not supported for this connection".to_string()),
         }
@@ -2070,21 +2118,40 @@ async fn list_tables_once(
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
                             Ok(Some(pool)) => {
+                                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
                                 return if object_types.is_some() {
-                                    db::postgres::list_tables_filtered(&pool, schema, filter, None, None).await.map(
-                                        |tables| {
-                                            filter_table_infos(
-                                                tables,
-                                                filter,
-                                                limit,
-                                                offset,
-                                                object_types,
-                                                table_name_filter,
-                                            )
-                                        },
+                                    db::postgres::list_tables_filtered(
+                                        &pool,
+                                        schema,
+                                        filter,
+                                        None,
+                                        None,
+                                        budget,
+                                        cancel_context.as_ref(),
                                     )
+                                    .await
+                                    .map(|tables| {
+                                        filter_table_infos(
+                                            tables,
+                                            filter,
+                                            limit,
+                                            offset,
+                                            object_types,
+                                            table_name_filter,
+                                        )
+                                    })
                                 } else {
-                                    db::postgres::list_tables_filtered(&pool, schema, filter, limit, offset).await
+                                    db::postgres::list_tables_filtered(
+                                        &pool,
+                                        schema,
+                                        filter,
+                                        limit,
+                                        offset,
+                                        budget,
+                                        cancel_context.as_ref(),
+                                    )
+                                    .await
                                 };
                             }
                             Ok(None) => {
@@ -2115,21 +2182,33 @@ async fn list_tables_once(
                         if let Some(pool) =
                             native_postgres_metadata_pool(state, connection_id, database, config).await?
                         {
+                            let budget = native_postgres_metadata_budget(db_config.as_ref());
+                            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
                             let result = if object_types.is_some() {
-                                db::postgres::list_tables_filtered(&pool, schema, filter, None, None).await.map(
-                                    |tables| {
-                                        filter_table_infos(
-                                            tables,
-                                            filter,
-                                            limit,
-                                            offset,
-                                            object_types,
-                                            table_name_filter,
-                                        )
-                                    },
+                                db::postgres::list_tables_filtered(
+                                    &pool,
+                                    schema,
+                                    filter,
+                                    None,
+                                    None,
+                                    budget,
+                                    cancel_context.as_ref(),
                                 )
+                                .await
+                                .map(|tables| {
+                                    filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter)
+                                })
                             } else {
-                                db::postgres::list_tables_filtered(&pool, schema, filter, limit, offset).await
+                                db::postgres::list_tables_filtered(
+                                    &pool,
+                                    schema,
+                                    filter,
+                                    limit,
+                                    offset,
+                                    budget,
+                                    cancel_context.as_ref(),
+                                )
+                                .await
                             };
                             return result.map_err(|fallback_error| {
                                 crate::db::agent_driver::append_legacy_error_context(
@@ -2196,12 +2275,15 @@ async fn list_tables_once(
             }
         }
         PoolKind::Postgres(p) => {
+            let budget = native_postgres_metadata_budget(db_config.as_ref());
+            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
             if object_types.is_some() || table_name_filter.is_some_and(|filter| !filter.is_empty()) {
-                db::postgres::list_tables_filtered(p, schema, filter, None, None)
+                db::postgres::list_tables_filtered(p, schema, filter, None, None, budget, cancel_context.as_ref())
                     .await
                     .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter))
             } else {
-                db::postgres::list_tables_filtered(p, schema, filter, limit, offset).await
+                db::postgres::list_tables_filtered(p, schema, filter, limit, offset, budget, cancel_context.as_ref())
+                    .await
             }
         }
         PoolKind::Sqlite(p) => db::sqlite::list_tables(p, schema)
@@ -2660,11 +2742,12 @@ mod tests {
         is_mysql_external_driver_config, is_retryable_metadata_error, metadata_error_action,
         metadata_name_or_comment_matches, mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
         mysql_object_source_ddl_column_index, mysql_object_source_sql, mysql_table_list_source_for_config,
-        mysql_table_metadata_catalog, normalize_information_schema_table_type, oracle_columns_from_query_result,
-        oracle_columns_sql, oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
-        oracle_object_statistics_rows_only_sql, oracle_object_statistics_sql,
-        oracle_object_statistics_user_segments_sql, oracle_table_comment_from_query_result, oracle_table_comment_sql,
-        oracle_table_comments_sql, presto_like_columns_from_query_result, presto_like_information_schema_columns_sql,
+        mysql_table_metadata_catalog, native_postgres_metadata_budget, normalize_information_schema_table_type,
+        oracle_columns_from_query_result, oracle_columns_sql, oracle_object_statistics_dba_segments_sql,
+        oracle_object_statistics_from_query_result, oracle_object_statistics_rows_only_sql,
+        oracle_object_statistics_sql, oracle_object_statistics_user_segments_sql,
+        oracle_table_comment_from_query_result, oracle_table_comment_sql, oracle_table_comments_sql,
+        presto_like_columns_from_query_result, presto_like_information_schema_columns_sql,
         presto_like_information_schema_tables_sql, presto_like_tables_from_query_result, replace_metadata_runtime,
         should_query_oracle_columns_via_sql_first, table_comments_from_query_result, table_name_filter_matches,
         tdengine_table_comment_like_pattern, tdengine_table_comment_sql, tdengine_table_comments_sql,
@@ -3288,6 +3371,41 @@ mod tests {
         assert_eq!(metadata_error_action(db_type, timeout, false), MetadataErrorAction::Discard);
         assert_eq!(metadata_error_action(db_type, timeout, true), MetadataErrorAction::Discard);
         assert!(!is_retryable_metadata_error(timeout));
+    }
+
+    #[test]
+    fn native_postgres_metadata_budget_is_bounded_and_config_derived() {
+        // No config: bounded 60s fallback.
+        assert_eq!(native_postgres_metadata_budget(None), db::postgres::POSTGRES_METADATA_QUERY_BUDGET_FALLBACK);
+        assert_eq!(db::postgres::POSTGRES_METADATA_QUERY_BUDGET_FALLBACK, Duration::from_secs(60));
+
+        // query_timeout_secs == 0 (unlimited for user queries): bounded 60s fallback.
+        let unlimited = test_connection_config(DatabaseType::Postgres);
+        let unlimited = ConnectionConfig { query_timeout_secs: 0, ..unlimited };
+        assert_eq!(native_postgres_metadata_budget(Some(&unlimited)), Duration::from_secs(60));
+
+        // Query timeout below the fallback is respected (not capped at 60s).
+        let short = test_connection_config(DatabaseType::Postgres);
+        let short = ConnectionConfig { query_timeout_secs: 30, ..short };
+        assert_eq!(native_postgres_metadata_budget(Some(&short)), Duration::from_secs(30));
+
+        // Query timeout above the fallback is threaded, not capped.
+        let long = test_connection_config(DatabaseType::Postgres);
+        let long = ConnectionConfig { query_timeout_secs: 120, ..long };
+        assert_eq!(native_postgres_metadata_budget(Some(&long)), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn native_postgres_metadata_budget_exceeds_connect_timeout_regression() {
+        // Regression for t8y2/dbx#5897: a 10s connect-timeout pool must NOT cap
+        // the metadata budget. With connect_timeout_secs=10 and
+        // query_timeout_secs=60, a metadata query that takes between 10s and
+        // 60s must NOT be killed by a 10s budget.
+        let config = test_connection_config(DatabaseType::Postgres);
+        let config = ConnectionConfig { connect_timeout_secs: 10, query_timeout_secs: 60, ..config };
+        let budget = native_postgres_metadata_budget(Some(&config));
+        assert_eq!(budget, Duration::from_secs(60));
+        assert!(budget > Duration::from_secs(config.connect_timeout_secs));
     }
 
     #[tokio::test]
@@ -4742,8 +4860,12 @@ pub async fn completion_assistant_search_core(
                 PoolKind::Postgres(pool) => Some(pool.clone()),
                 _ => None,
             }) {
+                let db_config = connection_config(state, &request.connection_id).await;
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
                 drop(connections);
-                return db::postgres::completion_assistant_search(&pool, &request).await;
+                return db::postgres::completion_assistant_search(&pool, &request, budget, cancel_context.as_ref())
+                    .await;
             }
         }
 
@@ -5008,7 +5130,11 @@ async fn list_object_statistics_once(
             }
         }
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => Ok(vec![]),
-        PoolKind::Postgres(p) => db::postgres::list_object_statistics(p, schema).await,
+        PoolKind::Postgres(p) => {
+            let budget = native_postgres_metadata_budget(db_config.as_ref());
+            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+            db::postgres::list_object_statistics(p, schema, budget, cancel_context.as_ref()).await
+        }
         PoolKind::ClickHouse(client) => {
             db::clickhouse_driver::list_object_statistics(client, clickhouse_metadata_database(database, schema)).await
         }
@@ -5147,9 +5273,19 @@ async fn list_objects_once(
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
                             Ok(Some(pool)) => {
-                                return db::postgres::list_objects(&pool, schema, true, true, false)
-                                    .await
-                                    .map(unpaged_object_list)
+                                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                                return db::postgres::list_objects(
+                                    &pool,
+                                    schema,
+                                    true,
+                                    true,
+                                    false,
+                                    budget,
+                                    cancel_context.as_ref(),
+                                )
+                                .await
+                                .map(unpaged_object_list);
                             }
                             Ok(None) => return Ok(unpaged_object_list(objects)),
                             Err(error) => {
@@ -5176,15 +5312,25 @@ async fn list_objects_once(
                         if let Some(pool) =
                             native_postgres_metadata_pool(state, connection_id, database, config).await?
                         {
-                            return db::postgres::list_objects(&pool, schema, true, true, false)
-                                .await
-                                .map(unpaged_object_list)
-                                .map_err(|fallback_error| {
-                                    crate::db::agent_driver::append_legacy_error_context(
-                                        &agent_error,
-                                        &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
-                                    )
-                                });
+                            let budget = native_postgres_metadata_budget(db_config.as_ref());
+                            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                            return db::postgres::list_objects(
+                                &pool,
+                                schema,
+                                true,
+                                true,
+                                false,
+                                budget,
+                                cancel_context.as_ref(),
+                            )
+                            .await
+                            .map(unpaged_object_list)
+                            .map_err(|fallback_error| {
+                                crate::db::agent_driver::append_legacy_error_context(
+                                    &agent_error,
+                                    &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
+                                )
+                            });
                         }
                     }
                     return Err(agent_error);
@@ -5224,9 +5370,19 @@ async fn list_objects_once(
             let include_routines = object_types_include_routines(object_types);
             let include_custom_types = db_config.as_ref().is_some_and(supports_pg_custom_type_objects)
                 && object_types_include_custom_types(object_types);
-            db::postgres::list_objects(p, schema, include_relations, include_routines, include_custom_types)
-                .await
-                .map(unpaged_object_list)
+            let budget = native_postgres_metadata_budget(db_config.as_ref());
+            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+            db::postgres::list_objects(
+                p,
+                schema,
+                include_relations,
+                include_routines,
+                include_custom_types,
+                budget,
+                cancel_context.as_ref(),
+            )
+            .await
+            .map(unpaged_object_list)
         }
         _ => {
             drop(connections);
@@ -5298,9 +5454,19 @@ async fn list_completion_objects_once(
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
                             Ok(Some(pool)) => {
-                                return db::postgres::list_objects(&pool, schema, true, true, false)
-                                    .await
-                                    .map(filter_completion_objects)
+                                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                                return db::postgres::list_objects(
+                                    &pool,
+                                    schema,
+                                    true,
+                                    true,
+                                    false,
+                                    budget,
+                                    cancel_context.as_ref(),
+                                )
+                                .await
+                                .map(filter_completion_objects);
                             }
                             Ok(None) => objects,
                             Err(error) => {
@@ -5323,15 +5489,25 @@ async fn list_completion_objects_once(
                         if let Some(pool) =
                             native_postgres_metadata_pool(state, connection_id, database, config).await?
                         {
-                            return db::postgres::list_objects(&pool, schema, true, true, false)
-                                .await
-                                .map(filter_completion_objects)
-                                .map_err(|fallback_error| {
-                                    crate::db::agent_driver::append_legacy_error_context(
-                                        &agent_error,
-                                        &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
-                                    )
-                                });
+                            let budget = native_postgres_metadata_budget(db_config.as_ref());
+                            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                            return db::postgres::list_objects(
+                                &pool,
+                                schema,
+                                true,
+                                true,
+                                false,
+                                budget,
+                                cancel_context.as_ref(),
+                            )
+                            .await
+                            .map(filter_completion_objects)
+                            .map_err(|fallback_error| {
+                                crate::db::agent_driver::append_legacy_error_context(
+                                    &agent_error,
+                                    &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
+                                )
+                            });
                         }
                     }
                     return Err(agent_error);
@@ -5356,7 +5532,11 @@ async fn list_completion_objects_once(
             db::cloudberry::list_objects(p, schema).await.map(filter_completion_objects)
         }
         PoolKind::Postgres(p) => {
-            db::postgres::list_objects(p, schema, true, true, false).await.map(filter_completion_objects)
+            let budget = native_postgres_metadata_budget(db_config.as_ref());
+            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+            db::postgres::list_objects(p, schema, true, true, false, budget, cancel_context.as_ref())
+                .await
+                .map(filter_completion_objects)
         }
         PoolKind::SqlServer(_) => {
             drop(connections);
@@ -5812,9 +5992,17 @@ async fn get_columns_core_for_session_inner(
                             }
                             match native_postgres_metadata_pool(state, connection_id, database, config).await {
                                 Ok(Some(pool)) => {
-                                    return db::postgres::get_columns(&pool, schema, table)
-                                        .await
-                                        .map(deduplicate_column_infos);
+                                    let budget = native_postgres_metadata_budget(db_config.as_ref());
+                                    let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                                    return db::postgres::get_columns(
+                                        &pool,
+                                        schema,
+                                        table,
+                                        budget,
+                                        cancel_context.as_ref(),
+                                    )
+                                    .await
+                                    .map(deduplicate_column_infos);
                                 }
                                 Ok(None) => return Ok(deduplicate_column_infos(columns)),
                                 Err(error) => {
@@ -5836,15 +6024,23 @@ async fn get_columns_core_for_session_inner(
                             if let Some(pool) =
                                 native_postgres_metadata_pool(state, connection_id, database, config).await?
                             {
-                                return db::postgres::get_columns(&pool, schema, table)
-                                    .await
-                                    .map(deduplicate_column_infos)
-                                    .map_err(|fallback_error| {
-                                        crate::db::agent_driver::append_legacy_error_context(
-                                            &agent_error,
-                                            &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
-                                        )
-                                    });
+                                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                                return db::postgres::get_columns(
+                                    &pool,
+                                    schema,
+                                    table,
+                                    budget,
+                                    cancel_context.as_ref(),
+                                )
+                                .await
+                                .map(deduplicate_column_infos)
+                                .map_err(|fallback_error| {
+                                    crate::db::agent_driver::append_legacy_error_context(
+                                        &agent_error,
+                                        &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
+                                    )
+                                });
                             }
                         }
                         return Err(agent_error);
@@ -5884,9 +6080,19 @@ async fn get_columns_core_for_session_inner(
             PoolKind::Postgres(p)
                 if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Redshift) =>
             {
-                db::postgres::get_redshift_columns(p, schema, table).await.map(deduplicate_column_infos)
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::get_redshift_columns(p, schema, table, budget, cancel_context.as_ref())
+                    .await
+                    .map(deduplicate_column_infos)
             }
-            PoolKind::Postgres(p) => db::postgres::get_columns(p, schema, table).await.map(deduplicate_column_infos),
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::get_columns(p, schema, table, budget, cancel_context.as_ref())
+                    .await
+                    .map(deduplicate_column_infos)
+            }
             PoolKind::Sqlite(p) => db::sqlite::get_columns(p, schema, table).await.map(deduplicate_column_infos),
             PoolKind::Rqlite(client) => {
                 db::rqlite_driver::get_columns(client, schema, table).await.map(deduplicate_column_infos)
@@ -6079,7 +6285,11 @@ async fn list_indexes_core_for_session(
             {
                 Ok(vec![])
             }
-            PoolKind::Postgres(p) => db::postgres::list_indexes(p, schema, table).await,
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_indexes(p, schema, table, budget, cancel_context.as_ref()).await
+            }
             PoolKind::Sqlite(p) => db::sqlite::list_indexes(p, schema, table).await,
             PoolKind::Rqlite(client) => db::rqlite_driver::list_indexes(client, schema, table).await,
             PoolKind::Turso(client) => db::turso_driver::list_indexes(client, schema, table).await,
@@ -6152,7 +6362,11 @@ async fn list_foreign_keys_core_for_session(
                     db::mysql::list_foreign_keys(p, mysql_table_metadata_catalog(database, schema), table).await
                 }
             }
-            PoolKind::Postgres(p) => db::postgres::list_foreign_keys(p, schema, table).await,
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_foreign_keys(p, schema, table, budget, cancel_context.as_ref()).await
+            }
             PoolKind::Sqlite(p) => db::sqlite::list_foreign_keys(p, schema, table).await,
             PoolKind::Rqlite(client) => db::rqlite_driver::list_foreign_keys(client, schema, table).await,
             PoolKind::Turso(client) => db::turso_driver::list_foreign_keys(client, schema, table).await,
@@ -6198,7 +6412,11 @@ pub async fn list_triggers_core(
                     db::mysql::list_triggers(p, mysql_table_metadata_catalog(database, schema), table).await
                 }
             }
-            PoolKind::Postgres(p) => db::postgres::list_triggers(p, schema, table).await,
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_triggers(p, schema, table, budget, cancel_context.as_ref()).await
+            }
             PoolKind::Sqlite(p) => db::sqlite::list_triggers(p, schema, table).await,
             PoolKind::Rqlite(client) => db::rqlite_driver::list_triggers(client, schema, table).await,
             PoolKind::Turso(client) => db::turso_driver::list_triggers(client, schema, table).await,
@@ -6285,11 +6503,16 @@ pub async fn list_functions_core(
 ) -> Result<Vec<db::FunctionInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+        let db_config = connection_config(state, connection_id).await;
         let connections = state.connections.read().await;
         let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
         match pool {
-            PoolKind::Postgres(p) => db::postgres::list_functions(p, schema).await,
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_functions(p, schema, budget, cancel_context.as_ref()).await
+            }
             _ => Ok(vec![]),
         }
     })
@@ -6311,9 +6534,16 @@ pub async fn list_sequences_core(
 
         match pool {
             PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_opengauss_family_config) => {
-                db::postgres::list_opengauss_sequences(p, schema, with_last_values).await
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_opengauss_sequences(p, schema, with_last_values, budget, cancel_context.as_ref())
+                    .await
             }
-            PoolKind::Postgres(p) => db::postgres::list_sequences(p, schema, with_last_values).await,
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_sequences(p, schema, with_last_values, budget, cancel_context.as_ref()).await
+            }
             _ => Ok(vec![]),
         }
     })
@@ -6328,11 +6558,16 @@ pub async fn list_rules_core(
 ) -> Result<Vec<db::RuleInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+        let db_config = connection_config(state, connection_id).await;
         let connections = state.connections.read().await;
         let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
         match pool {
-            PoolKind::Postgres(p) => db::postgres::list_rules(p, schema).await,
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_rules(p, schema, budget, cancel_context.as_ref()).await
+            }
             _ => Ok(vec![]),
         }
     })
@@ -6361,7 +6596,11 @@ pub async fn list_extensions_core(
         let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
         match pool {
-            PoolKind::Postgres(p) => db::postgres::list_extensions(p, schema).await,
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_extensions(p, schema, budget, cancel_context.as_ref()).await
+            }
             _ => Ok(vec![]),
         }
     })
@@ -6393,7 +6632,11 @@ pub async fn list_available_extensions_core(
         let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
         match pool {
-            PoolKind::Postgres(p) => db::postgres::list_available_extensions(p).await,
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_available_extensions(p, budget, cancel_context.as_ref()).await
+            }
             _ => Ok(vec![]),
         }
     })
@@ -6408,11 +6651,16 @@ pub async fn list_owners_core(
 ) -> Result<Vec<db::OwnerInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+        let db_config = connection_config(state, connection_id).await;
         let connections = state.connections.read().await;
         let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
         match pool {
-            PoolKind::Postgres(p) => db::postgres::list_owners(p, schema).await,
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_owners(p, schema, budget, cancel_context.as_ref()).await
+            }
             _ => Ok(vec![]),
         }
     })
@@ -7418,7 +7666,11 @@ async fn get_custom_type_details_once(
     let connections = state.connections.read().await;
     let pool = connections.get(&pool_key).ok_or("Pool not found")?;
     match pool {
-        PoolKind::Postgres(p) => db::postgres::get_custom_type_details(p, schema, name).await,
+        PoolKind::Postgres(p) => {
+            let budget = native_postgres_metadata_budget(db_config.as_ref());
+            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+            db::postgres::get_custom_type_details(p, schema, name, budget, cancel_context.as_ref()).await
+        }
         _ => Err("custom type details are not supported for this connection type".to_string()),
     }
 }
@@ -9178,16 +9430,17 @@ pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, schema: &str, table: &s
 }
 
 pub async fn pg_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -> Result<String, String> {
+    let budget = db::postgres::postgres_default_metadata_query_budget(pool);
     let (columns, indexes, fkeys, table_comment, partition_info, trigger_definitions) = tokio::try_join!(
-        db::postgres::get_columns(pool, schema, table),
-        db::postgres::list_indexes(pool, schema, table),
-        db::postgres::list_foreign_keys(pool, schema, table),
-        async { db::postgres::get_table_comment(pool, schema, table).await },
-        db::postgres::get_table_partition_info(pool, schema, table),
-        db::postgres::list_trigger_definitions(pool, schema, table),
+        db::postgres::get_columns(pool, schema, table, budget, None),
+        db::postgres::list_indexes(pool, schema, table, budget, None),
+        db::postgres::list_foreign_keys(pool, schema, table, budget, None),
+        async { db::postgres::get_table_comment(pool, schema, table, budget, None).await },
+        db::postgres::get_table_partition_info(pool, schema, table, budget, None),
+        db::postgres::list_trigger_definitions(pool, schema, table, budget, None),
     )?;
     let partition_local_objects = if partition_info.is_partition {
-        db::postgres::get_table_partition_local_objects(pool, schema, table).await?
+        db::postgres::get_table_partition_local_objects(pool, schema, table, budget, None).await?
     } else {
         db::postgres::PostgresTablePartitionLocalObjects::default()
     };
@@ -9208,7 +9461,9 @@ pub async fn pg_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -
 }
 
 async fn pg_display_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -> Result<String, String> {
-    let (ddl, access) = tokio::join!(pg_ddl(pool, schema, table), db::postgres::get_table_access(pool, schema, table));
+    let budget = db::postgres::postgres_default_metadata_query_budget(pool);
+    let (ddl, access) =
+        tokio::join!(pg_ddl(pool, schema, table), db::postgres::get_table_access(pool, schema, table, budget, None));
     let ddl = ddl?;
     match access {
         Ok(access) => Ok(append_postgres_access_ddl(ddl, schema, table, &access)),
@@ -9417,9 +9672,10 @@ fn append_postgres_grant_statement(
 }
 
 pub async fn opengauss_table_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -> Result<String, String> {
+    let budget = db::postgres::postgres_default_metadata_query_budget(pool);
     let (ddl, trigger_definitions) = tokio::try_join!(
         async { first_string_cell(db::postgres::execute_query(pool, &opengauss_table_ddl_sql(schema, table)).await?) },
-        db::postgres::list_trigger_definitions(pool, schema, table),
+        db::postgres::list_trigger_definitions(pool, schema, table, budget, None),
     )?;
 
     Ok(append_opengauss_trigger_definitions(ddl, &trigger_definitions))
