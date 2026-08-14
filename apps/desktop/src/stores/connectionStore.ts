@@ -897,14 +897,35 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function withMetadataLoadTimeout<T>(connectionId: string, promise: Promise<T>, label: string): Promise<T> {
     const timeoutMs = metadataLoadTimeoutMs(getConfig(connectionId));
+    const timeoutMessage = `Connection timed out while loading ${label} after ${Math.ceil(timeoutMs / 1000)}s. Please check the network or VPN and try again.`;
     const errorRevision = connectionErrorRevision(connectionId);
+    let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    void promise.then(
+      () => {
+        if (!timedOut) return;
+        // The timer already won; leave the enforced timeout message in place.
+      },
+      (error) => {
+        if (!timedOut) return;
+        // The backend error arrived after the UI timeout fired. The caller's
+        // catch already recorded the generic timeout message; replace it with
+        // the real database error (mirrors withConnectionAttemptTimeout) so a
+        // half-open connection is attributable instead of a silent generic
+        // timeout.
+        const current = connectionErrors.value[connectionId];
+        if (current === timeoutMessage) {
+          setConnectionError(connectionId, connectionAttemptOriginalErrorMessage(timeoutMessage, connectionErrorMessage(error)));
+        }
+      },
+    );
     try {
       const result = await Promise.race([
         promise,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
-            reject(new Error(`Connection timed out while loading ${label} after ${Math.ceil(timeoutMs / 1000)}s. Please check the network or VPN and try again.`));
+            timedOut = true;
+            reject(new Error(timeoutMessage));
           }, timeoutMs);
         }),
       ]);

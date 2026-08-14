@@ -989,6 +989,14 @@ fn pg_error_to_string(err: tokio_postgres::Error) -> String {
     err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string())
 }
 
+/// Metadata-query error mapping that preserves SQLSTATE. Unlike plain
+/// `pg_error_to_string` (which only unmasks tokio-postgres's generic
+/// "db error" for `Db` errors), this appends `(SQLSTATE XXXXX)` so the UI can
+/// attribute the real server condition.
+fn pg_metadata_error_to_string(err: tokio_postgres::Error) -> String {
+    err.as_db_error().map(pg_db_error_to_string).unwrap_or_else(|| err.to_string())
+}
+
 fn pg_db_error_to_string(err: &tokio_postgres::error::DbError) -> String {
     format!("{err} (SQLSTATE {})", err.code().code())
 }
@@ -1054,7 +1062,35 @@ fn should_retry_postgres_stale_cache_fields(sqlstate: Option<&str>, routine: Opt
     structured_match || message.to_ascii_lowercase().contains("cached plan must not change result type")
 }
 
-async fn postgres_query_cached(
+/// Distinctive error prefix for metadata queries that exceeded their
+/// application-level budget. Schema recovery maps it to `Discard` (evict the
+/// pool, surface the error, do not retry) instead of treating it as a
+/// connection error that triggers a blind reconnect + re-run.
+pub(crate) const POSTGRES_METADATA_QUERY_TIMEOUT: &str = "PostgreSQL metadata query timed out";
+
+/// Derive a per-query budget for a single metadata statement from the client's
+/// pool timeout configuration. A half-open connection (e.g. a cloud LB
+/// silently evicting an idle connection, or a proxy accepting TCP but stalling
+/// on a lazily-created second connection) would otherwise block the metadata
+/// query forever. The budget bounds the query and the distinctive timeout
+/// error lets schema recovery evict the pool.
+fn postgres_metadata_query_budget(client: &deadpool_postgres::Client) -> Duration {
+    let Some(pool) = deadpool_postgres::Client::pool(client) else {
+        return super::connection_timeout();
+    };
+    postgres_metadata_query_budget_from_timeouts(&pool.timeouts())
+}
+
+fn postgres_metadata_query_budget_from_timeouts(timeouts: &deadpool_postgres::Timeouts) -> Duration {
+    let fallback = super::connection_timeout();
+    [timeouts.wait, timeouts.create, timeouts.recycle].into_iter().flatten().fold(fallback, std::cmp::max)
+}
+
+fn postgres_metadata_query_timeout_message(budget: Duration) -> String {
+    format!("{POSTGRES_METADATA_QUERY_TIMEOUT} after {}s (connection evicted)", budget.as_secs())
+}
+
+async fn postgres_query_cached_inner(
     client: &deadpool_postgres::Client,
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
@@ -1077,7 +1113,23 @@ async fn postgres_query_cached(
     }
 }
 
-async fn postgres_query_one_cached(
+async fn postgres_query_cached(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Vec<Row>, String> {
+    let budget = postgres_metadata_query_budget(client);
+    match tokio::time::timeout(budget, postgres_query_cached_inner(client, sql, params)).await {
+        Ok(Ok(rows)) => Ok(rows),
+        Ok(Err(err)) => Err(pg_metadata_error_to_string(err)),
+        Err(_) => {
+            log::warn!("[postgres][metadata:timeout] query exceeded {}s budget", budget.as_secs());
+            Err(postgres_metadata_query_timeout_message(budget))
+        }
+    }
+}
+
+async fn postgres_query_one_cached_inner(
     client: &deadpool_postgres::Client,
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
@@ -1095,6 +1147,22 @@ async fn postgres_query_one_cached(
             client.query_one(&stmt, params).await
         }
         Err(err) => Err(err),
+    }
+}
+
+async fn postgres_query_one_cached(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Row, String> {
+    let budget = postgres_metadata_query_budget(client);
+    match tokio::time::timeout(budget, postgres_query_one_cached_inner(client, sql, params)).await {
+        Ok(Ok(row)) => Ok(row),
+        Ok(Err(err)) => Err(pg_metadata_error_to_string(err)),
+        Err(_) => {
+            log::warn!("[postgres][metadata:timeout] query exceeded {}s budget", budget.as_secs());
+            Err(postgres_metadata_query_timeout_message(budget))
+        }
     }
 }
 
@@ -1727,7 +1795,16 @@ where
         let tls = self.tls.clone();
         let pg_config = pg_config.clone();
         Box::pin(async move {
+            // TLS negotiation + PostgreSQL startup can stall against a proxy
+            // that accepts TCP but never completes the handshake. Log the phase
+            // elapsed so support can distinguish a TLS-stall from a refused
+            // connection; the outer pool `create_timeout` remains the bound.
+            let connect_start = std::time::Instant::now();
             let (client, mut connection) = pg_config.connect(tls).await?;
+            let connect_elapsed = connect_start.elapsed();
+            if connect_elapsed > Duration::from_secs(10) {
+                log::warn!("[postgres][connect:slow] TLS/startup phase took {}ms", connect_elapsed.as_millis());
+            }
             // No query can complete before the connection is being driven, so
             // the notice buffer is handed to the driver task through a slot
             // that is filled once the backend PID is known.
@@ -1855,6 +1932,7 @@ async fn connect_with_optional_local_timezone(
 
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
 
+    let connect_start = std::time::Instant::now();
     let (pool, client) = super::with_connection_timeout("PostgreSQL", timeout, async {
         let pg_config = tokio_postgres::Config::from_str(&postgres_url.url)
             .map_err(|e| format!("Invalid PostgreSQL connection URL: {e}"))?;
@@ -1893,6 +1971,10 @@ async fn connect_with_optional_local_timezone(
         Ok((pool, client))
     })
     .await?;
+    let connect_elapsed = connect_start.elapsed();
+    if connect_elapsed > Duration::from_secs(10) {
+        log::warn!("[postgres][connect:slow] pool build + first connect took {}ms", connect_elapsed.as_millis());
+    }
 
     // Creating the physical connection and applying session defaults are two
     // sequential network phases. Give each phase the configured connection
@@ -2403,14 +2485,14 @@ fn database_storage_sql() -> &'static str {
 
 pub async fn list_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, list_databases_sql(), &[]).await.map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, list_databases_sql(), &[]).await?;
 
     Ok(rows.iter().map(|row| DatabaseInfo { name: pg_row_try_string(row, 0), ..Default::default() }).collect())
 }
 
 pub async fn list_database_metadata(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, database_metadata_sql(), &[]).await.map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, database_metadata_sql(), &[]).await?;
     Ok(rows
         .iter()
         .map(|row| DatabaseInfo {
@@ -2432,8 +2514,7 @@ pub async fn list_database_storage(pool: &Pool, database_names: &[String]) -> Re
         return Ok(Vec::new());
     }
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows =
-        postgres_query_cached(&client, database_storage_sql(), &[&database_names]).await.map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, database_storage_sql(), &[&database_names]).await?;
     Ok(rows
         .iter()
         .map(|row| DatabaseStorageInfo {
@@ -2467,7 +2548,15 @@ pub async fn list_tables_filtered(
         &[(&schema, Type::VARCHAR), (&filter_pattern, Type::VARCHAR), (&fuzzy_filter_pattern, Type::VARCHAR)];
     // The pagination literals make this SQL vary by page. Use an unnamed typed
     // query so each load stays one round trip without growing the statement cache.
-    let rows = client.query_typed(&sql, params).await.map_err(|e| e.to_string())?;
+    let budget = postgres_metadata_query_budget(&client);
+    let rows = match tokio::time::timeout(budget, client.query_typed(&sql, params)).await {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => return Err(pg_metadata_error_to_string(err)),
+        Err(_) => {
+            log::warn!("[postgres][metadata:timeout] query exceeded {}s budget", budget.as_secs());
+            return Err(postgres_metadata_query_timeout_message(budget));
+        }
+    };
 
     Ok(rows
         .iter()
@@ -2506,8 +2595,7 @@ pub async fn completion_assistant_search(
              ORDER BY nspname LIMIT $2",
             &[&pattern, &(limit as i64)],
         )
-        .await
-        .map_err(|e| e.to_string())?
+        .await?
         {
             let schema_name: String = pg_row_try_string(&row, 0);
             candidates.push(CompletionAssistantCandidate {
@@ -2531,8 +2619,7 @@ pub async fn completion_assistant_search(
             postgres_completion_tables_sql(),
             &[&schema, &pattern, &relkinds, &((limit - candidates.len()) as i64)],
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
         for row in rows {
             let table_type: String = pg_row_try_string(&row, 2);
             candidates.push(CompletionAssistantCandidate {
@@ -2560,8 +2647,7 @@ pub async fn completion_assistant_search(
             postgres_completion_routines_sql(),
             &[&routine_schema, &pattern, &prokinds, &((limit - candidates.len()) as i64)],
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
         for row in rows {
             let routine_type: String = pg_row_try_string(&row, 2);
             candidates.push(CompletionAssistantCandidate {
@@ -2588,8 +2674,7 @@ pub async fn completion_assistant_search(
             postgres_completion_sequences_sql(),
             &[&schema, &pattern, &request.case_sensitive, &((limit - candidates.len()) as i64)],
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
         for row in rows {
             candidates.push(CompletionAssistantCandidate {
                 name: pg_row_try_string(&row, 0),
@@ -2613,8 +2698,7 @@ pub async fn completion_assistant_search(
             let resolved_schema = match schema {
                 Some(schema) => Some(schema.to_string()),
                 None => postgres_query_cached(&client, postgres_visible_table_schema_sql(), &[&table])
-                    .await
-                    .map_err(|e| e.to_string())?
+                    .await?
                     .first()
                     .map(|row| pg_row_try_string(row, 0)),
             };
@@ -2626,8 +2710,7 @@ pub async fn completion_assistant_search(
                 postgres_completion_columns_sql(),
                 &[&resolved_schema, &table, &pattern, &((limit - candidates.len()) as i64)],
             )
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
             for row in rows {
                 candidates.push(CompletionAssistantCandidate {
                     name: pg_row_try_string(&row, 0),
@@ -2751,9 +2834,7 @@ fn postgres_completion_like_pattern(value: &str, mode: Option<&CompletionAssista
 pub async fn get_table_comment(pool: &Pool, schema: &str, table: &str) -> Result<Option<String>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_table_comment_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, postgres_table_comment_sql(), &[&schema, &table]).await?;
     Ok(rows.first().and_then(|row| row.try_get::<_, Option<String>>(0).ok().flatten()).filter(|s| !s.is_empty()))
 }
 
@@ -2764,9 +2845,8 @@ pub async fn get_table_partition_info(
 ) -> Result<PostgresTablePartitionInfo, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let relation_rows = postgres_query_cached(&client, postgres_table_partition_relation_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
+    let relation_rows =
+        postgres_query_cached(&client, postgres_table_partition_relation_sql(), &[&schema, &table]).await?;
     let Some(relation) = relation_rows.first() else {
         return Ok(PostgresTablePartitionInfo::default());
     };
@@ -2776,9 +2856,7 @@ pub async fn get_table_partition_info(
         return Ok(PostgresTablePartitionInfo::default());
     }
 
-    let rows = postgres_query_cached(&client, postgres_table_partition_info_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, postgres_table_partition_info_sql(), &[&schema, &table]).await?;
     let Some(row) = rows.first() else {
         return Ok(PostgresTablePartitionInfo { is_partition, ..Default::default() });
     };
@@ -2802,9 +2880,7 @@ pub async fn get_table_partition_local_objects(
 ) -> Result<PostgresTablePartitionLocalObjects, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_table_partition_local_objects_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, postgres_table_partition_local_objects_sql(), &[&schema, &table]).await?;
     let mut result = PostgresTablePartitionLocalObjects::default();
     for row in rows {
         let object_kind = row.try_get::<_, String>(0).unwrap_or_default();
@@ -3212,9 +3288,7 @@ fn postgres_has_function_identity_arguments_sql() -> &'static str {
 }
 
 async fn postgres_has_function_identity_arguments(client: &deadpool_postgres::Client) -> Result<bool, String> {
-    let row = postgres_query_one_cached(client, postgres_has_function_identity_arguments_sql(), &[])
-        .await
-        .map_err(|e| e.to_string())?;
+    let row = postgres_query_one_cached(client, postgres_has_function_identity_arguments_sql(), &[]).await?;
     Ok(pg_row_try_bool(&row, 0).unwrap_or(false))
 }
 
@@ -3229,8 +3303,7 @@ fn postgres_proc_has_prokind_sql() -> &'static str {
 }
 
 async fn postgres_proc_has_prokind(client: &deadpool_postgres::Client) -> Result<bool, String> {
-    let row =
-        postgres_query_one_cached(client, postgres_proc_has_prokind_sql(), &[]).await.map_err(|e| e.to_string())?;
+    let row = postgres_query_one_cached(client, postgres_proc_has_prokind_sql(), &[]).await?;
     Ok(pg_row_try_bool(&row, 0).unwrap_or(false))
 }
 
@@ -3245,7 +3318,7 @@ fn postgres_proc_has_prosp_sql() -> &'static str {
 }
 
 async fn postgres_proc_has_prosp(client: &deadpool_postgres::Client) -> Result<bool, String> {
-    let row = postgres_query_one_cached(client, postgres_proc_has_prosp_sql(), &[]).await.map_err(|e| e.to_string())?;
+    let row = postgres_query_one_cached(client, postgres_proc_has_prosp_sql(), &[]).await?;
     Ok(pg_row_try_bool(&row, 0).unwrap_or(false))
 }
 
@@ -3274,7 +3347,7 @@ async fn list_objects_rows(
         // cannot serve); skip the round-trip instead of executing empty SQL.
         return Ok(Vec::new());
     }
-    postgres_query_cached(client, &sql, &[&schema]).await.map_err(|e| e.to_string())
+    postgres_query_cached(client, &sql, &[&schema]).await
 }
 
 pub async fn list_objects(
@@ -4037,8 +4110,7 @@ pub async fn list_object_statistics(pool: &Pool, schema: &str) -> Result<Vec<Obj
          ORDER BY c.relname",
         &[&schema],
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     Ok(rows
         .iter()
         .map(|row| ObjectStatistics {
@@ -4091,9 +4163,7 @@ fn postgres_schema_infos_sql(show_system_schemas: bool) -> &'static str {
 
 pub async fn list_schema_infos_with_system(pool: &Pool, show_system_schemas: bool) -> Result<Vec<SchemaInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_schema_infos_sql(show_system_schemas), &[])
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, postgres_schema_infos_sql(show_system_schemas), &[]).await?;
 
     Ok(rows
         .iter()
@@ -4303,7 +4373,7 @@ async fn get_columns_with_sql(
     sql: &str,
     schema: &str,
     table: &str,
-) -> Result<Vec<ColumnInfo>, tokio_postgres::Error> {
+) -> Result<Vec<ColumnInfo>, String> {
     let rows = postgres_query_cached(client, sql, &[&schema, &table]).await?;
 
     Ok(rows.iter().map(column_info_from_row).collect())
@@ -4317,19 +4387,16 @@ pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<C
         Err(primary_error) => match get_columns_with_sql(&client, POSTGRES_COLUMNS_COMPAT_SQL, schema, table).await {
             Ok(columns) => Ok(columns),
             Err(fallback_error) => {
-                let primary_message = pg_error_to_string(primary_error);
-                let fallback_message = pg_error_to_string(fallback_error);
                 match get_columns_with_sql(&client, POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL, schema, table).await {
                     Ok(columns) => Ok(columns),
                     Err(information_schema_error) => {
-                        let information_schema_message = pg_error_to_string(information_schema_error);
                         log::debug!(
                             "[postgres][get_columns:compat-failed] primary_error={} fallback_error={} information_schema_error={}",
-                            primary_message,
-                            fallback_message,
-                            information_schema_message
+                            primary_error,
+                            fallback_error,
+                            information_schema_error
                         );
-                        Err(information_schema_message)
+                        Err(information_schema_error)
                     }
                 }
             }
@@ -5138,8 +5205,10 @@ pub async fn checkout_postgres_client(
         // transaction: a lazy first lookup from `drain_postgres_notices`
         // could run inside the read-only EXPLAIN transaction, where a
         // failing identity query would abort the user's statement. Cached
-        // after the first checkout of each physical connection.
-        let _ = resolve_postgres_client_key(client).await;
+        // after the first checkout of each physical connection. Bound it to
+        // the checkout deadline so a half-open connection cannot hang the
+        // caller outside the checkout timeout.
+        let _ = tokio::time::timeout(checkout_timeout, resolve_postgres_client_key(client)).await;
     }
     result
 }
@@ -5348,7 +5417,7 @@ async fn list_indexes_with_sql(
     sql: &str,
     schema: &str,
     table: &str,
-) -> Result<Vec<IndexInfo>, tokio_postgres::Error> {
+) -> Result<Vec<IndexInfo>, String> {
     let rows = postgres_query_cached(client, sql, &[&schema, &table]).await?;
 
     Ok(rows
@@ -5380,14 +5449,12 @@ pub async fn list_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<
         Err(primary_error) => match list_indexes_with_sql(&client, POSTGRES_INDEXES_COMPAT_SQL, schema, table).await {
             Ok(indexes) => Ok(indexes),
             Err(fallback_error) => {
-                let primary_message = pg_error_to_string(primary_error);
-                let fallback_message = pg_error_to_string(fallback_error);
                 log::debug!(
                     "[postgres][list_indexes:compat-failed] primary_error={} fallback_error={}",
-                    primary_message,
-                    fallback_message
+                    primary_error,
+                    fallback_error
                 );
-                Err(fallback_message)
+                Err(fallback_error)
             }
         },
     }
@@ -5426,9 +5493,7 @@ fn postgres_foreign_key_action(value: String) -> Option<String> {
 
 pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_foreign_keys_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, postgres_foreign_keys_sql(), &[&schema, &table]).await?;
 
     Ok(rows
         .iter()
@@ -5461,9 +5526,7 @@ fn postgres_table_dependencies_sql() -> &'static str {
 /// exports use this instead of issuing one information_schema query per table.
 pub async fn list_table_dependencies(pool: &Pool, schema: &str) -> Result<Vec<(String, String)>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_table_dependencies_sql(), &[&schema])
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, postgres_table_dependencies_sql(), &[&schema]).await?;
 
     Ok(rows.iter().map(|row| (pg_row_try_string(row, 0), pg_row_try_string(row, 1))).collect())
 }
@@ -5478,8 +5541,7 @@ pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec
          ORDER BY trigger_name",
         &[&schema, &table],
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
 
     Ok(rows
         .iter()
@@ -5501,9 +5563,7 @@ pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec
 
 pub async fn list_trigger_definitions(pool: &Pool, schema: &str, table: &str) -> Result<Vec<String>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_trigger_definitions_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, postgres_trigger_definitions_sql(), &[&schema, &table]).await?;
 
     Ok(rows.iter().map(|row| pg_row_try_string(row, 0)).filter(|definition| !definition.trim().is_empty()).collect())
 }
@@ -5549,9 +5609,7 @@ pub async fn list_functions(pool: &Pool, schema: &str) -> Result<Vec<FunctionInf
     // for reliable function definition retrieval (information_schema.routines.routine_definition
     // is NULL for non-SQL functions like plpgsql)
     let has_proc_prokind = postgres_proc_has_prokind(&client).await?;
-    let rows = postgres_query_cached(&client, postgres_functions_sql(has_proc_prokind), &[&schema])
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, postgres_functions_sql(has_proc_prokind), &[&schema]).await?;
 
     Ok(rows
         .iter()
@@ -5626,7 +5684,7 @@ async fn list_sequences_with_sql(
     last_values_sql: &str,
 ) -> Result<Vec<SequenceInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, metadata_sql, &[&schema]).await.map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, metadata_sql, &[&schema]).await?;
 
     let mut sequences: Vec<SequenceInfo> = rows
         .iter()
@@ -5698,8 +5756,7 @@ pub async fn list_rules(pool: &Pool, schema: &str) -> Result<Vec<RuleInfo>, Stri
          ORDER BY rulename",
         &[&schema],
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
 
     Ok(rows
         .iter()
@@ -5736,8 +5793,7 @@ pub async fn list_extensions(pool: &Pool, schema: Option<&str>) -> Result<Vec<Ex
             &[],
         )
         .await
-    }
-    .map_err(|e| e.to_string())?;
+    }?;
 
     Ok(rows
         .iter()
@@ -5807,8 +5863,7 @@ pub async fn list_available_extensions(pool: &Pool) -> Result<Vec<ExtensionInfo>
          ORDER BY name",
         &[],
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
 
     Ok(rows
         .iter()
@@ -5823,7 +5878,7 @@ pub async fn list_available_extensions(pool: &Pool) -> Result<Vec<ExtensionInfo>
 
 pub async fn list_owners(pool: &Pool, schema: &str) -> Result<Vec<OwnerInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, POSTGRES_OWNERS_SQL, &[&schema]).await.map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, POSTGRES_OWNERS_SQL, &[&schema]).await?;
 
     Ok(rows
         .iter()
@@ -5841,8 +5896,7 @@ pub async fn list_owners(pool: &Pool, schema: &str) -> Result<Vec<OwnerInfo>, St
 pub async fn get_table_access(pool: &Pool, schema: &str, table: &str) -> Result<PostgresTableAccessInfo, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
-    let owner_rows =
-        postgres_query_cached(&client, POSTGRES_TABLE_OWNER_SQL, &params).await.map_err(pg_error_to_string)?;
+    let owner_rows = postgres_query_cached(&client, POSTGRES_TABLE_OWNER_SQL, &params).await?;
     let owner_row = owner_rows.first().ok_or_else(|| "Table owner not found".to_string())?;
     let owner = pg_row_try_string(owner_row, 0);
     if owner.is_empty() {
@@ -5856,8 +5910,7 @@ pub async fn get_table_access(pool: &Pool, schema: &str, table: &str) -> Result<
     let (table_privileges, column_privileges) = tokio::try_join!(
         postgres_query_cached(&client, POSTGRES_TABLE_ACL_PRIVILEGES_SQL, &params),
         postgres_query_cached(&client, POSTGRES_COLUMN_ACL_PRIVILEGES_SQL, &params),
-    )
-    .map_err(pg_error_to_string)?;
+    )?;
 
     let privileges = table_privileges
         .iter()
@@ -7866,6 +7919,29 @@ mod tests {
 
         assert_eq!(effective_postgres_checkout_timeout(&pool, Duration::from_secs(5)), Duration::from_secs(10));
         assert_eq!(effective_postgres_checkout_timeout(&pool, Duration::from_secs(15)), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn postgres_metadata_query_budget_derives_max_and_falls_back() {
+        use deadpool_postgres::Timeouts;
+        let timeouts = Timeouts {
+            wait: Some(Duration::from_secs(7)),
+            create: Some(Duration::from_secs(9)),
+            recycle: Some(Duration::from_secs(11)),
+        };
+        assert_eq!(postgres_metadata_query_budget_from_timeouts(&timeouts), Duration::from_secs(11));
+
+        // No configured pool timeouts: fall back to the 5s connection timeout.
+        assert_eq!(postgres_metadata_query_budget_from_timeouts(&Timeouts::new()), crate::db::connection_timeout());
+        assert_eq!(crate::db::connection_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn postgres_metadata_query_timeout_message_is_distinctive() {
+        let message = postgres_metadata_query_timeout_message(Duration::from_secs(30));
+        assert!(message.starts_with(POSTGRES_METADATA_QUERY_TIMEOUT), "{message}");
+        assert!(message.contains("30s"), "{message}");
+        assert!(message.contains("connection evicted"), "{message}");
     }
 
     #[tokio::test]

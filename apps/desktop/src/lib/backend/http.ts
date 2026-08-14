@@ -228,11 +228,12 @@ const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   sidebar_table_page_size: 1000,
 };
 
-async function post<T>(url: string, body: unknown): Promise<T> {
+async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const res = await fetch(apiUrl(url), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    ...(signal ? { signal } : {}),
   });
   if (!res.ok) throw await backendResponseError(res);
   return res.json();
@@ -287,8 +288,8 @@ async function postQueryWithDiagnostics<T>(url: string, body: unknown, traceId?:
   return result;
 }
 
-async function get<T>(url: string): Promise<T> {
-  const res = await fetch(apiUrl(url));
+async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(apiUrl(url), signal ? { signal } : undefined);
   if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
@@ -695,8 +696,8 @@ export async function syncSavedSqlDirectory(_request: SavedSqlSyncRequest): Prom
 // Schema
 // ---------------------------------------------------------------------------
 
-export async function listDatabases(connectionId: string): Promise<DatabaseInfo[]> {
-  return get(`/api/schema/databases?${qs({ connection_id: connectionId })}`);
+export async function listDatabases(connectionId: string, signal?: AbortSignal): Promise<DatabaseInfo[]> {
+  return get(`/api/schema/databases?${qs({ connection_id: connectionId })}`, signal);
 }
 
 export async function listDatabaseMetadata(connectionId: string): Promise<DatabaseInfo[]> {

@@ -3280,6 +3280,16 @@ mod tests {
         assert_eq!(metadata_error_action(db_type, sql, false), MetadataErrorAction::Return);
     }
 
+    #[test]
+    fn postgres_metadata_query_timeout_discards_pool_without_retry() {
+        let db_type = Some(DatabaseType::Postgres);
+        let timeout = "PostgreSQL metadata query timed out after 30s (connection evicted)";
+
+        assert_eq!(metadata_error_action(db_type, timeout, false), MetadataErrorAction::Discard);
+        assert_eq!(metadata_error_action(db_type, timeout, true), MetadataErrorAction::Discard);
+        assert!(!is_retryable_metadata_error(timeout));
+    }
+
     #[tokio::test]
     async fn metadata_fail_stop_detaches_base_pool_without_client_session() {
         let dir = std::env::temp_dir().join(format!("dbx-schema-metadata-fail-stop-{}", uuid::Uuid::new_v4()));
@@ -5512,6 +5522,14 @@ fn metadata_error_action(db_type: Option<DatabaseType>, error: &str, retried: bo
 }
 
 fn metadata_recovery(db_type: Option<DatabaseType>, error: &str, retried: bool) -> MetadataRecovery {
+    if error.contains(crate::db::postgres::POSTGRES_METADATA_QUERY_TIMEOUT) {
+        // A metadata query exceeded its application-level budget (half-open
+        // connection). Retrying would just re-run the same hung statement for
+        // another full budget inside an already-abandoned request. Discard the
+        // pool so the next call creates a fresh connection, and surface the
+        // distinctive timeout error to the UI.
+        return MetadataRecovery { action: MetadataErrorAction::Discard, agent_session_id: None };
+    }
     if db_type.is_some_and(|db_type| crate::database_capabilities::is_agent_type(&db_type)) {
         if let Some(error) = crate::db::agent_driver::try_agent_error_from_legacy(error) {
             let agent_session_id = error.session_id().map(str::to_string);
@@ -5546,6 +5564,11 @@ async fn replace_metadata_runtime(
 }
 
 fn is_retryable_metadata_error(error: &str) -> bool {
+    if error.contains(crate::db::postgres::POSTGRES_METADATA_QUERY_TIMEOUT) {
+        // The metadata query timeout is a fail-fast Discard signal, never a
+        // retryable connection error (metadata_recovery handles it earlier).
+        return false;
+    }
     if let Some(error) = crate::db::agent_driver::try_agent_error_from_legacy(error) {
         return RecoveryPolicy::decide(&error, RecoveryScope::ReadOnlyMetadata { retried: false })
             == RecoveryDecision::RetryReadOnlyMetadata;

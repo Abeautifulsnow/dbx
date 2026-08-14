@@ -254,6 +254,12 @@ const visibleDatabaseSelection = ref<Set<string>>(new Set());
 const visibleDatabaseSearchText = ref("");
 const visibleDatabaseError = ref("");
 const visibleDatabaseShowSystem = ref(false);
+// In-flight visible-databases picker requests. Aborted on the load timeout,
+// on picker completion, and on component unmount so a dismissed dialog cannot
+// be reopened by a late rejection.
+const visibleDatabasesPickerAbortControllers = new Set<AbortController>();
+let visibleDatabasesPickerRun = 0;
+const connectionDialogMounted = ref(true);
 const showVisibleNacosNamespacesDialog = ref(false);
 const isLoadingVisibleNacosNamespaces = ref(false);
 const visibleNacosNamespaces = ref<NacosNamespaceInfo[]>([]);
@@ -4301,20 +4307,43 @@ async function preloadVisibleDatabaseNames() {
   if (visibleDatabaseNames.value.length > 0) return;
   isLoadingVisibleDatabases.value = true;
   const draftId = buildDraftVisibleDatabasesConnectionId(uuid());
+  const abortController = new AbortController();
+  visibleDatabasesPickerAbortControllers.add(abortController);
   try {
     const draftConfig = {
       ...connectionConfigForSubmit(draftId),
       id: draftId,
       one_time: true,
     };
-    await api.connectDb(draftConfig);
-    visibleDatabaseNames.value = await loadVisibleDatabaseNames(draftId, draftConfig);
+    const timeoutMs = visibleDatabasesLoadTimeoutMs(draftConfig);
+    visibleDatabaseNames.value = await Promise.race([
+      api.connectDb(draftConfig).then(() => loadVisibleDatabaseNames(draftId, draftConfig, abortController.signal)),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          abortController.abort();
+          reject(new Error(`Connection timed out while loading databases after ${Math.ceil(timeoutMs / 1000)}s. Please check the network or VPN and try again.`));
+        }, timeoutMs);
+      }),
+    ]);
   } catch {
     // silently fail
   } finally {
+    visibleDatabasesPickerAbortControllers.delete(abortController);
+    abortController.abort();
+    if (connectionDialogMounted.value) {
+      isLoadingVisibleDatabases.value = false;
+    }
     await api.disconnectDb(draftId).catch(() => undefined);
-    isLoadingVisibleDatabases.value = false;
   }
+}
+
+function visibleDatabasesLoadTimeoutMs(config?: ConnectionConfig): number {
+  // Mirrors connectionStore.metadataLoadTimeoutMs: a configured query timeout
+  // gets a 5s buffer, and the floor keeps slow WAN/tunnel round-trips from
+  // tripping a too-tight guard.
+  const queryTimeoutSecs = Number(config?.query_timeout_secs);
+  const boundedTimeoutSecs = Number.isFinite(queryTimeoutSecs) && queryTimeoutSecs > 0 ? queryTimeoutSecs + 5 : 35;
+  return Math.max(15_000, boundedTimeoutSecs * 1000);
 }
 
 async function openVisibleDatabasesPicker() {
@@ -4325,6 +4354,9 @@ async function openVisibleDatabasesPicker() {
   visibleDatabaseError.value = "";
   visibleDatabaseSearchText.value = "";
   const draftId = buildDraftVisibleDatabasesConnectionId(uuid());
+  const abortController = new AbortController();
+  const runId = ++visibleDatabasesPickerRun;
+  visibleDatabasesPickerAbortControllers.add(abortController);
 
   try {
     const draftConfig = {
@@ -4332,8 +4364,21 @@ async function openVisibleDatabasesPicker() {
       id: draftId,
       one_time: true,
     };
-    await api.connectDb(draftConfig);
-    const names = await loadVisibleDatabaseNames(draftId, draftConfig);
+    // Bound the connect + database-name load so a half-open connection
+    // degrades to a clear timeout instead of a ~30s generic hang. The abort
+    // controller interrupts the in-flight HTTP listDatabases request so the
+    // backend query is canceled and the pool slot is freed.
+    const timeoutMs = visibleDatabasesLoadTimeoutMs(draftConfig);
+    const names = await Promise.race([
+      api.connectDb(draftConfig).then(() => loadVisibleDatabaseNames(draftId, draftConfig, abortController.signal)),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          abortController.abort();
+          reject(new Error(`Connection timed out while loading databases after ${Math.ceil(timeoutMs / 1000)}s. Please check the network or VPN and try again.`));
+        }, timeoutMs);
+      }),
+    ]);
+    if (runId !== visibleDatabasesPickerRun) return;
     visibleDatabaseNames.value = names;
     visibleDatabaseShowSystem.value = false;
     const configuredSchemas = visibleSchemaObjectSelection.value;
@@ -4343,14 +4388,21 @@ async function openVisibleDatabasesPicker() {
     visibleDatabaseShowSystem.value = initialSelection.some((name) => !defaultVisible.has(name));
     showVisibleDatabasesDialog.value = true;
   } catch (e: any) {
+    // A late rejection after unmount or after a newer run must not reopen a
+    // dismissed dialog or mutate state.
+    if (!connectionDialogMounted.value || runId !== visibleDatabasesPickerRun) return;
     visibleDatabaseNames.value = [];
     visibleDatabaseSelection.value = new Set();
     visibleDatabaseError.value = mongodbAuthFailureHint(errorMessage(e));
     testResult.value = { ok: false, message: visibleDatabaseError.value };
     showVisibleDatabasesDialog.value = true;
   } finally {
+    visibleDatabasesPickerAbortControllers.delete(abortController);
+    abortController.abort();
+    if (connectionDialogMounted.value && runId === visibleDatabasesPickerRun) {
+      isLoadingVisibleDatabases.value = false;
+    }
     await api.disconnectDb(draftId).catch(() => undefined);
-    isLoadingVisibleDatabases.value = false;
   }
 }
 
@@ -4426,7 +4478,7 @@ function saveVisibleNacosNamespaceSelection() {
   showVisibleNacosNamespacesDialog.value = false;
 }
 
-async function loadVisibleDatabaseNames(connectionId: string, config: ConnectionConfig): Promise<string[]> {
+async function loadVisibleDatabaseNames(connectionId: string, config: ConnectionConfig, signal?: AbortSignal): Promise<string[]> {
   if (connectionUsesVisibleSchemaFilter(config)) {
     return api.listSchemas(connectionId, config.database || "");
   }
@@ -4436,7 +4488,7 @@ async function loadVisibleDatabaseNames(connectionId: string, config: Connection
   if (config.db_type === "mongodb") {
     return api.mongoListDatabases(connectionId);
   }
-  return (await api.listDatabases(connectionId)).map((database) => database.name);
+  return (await api.listDatabases(connectionId, signal)).map((database) => database.name);
 }
 
 function normalizeProductionDatabaseSelection(selectedNames: Iterable<string>, databaseNames: string[]): string[] {
@@ -5468,6 +5520,13 @@ onMounted(async () => {
 onUnmounted(() => {
   unlistenAgentInstallProgress?.();
   unlistenAgentInstallProgress = null;
+  connectionDialogMounted.value = false;
+  // Interrupt any in-flight visible-databases picker load so a late rejection
+  // cannot reopen a dismissed dialog after unmount.
+  for (const controller of visibleDatabasesPickerAbortControllers) {
+    controller.abort();
+  }
+  visibleDatabasesPickerAbortControllers.clear();
 });
 
 function openExternalUrl(url: string) {
