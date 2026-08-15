@@ -602,6 +602,7 @@ export interface EditorSettings {
   toolbarItems: ToolbarItems;
   objectBrowserShowCheckbox: boolean;
   objectBrowserViewMode: "list" | "grid";
+  sqlVariableSubstitutionEnabled: boolean;
   sqlVariableSyntaxOverrides: SqlVariableSyntaxOverrides;
   continueOnErrorOnBatch: boolean;
   clickTableNavigationTarget: ClickTableNavigationTarget;
@@ -799,6 +800,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   toolbarItems: { ...DEFAULT_TOOLBAR_ITEMS },
   objectBrowserShowCheckbox: false,
   objectBrowserViewMode: "list",
+  sqlVariableSubstitutionEnabled: true,
   sqlVariableSyntaxOverrides: {},
   continueOnErrorOnBatch: false,
   clickTableNavigationTarget: "data",
@@ -1179,6 +1181,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     toolbarItems: normalizeToolbarItems(settings.toolbarItems),
     objectBrowserShowCheckbox: typeof settings.objectBrowserShowCheckbox === "boolean" ? settings.objectBrowserShowCheckbox : DEFAULT_EDITOR_SETTINGS.objectBrowserShowCheckbox,
     objectBrowserViewMode: settings.objectBrowserViewMode === "grid" ? "grid" : DEFAULT_EDITOR_SETTINGS.objectBrowserViewMode,
+    sqlVariableSubstitutionEnabled: typeof settings.sqlVariableSubstitutionEnabled === "boolean" ? settings.sqlVariableSubstitutionEnabled : DEFAULT_EDITOR_SETTINGS.sqlVariableSubstitutionEnabled,
     sqlVariableSyntaxOverrides: normalizeSqlVariableSyntaxOverrides(settings.sqlVariableSyntaxOverrides),
     continueOnErrorOnBatch: settings.continueOnErrorOnBatch === true,
     clickTableNavigationTarget: normalizeClickTableNavigationTarget(settings.clickTableNavigationTarget),
@@ -1721,6 +1724,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.toolbarItems !== undefined) editorSettings.value.toolbarItems = normalizeToolbarItems(partial.toolbarItems);
     if (partial.objectBrowserShowCheckbox !== undefined) editorSettings.value.objectBrowserShowCheckbox = partial.objectBrowserShowCheckbox === true;
     if (partial.objectBrowserViewMode !== undefined) editorSettings.value.objectBrowserViewMode = partial.objectBrowserViewMode === "grid" ? "grid" : "list";
+    if (partial.sqlVariableSubstitutionEnabled !== undefined) editorSettings.value.sqlVariableSubstitutionEnabled = partial.sqlVariableSubstitutionEnabled === true;
     if (partial.sqlVariableSyntaxOverrides !== undefined) editorSettings.value.sqlVariableSyntaxOverrides = normalizeSqlVariableSyntaxOverrides(partial.sqlVariableSyntaxOverrides);
     if (partial.continueOnErrorOnBatch !== undefined) editorSettings.value.continueOnErrorOnBatch = partial.continueOnErrorOnBatch === true;
     if (partial.clickTableNavigationTarget !== undefined) editorSettings.value.clickTableNavigationTarget = normalizeClickTableNavigationTarget(partial.clickTableNavigationTarget);

@@ -73,6 +73,7 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "updateDownloadSource",
   "toolbarItems",
   "snippets",
+  "sqlVariableSubstitutionEnabled",
   "sqlVariableSyntaxOverrides",
   "continueOnErrorOnBatch",
   "clickTableNavigationTarget",

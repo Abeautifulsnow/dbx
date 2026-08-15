@@ -25,6 +25,7 @@ function makeSettings(overrides: Partial<EditorSettings> = {}): EditorSettings {
     confirmUnsavedSqlClose: true,
     savedSqlOpenTargetMode: "saved",
     objectBrowserViewMode: "list",
+    sqlVariableSubstitutionEnabled: true,
     sqlVariableSyntaxOverrides: {},
     tabLayout: "scroll",
     ...overrides,
@@ -67,9 +68,34 @@ describe("EDITOR_SETTINGS_DRAFT_KEYS", () => {
   it("includes completionTriggerMode", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("completionTriggerMode");
   });
+
+  it("includes the SQL variable substitution master switch", () => {
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("sqlVariableSubstitutionEnabled");
+  });
 });
 
 describe("editorSettingsDraftFromSettings", () => {
+  it("toggles substitution without discarding per-database overrides", () => {
+    const base = editorSettingsDraftFromSettings(
+      makeSettings({
+        sqlVariableSubstitutionEnabled: true,
+        sqlVariableSyntaxOverrides: { mysql: { shell: false } },
+      }),
+    );
+    const draft = editorSettingsDraftFromSettings(
+      makeSettings({
+        sqlVariableSubstitutionEnabled: true,
+        sqlVariableSyntaxOverrides: { mysql: { shell: false } },
+      }),
+    );
+
+    draft.sqlVariableSubstitutionEnabled = false;
+
+    expect(editorSettingsPatchFromDraft(draft, base)).toEqual({ sqlVariableSubstitutionEnabled: false });
+    expect(draft.sqlVariableSyntaxOverrides).toEqual({ mysql: { shell: false } });
+    expect(base.sqlVariableSyntaxOverrides).toEqual({ mysql: { shell: false } });
+  });
+
   it("does not include persisted global timeout values in editor drafts", () => {
     const settings = makeSettings({ globalConnectTimeoutSecs: 17, globalQueryTimeoutSecs: 43 });
     const draft = editorSettingsDraftFromSettings(settings);

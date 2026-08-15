@@ -374,6 +374,14 @@ export async function disconnectDb(connectionId: string, clientAttempt?: number)
   return post("/api/connection/disconnect", { connectionId, clientAttempt });
 }
 
+export async function sessionCredentialStatus(connectionId: string): Promise<boolean> {
+  return post("/api/connection/session-credential-status", { connectionId });
+}
+
+export async function forgetSessionCredential(connectionId: string): Promise<void> {
+  return post("/api/connection/forget-session-credential", { connectionId });
+}
+
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
   return post("/api/connection/check-health", { connectionId });
 }
@@ -642,6 +650,10 @@ export async function listenAgentInstallProgress(handler: (progress: DriverInsta
 
 export async function loadSavedSqlLibrary(): Promise<SavedSqlLibrary> {
   return get("/api/saved-sql");
+}
+
+export async function loadSavedSqlFilesForSync(): Promise<SavedSqlFile[]> {
+  throw new Error("SQL directory sync is only available in the desktop app.");
 }
 
 export async function loadSavedSqlFile(id: string): Promise<SavedSqlFile | null> {
@@ -1677,6 +1689,14 @@ export async function loadSavedSqlEditorPositions(): Promise<unknown[] | null> {
 
 export async function saveSavedSqlEditorPositions(positions: unknown[]): Promise<void> {
   await saveBrowserAppState("saved_sql_editor_positions", positions);
+}
+
+export async function loadTransferTaskLibrary(): Promise<unknown | null> {
+  return loadBrowserAppState("transfer_task_library");
+}
+
+export async function saveTransferTaskLibrary(library: unknown): Promise<void> {
+  await saveBrowserAppState("transfer_task_library", library);
 }
 
 export async function completeAppClose(_action: "quit" | "hide"): Promise<void> {

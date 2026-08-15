@@ -2757,15 +2757,31 @@ pub async fn completion_assistant_search(
     }
 
     if candidates.len() < limit && kinds.iter().any(CompletionAssistantObjectKind::is_routine_like) {
-        let prokinds = postgres_completion_prokinds(&kinds);
-        let rows = postgres_query_cached_with_budget(
-            &client,
-            postgres_completion_routines_sql(),
-            &[&routine_schema, &pattern, &prokinds, &((limit - candidates.len()) as i64)],
-            metadata_budget,
-            cancel_context,
-        )
-        .await?;
+        let has_proc_prokind = postgres_proc_has_prokind(&client, metadata_budget, cancel_context).await?;
+        let rows = if has_proc_prokind {
+            let prokinds = postgres_completion_prokinds(&kinds);
+            postgres_query_cached_with_budget(
+                &client,
+                postgres_completion_routines_sql(true),
+                &[&routine_schema, &pattern, &prokinds, &((limit - candidates.len()) as i64)],
+                metadata_budget,
+                cancel_context,
+            )
+            .await?
+        } else if kinds.iter().any(|kind| {
+            matches!(kind, CompletionAssistantObjectKind::Function | CompletionAssistantObjectKind::Routine)
+        }) {
+            postgres_query_cached_with_budget(
+                &client,
+                postgres_completion_routines_sql(false),
+                &[&routine_schema, &pattern, &((limit - candidates.len()) as i64)],
+                metadata_budget,
+                cancel_context,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
         for row in rows {
             let routine_type: String = pg_row_try_string(&row, 2);
             candidates.push(CompletionAssistantCandidate {
@@ -2876,15 +2892,26 @@ fn postgres_completion_tables_sql() -> &'static str {
      ORDER BY c.relname LIMIT $4"
 }
 
-fn postgres_completion_routines_sql() -> &'static str {
-    "SELECT p.proname, n.nspname, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, \
+fn postgres_completion_routines_sql(has_proc_prokind: bool) -> &'static str {
+    if has_proc_prokind {
+        return "SELECT p.proname, n.nspname, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, \
             obj_description(p.oid) AS routine_comment, COALESCE(pg_get_function_result(p.oid), '') AS data_type, \
             pg_get_function_identity_arguments(p.oid) AS signature \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
      WHERE n.nspname = $1 AND p.prokind::text = ANY($3::text[]) \
        AND ($2 = '%%' OR p.proname ILIKE $2 ESCAPE '~') \
-     ORDER BY p.proname LIMIT $4"
+     ORDER BY p.proname LIMIT $4";
+    }
+
+    "SELECT p.proname, n.nspname, 'FUNCTION'::text, \
+            obj_description(p.oid) AS routine_comment, COALESCE(pg_get_function_result(p.oid), '') AS data_type, \
+            pg_get_function_identity_arguments(p.oid) AS signature \
+     FROM pg_catalog.pg_proc p \
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+     WHERE n.nspname = $1 \
+       AND ($2 = '%%' OR p.proname ILIKE $2 ESCAPE '~') \
+     ORDER BY p.proname LIMIT $3"
 }
 
 fn postgres_completion_sequences_sql() -> &'static str {
@@ -10298,10 +10325,15 @@ mod tests {
         assert!(postgres_completion_tables_sql().contains("pg_catalog.pg_table_is_visible(c.oid)"));
         assert!(postgres_completion_tables_sql().contains("c.relkind::text = ANY($3::text[])"));
         assert!(postgres_completion_tables_sql().contains("ORDER BY c.relname LIMIT $4"));
-        assert!(postgres_completion_routines_sql().contains("p.proname ILIKE $2 ESCAPE '~'"));
-        assert!(postgres_completion_routines_sql().contains("p.prokind::text = ANY($3::text[])"));
-        assert!(postgres_completion_routines_sql().contains("pg_get_function_identity_arguments(p.oid) AS signature"));
-        assert!(postgres_completion_routines_sql().contains("ORDER BY p.proname LIMIT $4"));
+        assert!(postgres_completion_routines_sql(true).contains("p.proname ILIKE $2 ESCAPE '~'"));
+        assert!(postgres_completion_routines_sql(true).contains("p.prokind::text = ANY($3::text[])"));
+        assert!(
+            postgres_completion_routines_sql(true).contains("pg_get_function_identity_arguments(p.oid) AS signature")
+        );
+        assert!(postgres_completion_routines_sql(true).contains("ORDER BY p.proname LIMIT $4"));
+        assert!(!postgres_completion_routines_sql(false).contains("p.prokind"));
+        assert!(postgres_completion_routines_sql(false).contains("'FUNCTION'::text"));
+        assert!(postgres_completion_routines_sql(false).contains("ORDER BY p.proname LIMIT $3"));
         assert!(postgres_completion_sequences_sql().contains("c.relkind = 'S'"));
         assert!(postgres_completion_sequences_sql().contains("has_schema_privilege(n.oid, 'USAGE')"));
         assert!(postgres_completion_sequences_sql().contains("pg_catalog.pg_table_is_visible(c.oid)"));
