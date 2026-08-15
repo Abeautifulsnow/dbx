@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { frontendQueryTimeoutDelayMs, frontendQueryTimeoutSecsForSql, queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
+import { frontendQueryTimeoutDelayMs, frontendQueryTimeoutSecsForSql, metadataLoadTimeoutMs, queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 
 describe("queryTimeout", () => {
   it("lets PostgreSQL row queries use the backend inactivity timeout", () => {
@@ -33,5 +33,25 @@ describe("queryTimeout", () => {
 
   it("falls back safely when an inherited global timeout is invalid", () => {
     expect(queryTimeoutSecsForConnection({ query_timeout_inherit: true }, Number.NaN)).toBe(30);
+  });
+
+  it("resolves the metadata load deadline from the inherited global timeout", () => {
+    expect(metadataLoadTimeoutMs({ query_timeout_secs: 30, query_timeout_inherit: true }, 120)).toBe(125_000);
+    expect(metadataLoadTimeoutMs({ query_timeout_secs: 30, query_timeout_inherit: true })).toBe(35_000);
+  });
+
+  it("uses the local query timeout for the metadata load deadline when not inheriting", () => {
+    expect(metadataLoadTimeoutMs({ query_timeout_secs: 45, query_timeout_inherit: false }, 120)).toBe(50_000);
+  });
+
+  it("gives a fixed window when the query timeout is disabled (0 = unlimited)", () => {
+    expect(metadataLoadTimeoutMs({ query_timeout_secs: 0, query_timeout_inherit: false }, 120)).toBe(65_000);
+    expect(metadataLoadTimeoutMs({ query_timeout_secs: 30, query_timeout_inherit: true }, 0)).toBe(65_000);
+  });
+
+  it("floors the metadata load deadline and defaults safely", () => {
+    expect(metadataLoadTimeoutMs(undefined)).toBe(35_000);
+    expect(metadataLoadTimeoutMs({})).toBe(35_000);
+    expect(metadataLoadTimeoutMs({ query_timeout_secs: 1 }, 120)).toBe(15_000);
   });
 });

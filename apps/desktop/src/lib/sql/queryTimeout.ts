@@ -17,6 +17,30 @@ export function queryTimeoutSecsForConnection(connection?: Pick<ConnectionConfig
   return Number.isFinite(value) && value >= 0 ? value : DEFAULT_QUERY_TIMEOUT_SECS;
 }
 
+/** Floor for the metadata-load deadline so slow WAN/tunnel round-trips don't trip a too-tight guard. */
+export const METADATA_LOAD_MIN_TIMEOUT_MS = 15_000;
+/** Fixed window when the query timeout is disabled (0 = unlimited): the 60s
+ * backend metadata fallback budget plus a ~5s connect round-trip buffer, so the
+ * PostgreSQL diagnostic can surface before the frontend generic timeout. */
+export const METADATA_LOAD_DISABLED_QUERY_TIMEOUT_MS = 65_000;
+
+/**
+ * Deadline for silent metadata loads (e.g. the visible-databases picker).
+ * Resolves the effective query timeout (inheritance + global via
+ * queryTimeoutSecsForConnection), then a configured timeout gets a 5s buffer
+ * with a floor; 0 (query timeout disabled) gets a fixed window so "unlimited"
+ * isn't silently capped at the default bound. The deadline equals the backend
+ * metadata budget (the effective query timeout, or the 60s fallback when
+ * disabled) plus a ~5s connect round-trip buffer; the backend draws its
+ * best-effort cancel allowance from inside the budget, so the whole metadata
+ * call (query + cancel) returns within the budget the deadline is aligned to.
+ */
+export function metadataLoadTimeoutMs(connection?: Pick<ConnectionConfig, "query_timeout_secs" | "query_timeout_inherit"> | null, globalQueryTimeoutSecs = DEFAULT_QUERY_TIMEOUT_SECS): number {
+  const queryTimeoutSecs = queryTimeoutSecsForConnection(connection, globalQueryTimeoutSecs);
+  if (queryTimeoutSecs === 0) return METADATA_LOAD_DISABLED_QUERY_TIMEOUT_MS;
+  return Math.max(METADATA_LOAD_MIN_TIMEOUT_MS, (queryTimeoutSecs + 5) * 1000);
+}
+
 export function frontendQueryTimeoutSecsForSql(sql: string, databaseType: DatabaseType | undefined, queryTimeoutSecs: number): number {
   if (queryTimeoutSecs === 0) return 0;
 

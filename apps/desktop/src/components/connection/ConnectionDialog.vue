@@ -40,6 +40,7 @@ import { connectionDeepLinkServiceHydrationValue, parseConnectionDeepLink, parse
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connection/connectionPresentation";
 import { parseGaussdbHosts, serializeGaussdbHosts, type GaussdbHostEntry } from "@/lib/connection/gaussdbHosts";
 import { h2ConnectionModeForConfig, h2FileJdbcUrlWithPath, h2FilePathFromJdbcUrl, isH2SplitJdbcUrl, type H2ConnectionMode } from "@/lib/database/h2Connection";
+import { metadataLoadTimeoutMs } from "@/lib/sql/queryTimeout";
 import { firstZooKeeperEndpoint, normalizeZooKeeperConnectString } from "@/lib/zookeeper/zookeeperConnection";
 import { setZooKeeperAuthScheme, zooKeeperAuthScheme as resolveZooKeeperAuthScheme, type ZooKeeperAuthScheme } from "@/lib/zookeeper/zookeeperConnectionOptions";
 import { isLocalFileTypeDb } from "@/lib/connection/connectionFile";
@@ -4315,7 +4316,7 @@ async function preloadVisibleDatabaseNames() {
       id: draftId,
       one_time: true,
     };
-    const timeoutMs = visibleDatabasesLoadTimeoutMs(draftConfig);
+    const timeoutMs = metadataLoadTimeoutMs(draftConfig, settingsStore.editorSettings.globalQueryTimeoutSecs);
     visibleDatabaseNames.value = await Promise.race([
       api.connectDb(draftConfig).then(() => loadVisibleDatabaseNames(draftId, draftConfig, abortController.signal)),
       new Promise<never>((_, reject) => {
@@ -4335,15 +4336,6 @@ async function preloadVisibleDatabaseNames() {
     }
     await api.disconnectDb(draftId).catch(() => undefined);
   }
-}
-
-function visibleDatabasesLoadTimeoutMs(config?: ConnectionConfig): number {
-  // Mirrors connectionStore.metadataLoadTimeoutMs: a configured query timeout
-  // gets a 5s buffer, and the floor keeps slow WAN/tunnel round-trips from
-  // tripping a too-tight guard.
-  const queryTimeoutSecs = Number(config?.query_timeout_secs);
-  const boundedTimeoutSecs = Number.isFinite(queryTimeoutSecs) && queryTimeoutSecs > 0 ? queryTimeoutSecs + 5 : 35;
-  return Math.max(15_000, boundedTimeoutSecs * 1000);
 }
 
 async function openVisibleDatabasesPicker() {
@@ -4368,7 +4360,7 @@ async function openVisibleDatabasesPicker() {
     // degrades to a clear timeout instead of a ~30s generic hang. The abort
     // controller interrupts the in-flight HTTP listDatabases request so the
     // backend query is canceled and the pool slot is freed.
-    const timeoutMs = visibleDatabasesLoadTimeoutMs(draftConfig);
+    const timeoutMs = metadataLoadTimeoutMs(draftConfig, settingsStore.editorSettings.globalQueryTimeoutSecs);
     const names = await Promise.race([
       api.connectDb(draftConfig).then(() => loadVisibleDatabaseNames(draftId, draftConfig, abortController.signal)),
       new Promise<never>((_, reject) => {
