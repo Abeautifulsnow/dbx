@@ -3015,6 +3015,29 @@ async function openExternalUrl(url: string) {
   border-radius: 0.375rem;
   border: 1px solid var(--border);
 }
+/* WebKit/Chromium-only styling. Do NOT set scrollbar-width/scrollbar-color here:
+   per CSS Scrollbars spec, a non-auto scrollbar-width makes engines ignore the
+   ::-webkit-scrollbar* rules below (both Tauri webviews support them). */
+.ai-markdown :deep(.ai-markdown-table-wrap::-webkit-scrollbar) {
+  width: 6px;
+  height: 6px;
+}
+.ai-markdown :deep(.ai-markdown-table-wrap::-webkit-scrollbar-track) {
+  background: transparent;
+}
+.ai-markdown :deep(.ai-markdown-table-wrap::-webkit-scrollbar-thumb) {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--foreground) 28%, transparent);
+  background-clip: padding-box;
+}
+.ai-markdown :deep(.ai-markdown-table-wrap:hover::-webkit-scrollbar-thumb) {
+  border: 0;
+  background: color-mix(in oklch, var(--foreground) 45%, transparent);
+}
+.ai-markdown :deep(.ai-markdown-table-wrap::-webkit-scrollbar-corner) {
+  background: transparent;
+}
 .ai-markdown :deep(.ai-markdown-table-wrap table) {
   border: none;
   margin: 0;
