@@ -3028,12 +3028,20 @@ async function openExternalUrl(url: string) {
 .ai-markdown :deep(.ai-markdown-table-wrap::-webkit-scrollbar-thumb) {
   border: 1px solid transparent;
   border-radius: 999px;
+  background: rgba(82, 82, 82, 0.28);
   background: color-mix(in oklch, var(--foreground) 28%, transparent);
   background-clip: padding-box;
 }
 .ai-markdown :deep(.ai-markdown-table-wrap:hover::-webkit-scrollbar-thumb) {
   border: 0;
+  background: rgba(82, 82, 82, 0.45);
   background: color-mix(in oklch, var(--foreground) 45%, transparent);
+}
+html.dbx-legacy-webview.dark .ai-markdown :deep(.ai-markdown-table-wrap::-webkit-scrollbar-thumb) {
+  background: rgba(212, 212, 216, 0.28);
+}
+html.dbx-legacy-webview.dark .ai-markdown :deep(.ai-markdown-table-wrap:hover::-webkit-scrollbar-thumb) {
+  background: rgba(212, 212, 216, 0.45);
 }
 .ai-markdown :deep(.ai-markdown-table-wrap::-webkit-scrollbar-corner) {
   background: transparent;
