@@ -87,6 +87,7 @@ pub enum PoolKind {
     Redis(db::redis_driver::RedisConnection),
     DuckDbWorker(DuckDbWorkerHandle),
     MongoDb(mongodb::Client),
+    DynamoDb(db::dynamodb_driver::DynamoDbClient),
     ClickHouse(db::clickhouse_driver::ChClient),
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
@@ -172,6 +173,7 @@ macro_rules! agent_connection_pool_database_type {
             | DatabaseType::Snowflake
             | DatabaseType::Trino
             | DatabaseType::Hive
+            | DatabaseType::Kyuubi
             | DatabaseType::Impala
             | DatabaseType::Spark
             | DatabaseType::Db2
@@ -2021,6 +2023,11 @@ impl AppState {
                     }
                 }
             }
+            DatabaseType::DynamoDb => {
+                let client = db::dynamodb_driver::connect(&db_config, &host, port)?;
+                db::dynamodb_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::DynamoDb(client)
+            }
             DatabaseType::ClickHouse => {
                 let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
                 let password = if db_config.password.is_empty() { None } else { Some(db_config.password.clone()) };
@@ -2063,11 +2070,12 @@ impl AppState {
                 PoolKind::Easysearch(client)
             }
             DatabaseType::Meilisearch => {
-                let client = db::meilisearch_driver::MeilisearchClient::new(
+                let client = db::meilisearch_driver::MeilisearchClient::new_for_config(
                     &url,
                     Some(&db_config.password),
                     db_config.ssl,
                     db_config.url_params.as_deref(),
+                    db_config.external_config.as_ref(),
                     connect_timeout,
                 )?;
                 db::meilisearch_driver::test_connection(&client, connect_timeout).await?;
@@ -2354,7 +2362,7 @@ impl AppState {
                 // Temporary "__test_*" probes must not retain agents in the registry.
                 // reconnect fast-path caching only applies to durable connection ids;
                 // drain_connection_pools no longer drops MQ adapters (reconnect reuse).
-                if connection_id.starts_with("__test_") {
+                if connection_id.starts_with(crate::runtime_config::TEST_PROBE_ID_PREFIX) {
                     let adapter = self.mq_registry.build_transient_config(mqc, agent_launch).await?;
                     adapter.test_connection().await?;
                     if let Err(err) = self.ensure_current_connection_attempt(connection_id, connection_attempt).await {
@@ -2932,6 +2940,11 @@ impl AppState {
 
         let (host, port) = self.connection_host_port(connection_id, config).await?;
         let nacos_config = nacos_config.with_server_endpoint(&host, port)?;
+        let transport_layers = self.resolved_transport_layers(config).await?;
+        if transport_layers.is_empty() {
+            return Ok(nacos_config);
+        }
+
         if nacos_config.rnacos_console_addr.is_empty() {
             return Ok(nacos_config);
         }
@@ -2945,10 +2958,6 @@ impl AppState {
         let console_port = console_url
             .port_or_known_default()
             .ok_or_else(|| "r-nacos console address does not include a port".to_string())?;
-        let transport_layers = self.resolved_transport_layers(config).await?;
-        if transport_layers.is_empty() {
-            return Ok(nacos_config);
-        }
         let console_transport_id = rnacos_console_transport_id(connection_id);
         let local_port = match db::transport_layer_tunnel::start_transport_layers(
             &console_transport_id,
@@ -3093,6 +3102,18 @@ impl AppState {
                         Ok(()) => false,
                         Err(err) => {
                             log::warn!("MongoDB connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::DynamoDb(client) => {
+                    let client = client.clone();
+                    drop(connections);
+                    let timeout = crate::db::connection_timeout();
+                    match db::dynamodb_driver::test_connection(&client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("DynamoDB connection pool '{pool_key}' is stale: {err}");
                             true
                         }
                     }
@@ -4048,6 +4069,13 @@ impl AppState {
                         false
                     }
                 },
+                PoolKind::DynamoDb(client) => match db::dynamodb_driver::test_connection(client, timeout).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("DynamoDB connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
                 PoolKind::ClickHouse(client) => match db::clickhouse_driver::test_connection(client, timeout).await {
                     Ok(()) => true,
                     Err(e) => {
@@ -4841,6 +4869,7 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         #[cfg(not(feature = "duckdb-sidecar"))]
         PoolKind::DuckDbWorker(_) => PoolKind::DuckDbWorker(()),
         PoolKind::MongoDb(client) => PoolKind::MongoDb(client.clone()),
+        PoolKind::DynamoDb(client) => PoolKind::DynamoDb(client.clone()),
         PoolKind::ClickHouse(client) => PoolKind::ClickHouse(client.clone()),
         PoolKind::SqlServer(client) => PoolKind::SqlServer(client.clone()),
         PoolKind::Elasticsearch(client) => PoolKind::Elasticsearch(client.clone()),
@@ -4883,6 +4912,9 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
         #[cfg(not(feature = "duckdb-sidecar"))]
         PoolKind::DuckDbWorker(_) => {}
         PoolKind::MongoDb(client) => {
+            drop(client);
+        }
+        PoolKind::DynamoDb(client) => {
             drop(client);
         }
         PoolKind::ClickHouse(client) => {
@@ -6200,7 +6232,7 @@ mod tests {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(path, b"").unwrap();
+        std::fs::write(path, b"test executable").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

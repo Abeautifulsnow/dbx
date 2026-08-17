@@ -357,6 +357,7 @@ export const listSqlFilesInFolder = forward("listSqlFilesInFolder");
 // Nacos
 export const nacosTestConnection = forward("nacosTestConnection");
 export const nacosListNamespaces = forward("nacosListNamespaces");
+export const nacosSidebarSnapshot = forward("nacosSidebarSnapshot");
 export const nacosCreateNamespace = forward("nacosCreateNamespace");
 export const nacosUpdateNamespace = forward("nacosUpdateNamespace");
 export const nacosListConfigs = forward("nacosListConfigs");
@@ -375,6 +376,18 @@ export const nacosGetConfigHistory = forward("nacosGetConfigHistory");
 export const nacosRollbackConfig = forward("nacosRollbackConfig");
 export const nacosGetRNacosConsoleCaptcha = forward("nacosGetRNacosConsoleCaptcha");
 export const nacosLoginRNacosConsole = forward("nacosLoginRNacosConsole");
+export const nacosListUsers = forward("nacosListUsers");
+export const nacosCreateUser = forward("nacosCreateUser");
+export const nacosUpdateUser = forward("nacosUpdateUser");
+export const nacosDeleteUser = forward("nacosDeleteUser");
+export const nacosListRoleBindings = forward("nacosListRoleBindings");
+export const nacosAssignRole = forward("nacosAssignRole");
+export const nacosRemoveRole = forward("nacosRemoveRole");
+export const nacosAccessSnapshot = forward("nacosAccessSnapshot");
+export const nacosStartAccessOperation = forward("nacosStartAccessOperation");
+export const nacosGetAccessOperation = forward("nacosGetAccessOperation");
+export const nacosRetryAccessOperation = forward("nacosRetryAccessOperation");
+export const nacosUndoAccessOperation = forward("nacosUndoAccessOperation");
 export const nacosListServices = forward("nacosListServices");
 export const nacosGetService = forward("nacosGetService");
 export const nacosCreateService = forward("nacosCreateService");
@@ -685,6 +698,8 @@ export const mongoDropCollection = forward("mongoDropCollection");
 export const mongoRenameCollection = forward("mongoRenameCollection");
 export const mongoCloneCollection = forward("mongoCloneCollection");
 export const documentFindDocuments = forward("documentFindDocuments");
+export const documentCountDocuments = forward("documentCountDocuments");
+export const dynamodbDescribeTable = forward("dynamodbDescribeTable");
 export const elasticsearchCountDocuments = forward("elasticsearchCountDocuments");
 export const mongoFindDocuments = forward("mongoFindDocuments");
 export const mongoParseShellCommand = forward("mongoParseShellCommand");
@@ -730,6 +745,7 @@ export const deleteHistoryEntry = forward("deleteHistoryEntry");
 // Updates
 export const checkMcpServerStatus = forward("checkMcpServerStatus");
 export const installMcpServer = forward("installMcpServer");
+export const uninstallMcpServer = forward("uninstallMcpServer");
 export const checkForUpdates = forward("checkForUpdates");
 export const fetchChangelog = forward("fetchChangelog");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
@@ -842,6 +858,9 @@ export type {
   EtcdPreflightResponse,
   EtcdDangerousApproval,
   DocumentQueryResult,
+  DynamoDbKeyInfo,
+  DynamoDbIndexInfo,
+  DynamoDbTableDescription,
   MongoDocumentResult,
   HistoryEntry,
   HistoryConnectionFilter,

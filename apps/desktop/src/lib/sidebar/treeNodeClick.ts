@@ -8,7 +8,7 @@ export type SidebarSelectionCopyAction = "copy-name" | "none";
 export type SidebarActivation = "single" | "double";
 
 const dataNodeTypes = new Set<TreeNodeType>(["table", "view", "materialized_view"]);
-const documentBrowserNodeTypes = new Set<TreeNodeType>(["mongo-collection", "mongo-bucket"]);
+const documentBrowserNodeTypes = new Set<TreeNodeType>(["mongo-collection", "mongo-bucket", "dynamodb-table"]);
 const toggleLeafNodeTypes = new Set<TreeNodeType>([
   "redis-db",
   "mq-tenant",
@@ -16,12 +16,15 @@ const toggleLeafNodeTypes = new Set<TreeNodeType>([
   "etcd-root",
   "etcd-dashboard",
   "etcd-access-control",
+  "nacos-namespace",
+  "nacos-access-control",
   "zookeeper-root",
   "consul-root",
   "consul-overview",
   "mongo-gridfs",
   "mongo-collection",
   "mongo-bucket",
+  "dynamodb-table",
   "vector-collection",
   "elasticsearch-index",
   "user-admin",
@@ -31,10 +34,15 @@ const toggleLeafNodeTypes = new Set<TreeNodeType>([
 // These are application entry points rather than database objects. They should
 // always navigate on a single click, even when the user prefers double-click
 // activation for ordinary tree objects.
-const directNavigationTreeNodeTypes = new Set<TreeNodeType>(["consul-root", "consul-overview"]);
+const directNavigationTreeNodeTypes = new Set<TreeNodeType>(["consul-root", "consul-overview", "nacos-namespace", "nacos-access-control"]);
+const repeatableNavigationTreeNodeTypes = new Set<TreeNodeType>(["nacos-namespace", "nacos-access-control"]);
 
 export function isDirectNavigationTreeNode(type: TreeNodeType): boolean {
   return directNavigationTreeNodeTypes.has(type);
+}
+
+export function isRepeatableNavigationTreeNode(type: TreeNodeType): boolean {
+  return repeatableNavigationTreeNodeTypes.has(type);
 }
 
 export function shouldActivateTreeNodeOnSingleClick(type: TreeNodeType, activation: SidebarActivation = "single"): boolean {

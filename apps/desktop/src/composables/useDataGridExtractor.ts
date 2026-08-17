@@ -79,6 +79,10 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
     return options.hasCellSelection.value ? options.selectedCells.value : null;
   }
 
+  function hasContextPredicateTarget(extractor: DataGridCopyExtractorId): boolean {
+    return (extractor === "sql-select" || extractor === "where-clause") && (options.contextCell.value?.col ?? -1) >= 0;
+  }
+
   function buildRequest(extractor: DataGridCopyExtractorId, extractorOptions: DataGridExtractorOptions = options.extractorOptions?.value ?? DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS): DataGridExtractRequest | null {
     const visibleIndexes = options.visibleColumnIndexes.value;
     const sourceNames = options.allSourceColumns.value;
@@ -91,12 +95,31 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
 
     const matrix = options.selectedCellMatrix.value;
     const isMultiCellSelection = !!matrix && (matrix.rowIndexes.length > 1 || matrix.columnIndexes.length > 1);
+    const contextCell = options.contextCell.value;
     // A right-click sets contextCell.col to the clicked column (≥ 0); the test
-    // harness and non-right-click paths leave it at -1. Only treat a 1×1 matrix
-    // as synthetic when there's a real right-click context.
-    const hasRightClickContext = !!options.contextCell.value && options.contextSelectionIsSynthetic.value;
+    // harness and non-right-click paths leave it at -1.
+    const hasRightClickContext = !!contextCell && options.contextSelectionIsSynthetic.value;
+    // SQL predicates generated from the context menu must describe the cell the
+    // user right-clicked, even when an existing row or range selection remains
+    // active underneath that menu.
+    const contextPredicateCell = hasContextPredicateTarget(extractor) ? contextCell : null;
+    // When the user already has a single-cell selection and right-clicks the same
+    // cell, contextSelectionIsSynthetic is false but we still have a valid context
+    // cell. For INSERT/UPDATE extractors, we include all visible non-PK columns
+    // so the "has writable column" check doesn't fail when the selected cell
+    // happens to be the primary key. sql-select intentionally keeps using only
+    // the selected cell via the matrix branch below.
+    const hasNonSyntheticContextCell = !!options.contextCell.value && options.contextCell.value.col >= 0 && !options.contextSelectionIsSynthetic.value && !!matrix && !isMultiCellSelection;
 
-    if (options.hasRowSelection.value && options.selectedRowIds.value.size > 0) {
+    if (contextPredicateCell) {
+      const item = fullItemsById.get(contextPredicateCell.rowId);
+      const sourceIndex = visibleIndexes[contextPredicateCell.col];
+      if (item && !item.isDraft && sourceIndex !== undefined) {
+        sourceRows = [item.data];
+        sourceRowIds = [item.id];
+        selectedSourceIndexes = [sourceIndex];
+      }
+    } else if (options.hasRowSelection.value && options.selectedRowIds.value.size > 0) {
       const items = options.displayItems.value.filter((item) => options.selectedRowIds.value.has(item.id) && !item.isDraft);
       sourceRows = items.map((item) => (fullItemsById.get(item.id) ?? item).data);
       sourceRowIds = items.map((item) => item.id);
@@ -108,8 +131,9 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
       sourceRowIds = items.map((item) => item.id);
       selectedSourceIndexes = dedupeColumnIndexes(matrix.columnIndexes.map((index) => visibleIndexes[index] ?? index)).filter((index) => index < fullColumns.length);
       if (options.hasColumnSelection.value) selectionKind = "columns";
-    } else if (hasRightClickContext && options.contextCell.value) {
-      // A SELECT targets the clicked cell; existing extractors keep their full-row context behavior.
+    } else if ((hasRightClickContext || (hasNonSyntheticContextCell && extractor !== "sql-select")) && options.contextCell.value) {
+      // A SELECT targets the clicked cell; other extractors use the full row
+      // so that right-clicking a selected PK cell still enables INSERT/UPDATE.
       const item = fullItemsById.get(options.contextCell.value.rowId);
       if (item && !item.isDraft) {
         sourceRows = [item.data];
@@ -149,7 +173,10 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
     const columnTypesBySource = new Map(visibleIndexes.map((sourceIndex, visibleIndex) => [sourceIndex, options.columnTypes.value?.[visibleIndex]]));
     const columns = requiredSourceIndexes.map((sourceIndex, compactIndex) => ({
       displayName: fullColumns[sourceIndex],
-      sourceName: sourceNames?.[sourceIndex],
+      // Query results without source metadata still expose their database column
+      // names as display names. Keep the request mapping aligned with the
+      // availability check so SQL SELECT can use that safe fallback.
+      sourceName: sourceNames?.[sourceIndex] ?? fullColumns[sourceIndex],
       sourceIndex: compactIndex,
     }));
     const descriptor = DATA_GRID_COPY_EXTRACTOR_DESCRIPTORS[extractor];
@@ -220,7 +247,8 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
   }
 
   function canCopyWithExtractor(extractor: DataGridCopyExtractorId, extractorOptions: DataGridExtractorOptions = options.extractorOptions?.value ?? DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS): boolean {
-    if (hasUnsupportedDiscreteSelection.value) return false;
+    const contextPredicateTarget = hasContextPredicateTarget(extractor);
+    if (hasUnsupportedDiscreteSelection.value && !contextPredicateTarget) return false;
     if (!options.hasRowSelection.value && !options.hasCellSelection.value && !options.contextCell.value) return false;
     if (extractorUnavailableForDatabase(extractor, options.databaseType.value)) return false;
     if (extractor === "sql-inserts") {
@@ -237,7 +265,9 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
     }
     if (extractor === "sql-select") {
       const matrix = options.selectedCellMatrix.value;
-      if (options.hasRowSelection.value) {
+      if (contextPredicateTarget) {
+        // The context-menu target is validated by buildRequest below.
+      } else if (options.hasRowSelection.value) {
         if (options.selectedRowIds.value.size !== 1) return false;
       } else if (matrix) {
         if (matrix.rowIndexes.length !== 1 || matrix.columnIndexes.length !== 1) return false;
@@ -248,7 +278,10 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
       if (!request?.tableMeta?.tableName.trim() || request.rows.length !== 1) return false;
       if (request.selectionKind === "columns") return false;
       if (request.selectionKind === "cells" && request.selectedColumnIndexes.length !== 1) return false;
-      return request.columns.length > 0 && request.columns.every((column) => !!column.sourceName?.trim());
+      return request.columns.length > 0 && request.columns.every((column) => !!(column.sourceName ?? column.displayName)?.trim());
+    }
+    if (extractor === "where-clause" && contextPredicateTarget) {
+      return buildRequest(extractor, extractorOptions) !== null;
     }
     if (extractor === "raw") {
       const request = buildRequest(extractor, extractorOptions);
@@ -271,7 +304,7 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
   }
 
   async function copyWithExtractor(extractor: DataGridCopyExtractorId, extractorOptions: DataGridExtractorOptions = options.extractorOptions?.value ?? DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS): Promise<boolean> {
-    if (hasUnsupportedDiscreteSelection.value) {
+    if (hasUnsupportedDiscreteSelection.value && !hasContextPredicateTarget(extractor)) {
       toast(t("grid.copyExtractorUnsupportedSelection"), 5000);
       return false;
     }
@@ -310,7 +343,7 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
   }
 
   async function previewWithExtractor(extractor: DataGridCopyExtractorId, extractorOptions: DataGridExtractorOptions): Promise<DataGridExtractPreview> {
-    if (hasUnsupportedDiscreteSelection.value) throw new Error(t("grid.copyExtractorUnsupportedSelection"));
+    if (hasUnsupportedDiscreteSelection.value && !hasContextPredicateTarget(extractor)) throw new Error(t("grid.copyExtractorUnsupportedSelection"));
     const initialRequest = buildRequest(extractor, extractorOptions);
     if (!initialRequest) throw new Error(t("grid.copyExtractorEmptySelection"));
     const sourceRowCount = initialRequest.rows.length;

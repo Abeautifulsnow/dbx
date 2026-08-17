@@ -20,6 +20,7 @@ use dbx_core::models::connection::{
     DatabaseConnectionInfo, DatabaseType,
 };
 pub use dbx_core::path_utils::expand_tilde;
+use dbx_core::runtime_config::{release_runtime_config_on_disconnect, should_retain_runtime_config};
 
 const MONGO_LEGACY_DRIVER_PROFILE: &str = "mongodb-legacy";
 const MONGO_LEGACY_DRIVER_LABEL: &str = "MongoDB (Legacy)";
@@ -625,6 +626,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Dropped-file preview connection: in-memory DuckDB, `one_time`, never in the saved list.
+    fn duckdb_preview_config() -> ConnectionConfig {
+        ConnectionConfig {
+            id: "preview-duckdb".to_string(),
+            name: "[Preview] sales.parquet".to_string(),
+            db_type: DatabaseType::DuckDb,
+            driver_profile: Some("duckdb".to_string()),
+            driver_label: Some("DuckDB".to_string()),
+            url_params: Some(String::new()),
+            host: ":memory:".to_string(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            database: None,
+            one_time: true,
+            ..mongodb_config()
+        }
+    }
+
+    #[tokio::test]
+    async fn save_connection_configs_retains_one_time_runtime_config_and_its_pool() {
+        let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+        let persisted = mongodb_config();
+        let preview = duckdb_preview_config();
+        state.configs.write().await.insert(preview.id.clone(), preview.clone());
+
+        let sync = sync_connection_configs(&state, std::slice::from_ref(&persisted)).await;
+
+        let configs = state.configs.read().await;
+        assert!(configs.contains_key(&persisted.id));
+        assert!(configs.contains_key(&preview.id), "one_time runtime config must survive save sync");
+        // The preview broke because the sync tore its pool down; asserting only that
+        // the config survives would miss the actual regression.
+        assert!(
+            !sync.connection_pool_ids_to_drop.contains(&preview.id),
+            "one_time connection pool must not be torn down by save sync"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn save_connection_configs_keeps_session_credential_of_one_time_config() {
+        let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+        let persisted = mongodb_config();
+        let preview = duckdb_preview_config();
+        state.configs.write().await.insert(preview.id.clone(), preview.clone());
+        state.session_credentials.set("", &preview.id, "secret").expect("session credential fixture");
+
+        save_connection_configs(&state, std::slice::from_ref(&persisted)).await.unwrap();
+
+        // If the config is retained the credential must be retained with it, or the
+        // next query re-prompts for a password that was already entered.
+        assert!(state.session_credentials.has("", &preview.id));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[cfg(feature = "mq-admin")]
     #[tokio::test]
     async fn save_connection_configs_removes_deleted_connection_pools() {
@@ -719,7 +784,7 @@ async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig])
     let mut connection_pool_ids_to_drop = HashSet::new();
     let mut runtime_configs = state.configs.write().await;
     runtime_configs.retain(|id, existing| {
-        if saved_ids.contains(id.as_str()) || is_transient_runtime_config_id(id) {
+        if saved_ids.contains(id.as_str()) || should_retain_runtime_config(id, existing) {
             true
         } else {
             connection_pool_ids_to_drop.insert(id.clone());
@@ -763,10 +828,6 @@ async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig])
         mq_adapter_ids_to_drop: mq_adapter_ids_to_drop.into_iter().collect(),
         connection_pool_ids_to_drop: connection_pool_ids_to_drop.into_iter().collect(),
     }
-}
-
-fn is_transient_runtime_config_id(id: &str) -> bool {
-    id.starts_with("__test_") || id.starts_with("__visible_draft_") || id.starts_with("__visible_schema_draft_")
 }
 
 async fn drop_nacos_adapters_for_connection_ids(state: &AppState, connection_ids: &[String]) {
@@ -1044,6 +1105,12 @@ async fn test_connection_with_info_inner(
                     Err(native_err)
                 }
             }
+            DatabaseType::DynamoDb => {
+                let client = db::dynamodb_driver::connect(&config, &host, port)?;
+                db::dynamodb_driver::test_connection(&client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
             DatabaseType::ClickHouse => {
                 let username = if config.username.is_empty() { None } else { Some(config.username.clone()) };
                 let password = if config.password.is_empty() { None } else { Some(config.password.clone()) };
@@ -1097,11 +1164,12 @@ async fn test_connection_with_info_inner(
                     .map(|_| "Connection successful".to_string())
             }
             DatabaseType::Meilisearch => {
-                let client = db::meilisearch_driver::MeilisearchClient::new(
+                let client = db::meilisearch_driver::MeilisearchClient::new_for_config(
                     &url,
                     Some(&config.password),
                     config.ssl,
                     config.url_params.as_deref(),
+                    config.external_config.as_ref(),
                     connect_timeout,
                 )?;
                 db::meilisearch_driver::test_connection(&client, connect_timeout)
@@ -1198,7 +1266,7 @@ async fn test_connection_with_info_inner(
             DatabaseType::Nacos => {
                 let admin_config = state.nacos_admin_config_for_connection(connection_id, &config).await?;
                 let adapter = state.nacos_registry.build_transient_config(admin_config).await?;
-                adapter.test_connection().await?;
+                adapter.test_connection_with_scope_validation().await?;
                 Ok("Connection successful".to_string())
             }
             DatabaseType::Consul => {
@@ -1325,6 +1393,7 @@ pub async fn connect_db(
     let mut connected_db_config = db_config.clone();
 
     state.remove_connection_pools_detached(&id).await;
+    drop_nacos_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&id)).await;
     state.reset_connection_transport_for_config(&id, &db_config).await;
 
     let (host, port) = state.connection_host_port(&id, &db_config).await?;
@@ -1455,6 +1524,11 @@ pub async fn connect_db(
                 }
             }
         }
+        DatabaseType::DynamoDb => {
+            let client = db::dynamodb_driver::connect(&db_config, &host, port)?;
+            db::dynamodb_driver::test_connection(&client, connect_timeout).await?;
+            PoolKind::DynamoDb(client)
+        }
         DatabaseType::ClickHouse => {
             let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
             let password = if db_config.password.is_empty() { None } else { Some(db_config.password.clone()) };
@@ -1498,11 +1572,12 @@ pub async fn connect_db(
             PoolKind::Easysearch(client)
         }
         DatabaseType::Meilisearch => {
-            let client = db::meilisearch_driver::MeilisearchClient::new(
+            let client = db::meilisearch_driver::MeilisearchClient::new_for_config(
                 &url,
                 Some(&db_config.password),
                 db_config.ssl,
                 db_config.url_params.as_deref(),
+                db_config.external_config.as_ref(),
                 connect_timeout,
             )?;
             db::meilisearch_driver::test_connection(&client, connect_timeout).await?;
@@ -1728,9 +1803,7 @@ pub async fn disconnect_db(
     drop_nacos_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
     drop_mq_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
     state.reset_connection_transport(&connection_id).await;
-    if connection_id.starts_with("__visible_draft_") || connection_id.starts_with("__visible_schema_draft_") {
-        state.configs.write().await.remove(&connection_id);
-    }
+    release_runtime_config_on_disconnect(state.inner(), &connection_id).await;
     Ok(())
 }
 

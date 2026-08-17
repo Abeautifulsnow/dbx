@@ -224,6 +224,7 @@ pub async fn mongo_find_documents_core(
         projection,
         sort,
         collation,
+        None,
     )
     .await
 }
@@ -1299,6 +1300,7 @@ mod tests {
             extended_documents: Some(vec![serde_json::json!(1), serde_json::json!(2), serde_json::json!(3)]),
             total: 3,
             total_is_exact: true,
+            next_cursor: None,
         };
 
         let limited = limit_mongo_documents(result, 2);
@@ -1323,6 +1325,7 @@ mod tests {
             extended_documents: None,
             total: 1,
             total_is_exact: true,
+            next_cursor: None,
         };
 
         let query_result = mongo_show_databases_query_result(result.documents, 2).unwrap();
@@ -1348,6 +1351,7 @@ mod tests {
             extended_documents: None,
             total: 1,
             total_is_exact: true,
+            next_cursor: None,
         };
         let query_result = mongo_show_databases_query_result(empty.documents, 100).unwrap();
         assert_eq!(query_result.columns, ["name", "sizeOnDisk", "empty"]);
@@ -1360,6 +1364,7 @@ mod tests {
             extended_documents: None,
             total: 1,
             total_is_exact: true,
+            next_cursor: None,
         };
         assert!(mongo_show_databases_query_result(malformed.documents, 100).unwrap_err().contains("databases array"));
     }
@@ -1846,6 +1851,7 @@ for line in sys.stdin:
                     index_type: Some("_id: 1".to_string()),
                     included_columns: None,
                     comment: None,
+                    key_is_expression: Vec::new(),
                 },
                 IndexInfo {
                     name: "email_1".to_string(),
@@ -1856,6 +1862,7 @@ for line in sys.stdin:
                     index_type: Some("email: 1".to_string()),
                     included_columns: None,
                     comment: None,
+                    key_is_expression: Vec::new(),
                 },
             ],
             1,

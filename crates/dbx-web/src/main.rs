@@ -723,6 +723,7 @@ async fn main() {
         // Nacos
         .route("/nacos/test-connection", post(routes::nacos::test_connection))
         .route("/nacos/namespaces/list", post(routes::nacos::list_namespaces))
+        .route("/nacos/sidebar/snapshot", post(routes::nacos::sidebar_snapshot))
         .route("/nacos/namespaces/create", post(routes::nacos::create_namespace))
         .route("/nacos/namespaces/update", post(routes::nacos::update_namespace))
         .route("/nacos/configs/list", post(routes::nacos::list_configs))
@@ -734,6 +735,18 @@ async fn main() {
         .route("/nacos/configs/history/rollback", post(routes::nacos::rollback_config))
         .route("/nacos/rnacos-console/captcha", post(routes::nacos::get_rnacos_console_captcha))
         .route("/nacos/rnacos-console/login", post(routes::nacos::login_rnacos_console))
+        .route("/nacos/users/list", post(routes::nacos::list_users))
+        .route("/nacos/users/create", post(routes::nacos::create_user))
+        .route("/nacos/users/update", post(routes::nacos::update_user))
+        .route("/nacos/users/delete", post(routes::nacos::delete_user))
+        .route("/nacos/roles/list", post(routes::nacos::list_role_bindings))
+        .route("/nacos/roles/assign", post(routes::nacos::assign_role))
+        .route("/nacos/roles/remove", post(routes::nacos::remove_role))
+        .route("/nacos/access/snapshot", post(routes::nacos::access_snapshot))
+        .route("/nacos/access/operations/start", post(routes::nacos::start_access_operation))
+        .route("/nacos/access/operations/get", post(routes::nacos::get_access_operation))
+        .route("/nacos/access/operations/retry", post(routes::nacos::retry_access_operation))
+        .route("/nacos/access/operations/undo", post(routes::nacos::undo_access_operation))
         .route("/nacos/services/list", post(routes::nacos::list_services))
         .route("/nacos/services/get", post(routes::nacos::get_service))
         .route("/nacos/services/create", post(routes::nacos::create_service))
@@ -764,6 +777,8 @@ async fn main() {
         .route("/document-store/list-databases", post(routes::document_store::list_databases))
         .route("/document-store/list-collections", post(routes::document_store::list_collections))
         .route("/document-store/find-documents", post(routes::document_store::find_documents))
+        .route("/document-store/count-documents", post(routes::document_store::count_documents))
+        .route("/document-store/dynamodb-describe-table", post(routes::document_store::describe_dynamodb_table))
         .route(
             "/document-store/elasticsearch-count-documents",
             post(routes::document_store::elasticsearch_count_documents),
