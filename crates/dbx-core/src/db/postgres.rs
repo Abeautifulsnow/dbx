@@ -3537,6 +3537,7 @@ async fn postgres_proc_has_prosp(
     Ok(pg_row_try_bool(&row, 0).unwrap_or(false))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn list_objects_rows(
     client: &deadpool_postgres::Client,
     schema: &str,
