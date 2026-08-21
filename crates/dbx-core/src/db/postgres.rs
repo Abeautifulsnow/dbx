@@ -1182,9 +1182,8 @@ fn postgres_metadata_query_timeout_message(budget: Duration) -> String {
 
 /// Best-effort server-side cancellation on a metadata timeout. A TLS cancel
 /// context (when the connection uses TLS) sends a real TLS cancel; when it is
-/// `None` (e.g. `sslmode=disable` plaintext), `cancel_postgres_query` falls
-/// back to a NoTls cancel request so the server is still asked to stop the
-/// query rather than only being abandoned locally. The cancel runs under
+/// an explicit `sslmode=disable` context permits a NoTls cancel. Unknown
+/// transport never falls back to plaintext. The cancel runs under
 /// `cancel_budget`, a distinct fixed allowance added ON TOP of the query budget
 /// (see `POSTGRES_METADATA_CANCEL_ALLOWANCE`) so the query always gets its full
 /// statement window; the whole metadata call returns within
@@ -2438,14 +2437,14 @@ pub struct PostgresCancelContext {
     pub ssl_mode: SslMode,
 }
 
-/// Build a TLS cancel context from the connection URL.
-/// Returns None if URL parsing fails or sslmode=disable (no TLS cancel needed).
+/// Build a cancel transport context from the connection URL.
+///
+/// `sslmode=disable` still returns a context: it is explicit proof that a
+/// plaintext CancelRequest is permitted. `None` means the transport is
+/// unknown and must never be downgraded to `NoTls` cancellation.
 pub fn build_postgres_cancel_context(url: &str) -> Option<PostgresCancelContext> {
     let postgres_url = postgres_connection_url(url).ok()?;
     let pg_config = tokio_postgres::Config::from_str(&postgres_url.url).ok()?;
-    if pg_config.get_ssl_mode() == SslMode::Disable {
-        return None;
-    }
     Some(PostgresCancelContext {
         ssl_files: postgres_url.ssl_files,
         accepts_invalid_certs: postgres_url.accepts_invalid_certs,
@@ -6767,27 +6766,22 @@ async fn cancel_postgres_query(
     cancel_timeout: Duration,
 ) {
     let cancel_timeout = postgres_cancel_attempt_timeout(cancel_timeout, cancel_context);
-    if let Some(ctx) = cancel_context {
+    let Some(ctx) = cancel_context else {
+        // The pool may be TLS-backed, so an unknown transport must not leak
+        // the backend cancel secret in an unencrypted CancelRequest.
+        log::warn!("Skipping PostgreSQL cancel request because its transport is unknown");
+        return;
+    };
+    if ctx.ssl_mode != SslMode::Disable {
         match make_rustls_connect_from_context(ctx) {
             Ok(tls) => match tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(tls)).await {
-                Ok(Ok(())) => return,
-                Ok(Err(err)) => {
-                    log::warn!("Failed to send PostgreSQL TLS cancel request: {err}");
-                    if ctx.ssl_mode != SslMode::Prefer {
-                        return;
-                    }
-                }
-                Err(_) => {
-                    log::warn!("Timed out sending PostgreSQL TLS cancel request ({}s)", cancel_timeout.as_secs());
-                    if ctx.ssl_mode != SslMode::Prefer {
-                        return;
-                    }
-                }
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => log::warn!("Failed to send PostgreSQL TLS cancel request: {err}"),
+                Err(_) => log::warn!("Timed out sending PostgreSQL TLS cancel request ({}s)", cancel_timeout.as_secs()),
             },
-            Err(err) => {
-                log::warn!("Failed to build TLS connector for cancel: {err}; falling back to NoTls cancel");
-            }
+            Err(err) => log::warn!("Failed to build TLS connector for cancel: {err}"),
         }
+        return;
     }
     match tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(NoTls)).await {
         Ok(Ok(())) => {}
@@ -10204,8 +10198,10 @@ mod tests {
     }
 
     #[test]
-    fn postgres_cancel_context_omits_disabled_ssl_mode() {
-        assert!(build_postgres_cancel_context("postgres://localhost/app?sslmode=disable").is_none());
+    fn postgres_cancel_context_marks_disabled_ssl_mode_as_plaintext() {
+        let context = build_postgres_cancel_context("postgres://localhost/app?sslmode=disable")
+            .expect("disabled TLS mode is an explicit plaintext-cancel transport");
+        assert_eq!(context.ssl_mode, SslMode::Disable);
     }
 
     #[test]
