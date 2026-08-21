@@ -33,7 +33,13 @@ async fn opentenbase_metadata_and_ddl_round_trip() {
     .expect("create OpenTenBase fixtures");
 
     let exercise = async {
-        let tables = db::postgres::list_tables(&pool, &source_schema).await?;
+        let tables = db::postgres::list_tables(
+            &pool,
+            &source_schema,
+            db::postgres::postgres_default_metadata_query_budget(&pool),
+            None,
+        )
+        .await?;
         if !tables.iter().any(|table| table.name == "shard_events") {
             return Err("shard_events was not listed".to_string());
         }
@@ -46,7 +52,7 @@ async fn opentenbase_metadata_and_ddl_round_trip() {
             ("replicated_dimensions", "DISTRIBUTE BY REPLICATION"),
         ];
         for (table, expected) in cases {
-            let ddl = schema::opentenbase_ddl(&pool, &source_schema, table).await?;
+            let ddl = schema::opentenbase_ddl(&pool, &source_schema, table, false).await?;
             if !ddl.contains(expected) {
                 return Err(format!("{table} DDL did not contain {expected}: {ddl}"));
             }
