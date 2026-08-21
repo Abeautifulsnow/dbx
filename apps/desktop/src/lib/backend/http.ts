@@ -317,7 +317,9 @@ async function postQueryWithDiagnostics<T>(url: string, body: unknown, traceId?:
 }
 
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(apiUrl(url), signal ? { signal } : undefined);
+  // Only pass the signal when present so the fetch call keeps its classic
+  // single-argument shape for callers/specs that don't abort.
+  const res = signal ? await fetch(apiUrl(url), { signal }) : await fetch(apiUrl(url));
   if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }

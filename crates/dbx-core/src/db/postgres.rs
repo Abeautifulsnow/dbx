@@ -1137,21 +1137,13 @@ pub(crate) const POSTGRES_METADATA_QUERY_TIMEOUT: &str = "PostgreSQL metadata qu
 pub(crate) const POSTGRES_METADATA_QUERY_BUDGET_FALLBACK: Duration = Duration::from_secs(60);
 
 /// Best-effort server-side cancellation allowance for a metadata query timeout.
-/// Drawn from the metadata budget (see `postgres_metadata_budget_split`) so the
-/// whole metadata call (query + cancel) returns within the budget the frontend
-/// deadline is aligned to; the frontend reserves ~5s for the connect round-trip
-/// on top. A cancel request is a single small message on an existing host, so
-/// 2s is a generous window and keeps the query window close to the budget.
+/// A CancelRequest is a separate protocol request on a new connection that the
+/// server never answers
+/// (https://www.postgresql.org/docs/17/protocol-flow.html#PROTOCOL-FLOW-CANCELING-REQUESTS),
+/// so it runs in its own fixed allowance ON TOP of the query budget instead of
+/// being drawn from it. A cancel request is a single small message, so 2s is a
+/// generous window that still keeps the total near the query budget.
 pub(crate) const POSTGRES_METADATA_CANCEL_ALLOWANCE: Duration = Duration::from_secs(2);
-
-/// Split a metadata budget into a query window and a distinct cancellation
-/// allowance so the total (query + cancel) never exceeds `budget`. When the
-/// budget is smaller than the allowance, the whole budget goes to the cancel
-/// and the query window is empty (the call still returns within `budget`).
-fn postgres_metadata_budget_split(budget: Duration) -> (Duration, Duration) {
-    let cancel_budget = budget.min(POSTGRES_METADATA_CANCEL_ALLOWANCE);
-    (budget - cancel_budget, cancel_budget)
-}
 
 /// Derive a per-query budget for a single metadata statement from the client's
 /// pool timeout configuration. A half-open connection (e.g. a cloud LB
@@ -1193,10 +1185,11 @@ fn postgres_metadata_query_timeout_message(budget: Duration) -> String {
 /// `None` (e.g. `sslmode=disable` plaintext), `cancel_postgres_query` falls
 /// back to a NoTls cancel request so the server is still asked to stop the
 /// query rather than only being abandoned locally. The cancel runs under
-/// `cancel_budget`, a distinct allowance drawn from the metadata budget (see
-/// `postgres_metadata_budget_split`), so the whole metadata call (query +
-/// cancel) still returns within `budget`; when the allowance is zero the
-/// cancel is skipped entirely and the caller returns immediately.
+/// `cancel_budget`, a distinct fixed allowance added ON TOP of the query budget
+/// (see `POSTGRES_METADATA_CANCEL_ALLOWANCE`) so the query always gets its full
+/// statement window; the whole metadata call returns within
+/// `budget + cancel_budget`. When the allowance is zero the cancel is skipped
+/// entirely and the caller returns immediately.
 async fn postgres_metadata_timeout_error(
     client: &deadpool_postgres::Client,
     budget: Duration,
@@ -1326,9 +1319,9 @@ async fn postgres_query_cached(
 /// config-derived query timeout bounds the whole operation and, on timeout, a
 /// `CancelToken` cancel is sent server-side — a real TLS cancel when a cancel
 /// context is available, otherwise a NoTls cancel request (plaintext/unknown).
-/// The query runs under the budget minus a small cancel allowance (see
-/// `postgres_metadata_budget_split`) so query + best-effort cancel still
-/// returns within `budget`.
+/// The query runs the FULL budget (statement_timeout semantics) and the cancel
+/// allowance is added on top (see `POSTGRES_METADATA_CANCEL_ALLOWANCE`), so
+/// query + best-effort cancel returns within `budget + allowance`.
 pub(crate) async fn postgres_query_cached_with_budget(
     client: &deadpool_postgres::Client,
     sql: &str,
@@ -1336,11 +1329,13 @@ pub(crate) async fn postgres_query_cached_with_budget(
     budget: Duration,
     cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Vec<Row>, String> {
-    let (query_budget, cancel_budget) = postgres_metadata_budget_split(budget);
-    match tokio::time::timeout(query_budget, postgres_query_cached_inner(client, sql, params)).await {
+    match tokio::time::timeout(budget, postgres_query_cached_inner(client, sql, params)).await {
         Ok(Ok(rows)) => Ok(rows),
         Ok(Err(err)) => Err(pg_metadata_error_to_string(err)),
-        Err(_) => Err(postgres_metadata_timeout_error(client, budget, cancel_context, cancel_budget).await),
+        Err(_) => {
+            Err(postgres_metadata_timeout_error(client, budget, cancel_context, POSTGRES_METADATA_CANCEL_ALLOWANCE)
+                .await)
+        }
     }
 }
 
@@ -1409,11 +1404,13 @@ pub(crate) async fn postgres_query_one_cached_with_budget(
     budget: Duration,
     cancel_context: Option<&PostgresCancelContext>,
 ) -> Result<Row, String> {
-    let (query_budget, cancel_budget) = postgres_metadata_budget_split(budget);
-    match tokio::time::timeout(query_budget, postgres_query_one_cached_inner(client, sql, params)).await {
+    match tokio::time::timeout(budget, postgres_query_one_cached_inner(client, sql, params)).await {
         Ok(Ok(row)) => Ok(row),
         Ok(Err(err)) => Err(pg_metadata_error_to_string(err)),
-        Err(_) => Err(postgres_metadata_timeout_error(client, budget, cancel_context, cancel_budget).await),
+        Err(_) => {
+            Err(postgres_metadata_timeout_error(client, budget, cancel_context, POSTGRES_METADATA_CANCEL_ALLOWANCE)
+                .await)
+        }
     }
 }
 
@@ -2935,12 +2932,18 @@ pub async fn list_tables_filtered(
         &[(&schema, Type::VARCHAR), (&filter_pattern, Type::VARCHAR), (&fuzzy_filter_pattern, Type::VARCHAR)];
     // The pagination literals make this SQL vary by page. Use an unnamed typed
     // query so each load stays one round trip without growing the statement cache.
-    let (query_budget, cancel_budget) = postgres_metadata_budget_split(metadata_budget);
-    let rows = match tokio::time::timeout(query_budget, client.query_typed(&sql, params)).await {
+    // The query runs the full budget; the cancel allowance is added on top.
+    let rows = match tokio::time::timeout(metadata_budget, client.query_typed(&sql, params)).await {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => return Err(pg_metadata_error_to_string(err)),
         Err(_) => {
-            return Err(postgres_metadata_timeout_error(&client, metadata_budget, cancel_context, cancel_budget).await)
+            return Err(postgres_metadata_timeout_error(
+                &client,
+                metadata_budget,
+                cancel_context,
+                POSTGRES_METADATA_CANCEL_ALLOWANCE,
+            )
+            .await)
         }
     };
 
@@ -5902,11 +5905,10 @@ pub async fn get_redshift_columns(
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     // Redshift needs the text protocol for column metadata, so this goes through
     // the execution path. Bound the whole operation with the metadata budget and
-    // send a real server-side cancel on timeout. The query runs under the budget
-    // minus a small cancel allowance so query + cancel stays within `metadata_budget`.
-    let (query_budget, cancel_budget) = postgres_metadata_budget_split(metadata_budget);
+    // send a real server-side cancel on timeout. The query runs the full budget;
+    // the cancel allowance is added on top (see POSTGRES_METADATA_CANCEL_ALLOWANCE).
     let result = match tokio::time::timeout(
-        query_budget,
+        metadata_budget,
         execute_select_text(
             &client,
             &redshift_columns_sql(schema, table),
@@ -5921,7 +5923,13 @@ pub async fn get_redshift_columns(
         Ok(Ok(result)) => result,
         Ok(Err(err)) => return Err(err),
         Err(_) => {
-            return Err(postgres_metadata_timeout_error(&client, metadata_budget, cancel_context, cancel_budget).await)
+            return Err(postgres_metadata_timeout_error(
+                &client,
+                metadata_budget,
+                cancel_context,
+                POSTGRES_METADATA_CANCEL_ALLOWANCE,
+            )
+            .await)
         }
     };
     Ok(redshift_columns_from_query_result(result))
@@ -9840,25 +9848,36 @@ mod tests {
     }
 
     #[test]
-    fn postgres_metadata_budget_split_preserves_total() {
+    fn postgres_metadata_query_window_is_never_zeroed_by_cancel() {
+        // The query must run the FULL configured budget (statement_timeout
+        // semantics) for every valid setting, including 1s/2s — the regression
+        // where a fixed 2s cancel allowance was drawn out of the budget made
+        // query windows of 1s/2s zero (the query never executed at all).
         for secs in [1, 2, 3, 15, 30, 60, 120] {
             let budget = Duration::from_secs(secs);
-            let (query_window, cancel_window) = postgres_metadata_budget_split(budget);
-            assert_eq!(query_window + cancel_window, budget, "split({secs}s) must preserve the total");
-            assert!(cancel_window <= POSTGRES_METADATA_CANCEL_ALLOWANCE, "cancel window too large for {secs}s");
-            if budget >= POSTGRES_METADATA_CANCEL_ALLOWANCE {
-                assert_eq!(query_window, budget - POSTGRES_METADATA_CANCEL_ALLOWANCE, "query window for {secs}s");
-            } else {
-                assert!(query_window.is_zero(), "query window must be empty below the allowance for {secs}s");
-                assert_eq!(cancel_window, budget, "whole budget goes to cancel for {secs}s");
-            }
+            assert!(!budget.is_zero(), "query window must be non-zero for {secs}s");
+            // The cancel allowance is a separate budget ON TOP; the total call
+            // (query + cancel) is bounded by budget + allowance.
+            assert_eq!(
+                budget + POSTGRES_METADATA_CANCEL_ALLOWANCE,
+                Duration::from_secs(secs + POSTGRES_METADATA_CANCEL_ALLOWANCE.as_secs()),
+                "total must be query budget plus the fixed cancel allowance for {secs}s"
+            );
         }
-        assert_eq!(postgres_metadata_budget_split(Duration::from_secs(2)), (Duration::ZERO, Duration::from_secs(2)));
-        assert_eq!(postgres_metadata_budget_split(Duration::from_secs(1)), (Duration::ZERO, Duration::from_secs(1)));
+        assert_eq!(
+            Duration::from_secs(1) + POSTGRES_METADATA_CANCEL_ALLOWANCE,
+            Duration::from_secs(3),
+            "1s query budget keeps a 1s query window and adds a 2s cancel allowance"
+        );
+        assert_eq!(
+            Duration::from_secs(2) + POSTGRES_METADATA_CANCEL_ALLOWANCE,
+            Duration::from_secs(4),
+            "2s query budget keeps a 2s query window and adds a 2s cancel allowance"
+        );
     }
 
     #[tokio::test]
-    async fn postgres_metadata_timeout_keeps_total_within_budget_when_cancel_stalls() {
+    async fn postgres_metadata_timeout_returns_diagnostic_after_full_query_budget() {
         let addr = spawn_stalled_postgres_fake().await;
         let mut pg_config = tokio_postgres::Config::new();
         pg_config.host("127.0.0.1").port(addr.port()).user("postgres").dbname("postgres");
@@ -9872,27 +9891,84 @@ mod tests {
             .build()
             .expect("build fake postgres pool");
         let client = pool.get().await.expect("checkout fake postgres client");
-        let budget = Duration::from_secs(3); // query window 1s + cancel allowance 2s
+        let budget = Duration::from_secs(1); // the FULL query window, never shortened
         let start = Instant::now();
         let err = postgres_query_cached_with_budget(&client, "SELECT 1", &[], budget, None)
             .await
             .expect_err("stalled metadata query must time out");
         let elapsed = start.elapsed();
         assert!(err.contains(POSTGRES_METADATA_QUERY_TIMEOUT), "unexpected error: {err}");
-        let query_budget = budget - POSTGRES_METADATA_CANCEL_ALLOWANCE;
-        assert!(elapsed >= query_budget, "query timed out too early: {elapsed:?}");
-        // The query must have fired under the split query window (budget minus
-        // the cancel allowance), not the full budget: the strict upper bound
-        // catches the P3 regression where a call site ran the query under the
-        // whole budget and then cancelled separately — that path leaves the
-        // query running for `budget` itself (>= 3s here) instead of ~1s. The
-        // cancel is fire-and-forget in the gaussdb tokio-postgres fork (it
-        // writes the CancelRequest and shuts the socket without waiting for a
-        // response), so the measured elapsed stays at ~query_window and the
-        // total is comfortably inside `budget`.
+        // The query ran the FULL budget (statement_timeout semantics) — the
+        // regression where the query window was budget minus the fixed cancel
+        // allowance (zero for 1s/2s budgets) is fixed. The NoTls cancel is
+        // fire-and-forget in the gaussdb tokio-postgres fork (it writes the
+        // CancelRequest and shuts the socket without waiting for a response),
+        // so the measured elapsed stays at ~budget, comfortably inside
+        // budget + the separate cancel allowance.
+        assert!(elapsed >= budget, "query timed out before its full budget: {elapsed:?}");
         assert!(
-            elapsed < budget,
-            "query ran under the full budget instead of the split window: {elapsed:?} vs {budget:?}"
+            elapsed <= budget + POSTGRES_METADATA_CANCEL_ALLOWANCE,
+            "total exceeded query budget + cancel allowance: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_metadata_timeout_total_includes_stalled_tls_cancel() {
+        // A TLS cancel attempt against a server that accepts the TCP connection
+        // but never answers the SSLRequest handshake stalls client-side: the
+        // fork's cancel_query connects, negotiates TLS, writes the CancelRequest
+        // and never reads a reply — but the TLS negotiation itself must complete
+        // first, and it blocks until the cancel timeout fires. This proves the
+        // client-side cancel path is actually bounded: the total call returns
+        // within query budget + the separate cancel allowance, and the cancel
+        // consumed real time (it stalled, it did not fire-and-forget).
+        //
+        // The CancelToken's ssl_mode comes from the MAIN connection's config
+        // (it decides whether the cancel sends an SSLRequest under Postgres
+        // negotiation), so the main connection is `Prefer` + NoTls — the
+        // NoTls connector cannot do TLS, so the main connection stays plaintext
+        // and never sends an SSLRequest; only the cancel attempt does.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let addr = spawn_stalled_postgres_fake_with_tls_cancel_stall().await;
+        let mut pg_config = tokio_postgres::Config::new();
+        pg_config.host("127.0.0.1").port(addr.port()).user("postgres").dbname("postgres");
+        pg_config.ssl_mode(SslMode::Prefer); // main connection: plaintext via NoTls, but Prefer so the cancel negotiates TLS
+        let manager = deadpool_postgres::Manager::new(pg_config, NoTls);
+        let pool = Pool::builder(manager)
+            .runtime(Runtime::Tokio1)
+            .wait_timeout(Some(Duration::from_secs(1)))
+            .create_timeout(Some(Duration::from_secs(1)))
+            .recycle_timeout(Some(Duration::from_secs(1)))
+            .max_size(1)
+            .build()
+            .expect("build fake postgres pool");
+        let client = pool.get().await.expect("checkout fake postgres client");
+        let cancel_context = PostgresCancelContext {
+            ssl_files: PostgresSslFiles::default(),
+            accepts_invalid_certs: true,
+            verifies_hostname: false,
+            ssl_mode: SslMode::Require,
+        };
+        let budget = Duration::from_secs(1);
+        let start = Instant::now();
+        let err = postgres_query_cached_with_budget(&client, "SELECT 1", &[], budget, Some(&cancel_context))
+            .await
+            .expect_err("stalled metadata query must time out");
+        let elapsed = start.elapsed();
+        assert!(err.contains(POSTGRES_METADATA_QUERY_TIMEOUT), "unexpected error: {err}");
+        // Query ran the full budget.
+        assert!(elapsed >= budget, "query timed out before its full budget: {elapsed:?}");
+        // The TLS cancel stalled and consumed a meaningful chunk of its separate
+        // allowance — the fire-and-forget NoTls path returns in ~ms, so a
+        // ~1s+ gap here proves the client-side cancel handshake was exercised.
+        assert!(
+            elapsed >= budget + Duration::from_secs(1),
+            "TLS cancel did not stall client-side: {elapsed:?} vs query {budget:?}"
+        );
+        // ...and the total stays within query budget + cancel allowance.
+        assert!(
+            elapsed <= budget + POSTGRES_METADATA_CANCEL_ALLOWANCE + Duration::from_millis(500),
+            "total exceeded query budget + cancel allowance: {elapsed:?}"
         );
     }
 
@@ -9912,7 +9988,34 @@ mod tests {
         addr
     }
 
-    async fn handle_postgres_fake_connection(mut socket: TcpStream) {
+    /// Like `spawn_stalled_postgres_fake`, but a connection whose first message
+    /// is an SSLRequest is treated as the TLS cancel attempt and stalled instead
+    /// of declined — the client-side TLS-cancel handshake path under test. The
+    /// main metadata connection uses `sslmode=disable` (no SSLRequest), so the
+    /// only SSLRequest that arrives is the cancel's.
+    async fn spawn_stalled_postgres_fake_with_tls_cancel_stall() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake postgres listener");
+        let addr = listener.local_addr().expect("fake postgres local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else { break };
+                tokio::spawn(handle_postgres_fake_connection_stall_tls_cancel(socket));
+            }
+        });
+        addr
+    }
+
+    async fn handle_postgres_fake_connection(socket: TcpStream) {
+        // Default: decline SSLRequest (main metadata connections stay plaintext).
+        handle_postgres_fake_connection_impl(socket, false).await
+    }
+
+    async fn handle_postgres_fake_connection_stall_tls_cancel(socket: TcpStream) {
+        // Stall an SSLRequest (the TLS cancel attempt) instead of declining it.
+        handle_postgres_fake_connection_impl(socket, true).await
+    }
+
+    async fn handle_postgres_fake_connection_impl(mut socket: TcpStream, stall_tls_cancel: bool) {
         // PostgreSQL wire protocol: the startup message is `[len(4)][code(4)]`
         // followed by `len - 8` body bytes; every later frontend/backend message
         // is `[type(1)][len(4)]` followed by `len - 4` payload bytes.
@@ -9924,8 +10027,15 @@ mod tests {
             let length = u32::from_be_bytes(header[0..4].try_into().expect("4-byte startup length")) as usize;
             let code = u32::from_be_bytes(header[4..8].try_into().expect("4-byte startup code"));
             if code == 80877103 {
-                // SSLRequest (code 80877103): decline so the client continues in
-                // plaintext, then read the real startup message.
+                // SSLRequest (code 80877103). Decline so the client continues in
+                // plaintext, then read the real startup message — unless the
+                // caller asked to stall it, in which case this is the TLS cancel
+                // attempt and we accept the TCP connection but never answer, so
+                // the client-side TLS handshake blocks until its cancel timeout
+                // fires (the client-side cancel path under test).
+                if stall_tls_cancel {
+                    std::future::pending::<()>().await;
+                }
                 if socket.write_all(b"N").await.is_err() {
                     return;
                 }
@@ -9947,7 +10057,7 @@ mod tests {
             batch.extend_from_slice(&msg_body(b'R', &[0, 0, 0, 0])); // AuthenticationOk
             batch.extend_from_slice(&msg_body(b'S', b"client_encoding\0UTF8\0")); // ParameterStatus
             batch.extend_from_slice(&msg_body(b'K', &[0, 0, 4, 210, 0, 0, 22, 46])); // BackendKeyData pid=1234 secret=5678
-            batch.extend_from_slice(&msg_body(b'Z', &[b'I'])); // ReadyForQuery
+            batch.extend_from_slice(&msg_body(b'Z', b"I")); // ReadyForQuery
             if socket.write_all(&batch).await.is_err() {
                 return;
             }
@@ -9983,7 +10093,7 @@ mod tests {
                     }
                     b'S' => {
                         // Sync -> ReadyForQuery.
-                        if socket.write_all(&msg_body(b'Z', &[b'I'])).await.is_err() {
+                        if socket.write_all(&msg_body(b'Z', b"I")).await.is_err() {
                             return;
                         }
                     }

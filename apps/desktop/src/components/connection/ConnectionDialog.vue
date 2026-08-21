@@ -4710,7 +4710,7 @@ async function preloadVisibleDatabaseNames() {
       id: draftId,
       one_time: true,
     };
-    const timeoutMs = metadataLoadTimeoutMs(draftConfig, settingsStore.editorSettings.globalQueryTimeoutSecs);
+    const timeoutMs = metadataLoadTimeoutMs(draftConfig, settingsStore.editorSettings.globalQueryTimeoutSecs, settingsStore.editorSettings.globalConnectTimeoutSecs);
     visibleDatabaseNames.value = await Promise.race([
       api.connectDb(draftConfig).then(() => loadVisibleDatabaseNames(draftId, draftConfig, abortController.signal)),
       new Promise<never>((_, reject) => {
@@ -4754,7 +4754,7 @@ async function openVisibleDatabasesPicker() {
     // degrades to a clear timeout instead of a ~30s generic hang. The abort
     // controller interrupts the in-flight HTTP listDatabases request so the
     // backend query is canceled and the pool slot is freed.
-    const timeoutMs = metadataLoadTimeoutMs(draftConfig, settingsStore.editorSettings.globalQueryTimeoutSecs);
+    const timeoutMs = metadataLoadTimeoutMs(draftConfig, settingsStore.editorSettings.globalQueryTimeoutSecs, settingsStore.editorSettings.globalConnectTimeoutSecs);
     const names = await Promise.race([
       api.connectDb(draftConfig).then(() => loadVisibleDatabaseNames(draftId, draftConfig, abortController.signal)),
       new Promise<never>((_, reject) => {

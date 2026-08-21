@@ -998,7 +998,7 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   async function withMetadataLoadTimeout<T>(connectionId: string, promise: Promise<T>, label: string): Promise<T> {
-    const timeoutMs = metadataLoadTimeoutMs(getConfig(connectionId), settingsStore.editorSettings.globalQueryTimeoutSecs);
+    const timeoutMs = metadataLoadTimeoutMs(getConfig(connectionId), settingsStore.editorSettings.globalQueryTimeoutSecs, settingsStore.editorSettings.globalConnectTimeoutSecs);
     const timeoutMessage = `Connection timed out while loading ${label} after ${Math.ceil(timeoutMs / 1000)}s. Please check the network or VPN and try again.`;
     const errorRevision = connectionErrorRevision(connectionId);
     let timedOut = false;
