@@ -3001,6 +3001,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn reference_key_columns_require_effective_unfiltered_single_column_uniqueness() {
         let index = |name: &str, columns: &[&str], is_unique: bool, is_primary: bool| db::IndexInfo {
             name: name.to_string(),
