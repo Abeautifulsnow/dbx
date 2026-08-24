@@ -7198,12 +7198,24 @@ const POSTGRES_INVALID_INDEXES_SQL: &str = "SELECT idx.relname \
      WHERE n.nspname = $1 AND t.relname = $2 AND ix.indisvalid = false \
      ORDER BY idx.relname";
 
-pub async fn list_invalid_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<String>, String> {
+pub async fn list_invalid_indexes(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Vec<String>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, POSTGRES_INVALID_INDEXES_SQL, &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached_with_budget(
+        &client,
+        POSTGRES_INVALID_INDEXES_SQL,
+        &[&schema, &table],
+        metadata_budget,
+        cancel_context,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(rows.iter().map(|row| pg_row_try_string(row, 0)).collect())
 }
 
@@ -7787,10 +7799,18 @@ pub async fn list_owners(
         .collect())
 }
 
-pub async fn get_table_owner(pool: &Pool, schema: &str, table: &str) -> Result<Option<String>, String> {
+pub async fn get_table_owner(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    metadata_budget: Duration,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<Option<String>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
-    let rows = postgres_query_cached(&client, POSTGRES_TABLE_OWNER_SQL, &params).await?;
+    let rows =
+        postgres_query_cached_with_budget(&client, POSTGRES_TABLE_OWNER_SQL, &params, metadata_budget, cancel_context)
+            .await?;
 
     Ok(rows.first().map(|row| pg_row_try_string(row, 0)).filter(|owner| !owner.is_empty()))
 }

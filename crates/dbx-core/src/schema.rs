@@ -177,13 +177,18 @@ fn clickhouse_metadata_database<'a>(database: &'a str, schema: &'a str) -> &'a s
     }
 }
 
+/// RPC deadline for agent/plugin metadata calls. A missing config uses the
+/// query-timeout-aligned 60s default; `query_timeout_secs == 0` (unlimited)
+/// maps to `None` (no client-side deadline — the agent owns the timeout); any
+/// finite configured timeout is preserved as-is so a connection configured below
+/// 60s is not forced to wait a full minute on that metadata path.
 fn agent_metadata_timeout(config: Option<&ConnectionConfig>) -> Option<Duration> {
     let Some(config) = config else {
         return Some(Duration::from_secs(60));
     };
     match config.effective_query_timeout_secs() {
         0 => None,
-        seconds => Some(Duration::from_secs(seconds.max(60))),
+        seconds => Some(Duration::from_secs(seconds)),
     }
 }
 
@@ -198,6 +203,59 @@ fn native_postgres_metadata_budget(config: Option<&ConnectionConfig>) -> Duratio
     match config.effective_query_timeout_secs() {
         0 => db::postgres::POSTGRES_METADATA_QUERY_BUDGET_FALLBACK, // bounded fallback for "unlimited"
         secs => Duration::from_secs(secs),
+    }
+}
+
+/// End-to-end budget for a metadata operation INCLUDING a reconnect + retry,
+/// mirroring the frontend `metadataLoadTimeoutMs` formula (connect × 3 for
+/// connectDb / checkout / identity + the query budget + the fixed cancel
+/// allowance) so the backend total can never exceed the frontend estimate. The
+/// frontend adds its transport buffer ON TOP of this total, so the backend
+/// always surfaces its own diagnostic — never the generic frontend abort — even
+/// when a failed first attempt is followed by reconnect and retry.
+fn metadata_operation_budget(config: Option<&ConnectionConfig>) -> Duration {
+    const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10; // mirrors frontend DEFAULT_CONNECT_TIMEOUT_SECS floor
+    const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30; // mirrors frontend DEFAULT_QUERY_TIMEOUT_SECS
+    let connect_secs = config
+        .map(|config| config.effective_connect_timeout_secs())
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS)
+        .max(DEFAULT_CONNECT_TIMEOUT_SECS);
+    // Use the RAW query timeout (mirroring frontend `queryTimeoutSecsForConnection`),
+    // not `effective_query_timeout_secs`, so the deadline tracks the frontend even
+    // for database types with a raised effective floor (e.g. Spanner's 120s).
+    let query_secs = match config {
+        Some(config) if config.query_timeout_secs == 0 => {
+            db::postgres::POSTGRES_METADATA_QUERY_BUDGET_FALLBACK.as_secs() // 0 (unlimited) -> bounded fallback
+        }
+        Some(config) => config.query_timeout_secs,
+        None => DEFAULT_QUERY_TIMEOUT_SECS,
+    };
+    Duration::from_secs(3 * connect_secs + query_secs) + db::postgres::POSTGRES_METADATA_CANCEL_ALLOWANCE
+}
+
+/// Error returned when the end-to-end metadata deadline expires: a failed first
+/// attempt followed by reconnect and retry exhausted the whole frontend-aligned
+/// budget. PostgreSQL-family connections carry the distinctive PostgreSQL
+/// metadata diagnostic so schema recovery discards the pool and the UI shows the
+/// real cause instead of the generic frontend abort.
+fn metadata_operation_deadline_error(db_type: Option<DatabaseType>, budget: Duration) -> String {
+    let seconds = budget.as_secs();
+    match db_type {
+        Some(
+            DatabaseType::Postgres
+            | DatabaseType::Redshift
+            | DatabaseType::Gaussdb
+            | DatabaseType::Kwdb
+            | DatabaseType::Questdb
+            | DatabaseType::OpenGauss
+            | DatabaseType::Highgo
+            | DatabaseType::Vastbase,
+        ) => format!(
+            "{} after {}s (end-to-end metadata deadline: reconnect + retry exceeded the budget)",
+            db::postgres::POSTGRES_METADATA_QUERY_TIMEOUT,
+            seconds
+        ),
+        _ => format!("Metadata operation timed out after {}s (end-to-end metadata deadline)", seconds),
     }
 }
 
@@ -3892,6 +3950,92 @@ mod tests {
     }
 
     #[test]
+    fn metadata_operation_budget_mirrors_frontend_total_including_retry() {
+        // Defaults (connect floored at 10s, query 30s): 3*10 + 30 + 2s cancel
+        // allowance = 62s. The frontend adds its 3s transport buffer on top, so
+        // the backend deadline always fires before the frontend abort.
+        assert_eq!(super::metadata_operation_budget(None), Duration::from_secs(62));
+
+        let config = test_connection_config(DatabaseType::Postgres); // connect 5, query 30
+                                                                     // connect is floored at the frontend default (10s), not the 5s config.
+        assert_eq!(super::metadata_operation_budget(Some(&config)), Duration::from_secs(62));
+
+        let config = ConnectionConfig { connect_timeout_secs: 45, query_timeout_secs: 30, ..config };
+        assert_eq!(super::metadata_operation_budget(Some(&config)), Duration::from_secs(3 * 45 + 30 + 2));
+
+        // query_timeout_secs == 0 (unlimited) maps to the 60s bounded fallback.
+        let unlimited = ConnectionConfig { query_timeout_secs: 0, ..config.clone() };
+        assert_eq!(super::metadata_operation_budget(Some(&unlimited)), Duration::from_secs(3 * 45 + 60 + 2));
+
+        // A database type with a raised effective query floor (Spanner's 120s)
+        // must still track the raw configured timeout so the backend deadline
+        // never exceeds the frontend estimate for that type.
+        let spanner = ConnectionConfig { db_type: DatabaseType::Spanner, query_timeout_secs: 30, ..config };
+        assert_eq!(super::metadata_operation_budget(Some(&spanner)), Duration::from_secs(3 * 45 + 30 + 2));
+    }
+
+    #[test]
+    fn metadata_operation_deadline_error_carries_pg_diagnostic_for_postgres_family() {
+        let budget = Duration::from_secs(62);
+        for db_type in [
+            DatabaseType::Postgres,
+            DatabaseType::Redshift,
+            DatabaseType::Highgo,
+            DatabaseType::Vastbase,
+            DatabaseType::OpenGauss,
+        ] {
+            let error = super::metadata_operation_deadline_error(Some(db_type), budget);
+            assert!(
+                error.contains(db::postgres::POSTGRES_METADATA_QUERY_TIMEOUT),
+                "PG-family db_type {db_type:?} must surface the PostgreSQL diagnostic: {error}"
+            );
+            assert_eq!(
+                super::metadata_recovery(Some(db_type), &error, true).action,
+                MetadataErrorAction::Discard,
+                "PG deadline error must discard the pool, got {error}"
+            );
+        }
+
+        let mysql = super::metadata_operation_deadline_error(Some(DatabaseType::Mysql), budget);
+        assert!(!mysql.contains(db::postgres::POSTGRES_METADATA_QUERY_TIMEOUT));
+        assert!(mysql.contains("timed out after 62s"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metadata_operation_deadline_cuts_off_a_hung_attempt_with_pg_diagnostic() {
+        let dir = std::env::temp_dir().join(format!("dbx-schema-metadata-deadline-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = crate::storage::Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = std::sync::Arc::new(crate::connection::AppState::new(storage));
+        let mut config = test_connection_config(DatabaseType::Postgres);
+        config.id = "conn".to_string();
+        state.configs.write().await.insert(config.id.clone(), config);
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert("conn".to_string(), super::PoolKind::Sqlite(pool));
+
+        let state_handle = state.clone();
+        let handle = tokio::spawn(async move {
+            super::retry_metadata_connection_for_session(&state_handle, "conn", None, None, || async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                Ok::<(), String>(())
+            })
+            .await
+        });
+        // Fast-forward past the end-to-end deadline (62s for the test config) but
+        // well before the operation's own 600s hang.
+        tokio::time::advance(Duration::from_secs(63)).await;
+        let result = handle.await.expect("deadline task must complete");
+
+        let error = result.expect_err("a hung attempt must be cut off by the end-to-end deadline");
+        assert!(
+            error.contains(db::postgres::POSTGRES_METADATA_QUERY_TIMEOUT),
+            "deadline expiry must surface the PostgreSQL diagnostic, got {error}"
+        );
+        assert!(error.contains("end-to-end metadata deadline"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn native_postgres_metadata_budget_exceeds_connect_timeout_regression() {
         // Regression for t8y2/dbx#5897: a 10s connect-timeout pool must NOT cap
         // the metadata budget. With connect_timeout_secs=10 and
@@ -4737,11 +4881,16 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn agent_metadata_timeout_defaults_to_sixty_seconds_and_honors_longer_config() {
+    fn agent_metadata_timeout_preserves_finite_config_and_defaults_safely() {
         assert_eq!(super::agent_metadata_timeout(None), Some(std::time::Duration::from_secs(60)));
 
         let mut config = test_connection_config(DatabaseType::Oracle);
-        assert_eq!(super::agent_metadata_timeout(Some(&config)), Some(std::time::Duration::from_secs(60)));
+        // A finite configured timeout below the old 60s floor is preserved, so a
+        // connection configured for 30s is not forced to wait a full minute.
+        assert_eq!(super::agent_metadata_timeout(Some(&config)), Some(std::time::Duration::from_secs(30)));
+
+        config.query_timeout_secs = 45;
+        assert_eq!(super::agent_metadata_timeout(Some(&config)), Some(std::time::Duration::from_secs(45)));
 
         config.query_timeout_secs = 120;
         assert_eq!(super::agent_metadata_timeout(Some(&config)), Some(std::time::Duration::from_secs(120)));
@@ -6279,10 +6428,27 @@ where
         }
         None => None,
     };
+    // ONE end-to-end deadline created before recovery starts. It mirrors the
+    // frontend `metadataLoadTimeoutMs` total (connect x3 + query + cancel), so a
+    // failed first attempt followed by reconnect and retry can never exceed the
+    // frontend estimate: when the deadline expires the backend returns its own
+    // diagnostic (the PostgreSQL metadata timeout for PG-family connections)
+    // instead of letting the generic frontend abort fire first. Every attempt
+    // and every reconnect below draws its remaining budget from this deadline.
+    let operation_budget = metadata_operation_budget(connection_config(state, connection_id).await.as_ref());
+    let deadline = tokio::time::Instant::now() + operation_budget;
     let mut retried = false;
     let mut missing_pool_retry = false;
     loop {
-        let result = operation().await;
+        let result = match tokio::time::timeout_at(deadline, operation()).await {
+            Ok(result) => result,
+            Err(_) => {
+                state
+                    .detach_metadata_pool_after_recovery(connection_id, database, client_session_id, None, false)
+                    .await;
+                return Err(metadata_operation_deadline_error(db_type, operation_budget));
+            }
+        };
         if result.as_ref().err().is_some_and(|error| error == "Pool not found") {
             if !missing_pool_retry {
                 missing_pool_retry = true;
@@ -6338,9 +6504,23 @@ where
             }
             MetadataErrorAction::Retry => {
                 retried = true;
-                if let Err(error) =
-                    state.reconnect_metadata_pool_for_session(connection_id, database, client_session_id).await
-                {
+                let reconnect = state.reconnect_metadata_pool_for_session(connection_id, database, client_session_id);
+                let reconnect_result = match tokio::time::timeout_at(deadline, reconnect).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        state
+                            .detach_metadata_pool_after_recovery(
+                                connection_id,
+                                database,
+                                client_session_id,
+                                None,
+                                false,
+                            )
+                            .await;
+                        return Err(metadata_operation_deadline_error(db_type, operation_budget));
+                    }
+                };
+                if let Err(error) = reconnect_result {
                     let reconnect_recovery = metadata_recovery(db_type, &error, true);
                     match reconnect_recovery.action {
                         MetadataErrorAction::ReplaceRuntime => {
@@ -7254,9 +7434,14 @@ pub async fn list_invalid_indexes_core(
 ) -> Result<Vec<String>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+        let db_config = connection_config(state, connection_id).await;
         let connections = state.connections.read().await;
         match connections.get(&pool_key) {
-            Some(PoolKind::Postgres(pool)) => db::postgres::list_invalid_indexes(pool, schema, table).await,
+            Some(PoolKind::Postgres(pool)) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::list_invalid_indexes(pool, schema, table, budget, cancel_context.as_ref()).await
+            }
             _ => Ok(vec![]),
         }
     })
@@ -7461,10 +7646,15 @@ pub async fn get_table_owner_core(
 ) -> Result<Option<String>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+        let db_config = connection_config(state, connection_id).await;
         let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
         match &pool {
-            PoolKind::Postgres(p) => db::postgres::get_table_owner(p, schema, table).await,
+            PoolKind::Postgres(p) => {
+                let budget = native_postgres_metadata_budget(db_config.as_ref());
+                let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+                db::postgres::get_table_owner(p, schema, table, budget, cancel_context.as_ref()).await
+            }
             _ => Ok(None),
         }
     })

@@ -66,7 +66,10 @@ export function effectiveConnectTimeoutSecs(connection?: Pick<ConnectionConfig, 
  * first connect) ≤ connect timeout, checkout ≤ connect timeout, identity ≤
  * connect timeout, the metadata query ≤ the effective query budget (or the 60s
  * fallback when query timeout is disabled), and the server-side cancel ≤ its
- * fixed 2s allowance on top. This deadline covers that total (plus a small
+ * fixed 2s allowance on top. The backend retry wrapper enforces this SAME total
+ * as one deadline created before recovery starts (see `metadata_operation_budget`
+ * in dbx-core), so a failed first attempt followed by reconnect and retry still
+ * cannot exceed this estimate. This deadline covers that total (plus a small
  * transport buffer) so the backend's distinctive PostgreSQL diagnostic — never
  * the generic frontend timeout — is what surfaces first.
  */
