@@ -250,8 +250,8 @@ export function supportsTransaction(dbType?: string): boolean {
 
 /**
  * Default auto-commit mode when opening a query tab for the given database type.
- * Oracle defaults to manual transactions so edits require an explicit Commit.
+ * Query tabs default to auto-commit; users can explicitly switch to manual transactions.
  */
-export function defaultAutoCommitForDbType(dbType?: string): boolean {
-  return dbType !== "oracle";
+export function defaultAutoCommitForDbType(_dbType?: string): boolean {
+  return true;
 }

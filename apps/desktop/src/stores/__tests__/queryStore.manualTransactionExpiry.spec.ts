@@ -102,6 +102,8 @@ describe("queryStore manual transaction expiry recovery", () => {
     const { useQueryStore } = await import("@/stores/queryStore");
     const store = useQueryStore();
     const tabId = store.createTab("oracle-1", "ORCL", "Query", "query", "APP");
+    // Tabs default to auto-commit; the expiry recovery path only applies to manual transactions.
+    store.setAutoCommit(tabId, false);
 
     await store.executeTabSql(tabId, "UPDATE USERS SET ACTIVE = 1");
     await store.executeTabSql(tabId, "UPDATE USERS SET ACTIVE = 1");
