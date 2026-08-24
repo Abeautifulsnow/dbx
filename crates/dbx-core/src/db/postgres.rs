@@ -10274,6 +10274,7 @@ mod tests {
             accepts_invalid_certs: true,
             verifies_hostname: false,
             ssl_mode: SslMode::Require,
+            legacy_tls: false,
         };
         let budget = Duration::from_secs(1);
         let start = Instant::now();
