@@ -30,6 +30,11 @@ export type ShortcutActionId =
   | "toggleFold"
   | "copyCurrentRow"
   | "deleteCurrentRow"
+  | "goToColumn"
+  | "goToFirstPage"
+  | "goToPreviousPage"
+  | "goToNextPage"
+  | "goToLastPage"
   | "newQuery"
   | "openSettings"
   | "closeTab"
@@ -56,6 +61,7 @@ export type ShortcutActionId =
   | "find"
   | "replace"
   | "refreshData"
+  | "toggleResultsPane"
   | "toggleTranspose"
   | "cancelSearch"
   | "toggleSidebar"
@@ -280,6 +286,36 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Delete",
   },
   {
+    id: "goToColumn",
+    labelKey: "settings.shortcutGoToColumn",
+    scope: "grid",
+    defaultShortcut: "",
+  },
+  {
+    id: "goToFirstPage",
+    labelKey: "settings.shortcutGoToFirstPage",
+    scope: "grid",
+    defaultShortcut: "",
+  },
+  {
+    id: "goToPreviousPage",
+    labelKey: "settings.shortcutGoToPreviousPage",
+    scope: "grid",
+    defaultShortcut: "",
+  },
+  {
+    id: "goToNextPage",
+    labelKey: "settings.shortcutGoToNextPage",
+    scope: "grid",
+    defaultShortcut: "",
+  },
+  {
+    id: "goToLastPage",
+    labelKey: "settings.shortcutGoToLastPage",
+    scope: "grid",
+    defaultShortcut: "",
+  },
+  {
     id: "newQuery",
     labelKey: "settings.shortcutNewQuery",
     scope: "global",
@@ -434,6 +470,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutRefreshData",
     scope: "global",
     defaultShortcut: "F5",
+  },
+  {
+    id: "toggleResultsPane",
+    labelKey: "settings.shortcutToggleResultsPane",
+    scope: "global",
+    defaultShortcut: "",
   },
   {
     id: "toggleTranspose",
