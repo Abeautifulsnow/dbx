@@ -1745,6 +1745,7 @@ async fn stream_select_query_text(
     Ok(rows_streamed)
 }
 
+#[cfg(test)]
 pub(crate) async fn stream_select_query_inner_unnamed(
     client: &deadpool_postgres::Client,
     sql: &str,
@@ -1752,6 +1753,57 @@ pub(crate) async fn stream_select_query_inner_unnamed(
     on_item: &mut impl FnMut(PostgresQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, String> {
     stream_select_query_inner_with_mode(client, sql, row_limit, on_item, true).await
+}
+
+pub(crate) async fn stream_select_query_inner_unnamed_with_cancel(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    row_limit: Option<usize>,
+    on_item: &mut impl FnMut(PostgresQueryStreamItem) -> Result<(), String>,
+    cancel_token: Option<&CancellationToken>,
+    budget: &DbOperationBudget,
+    cancel_context: Option<&PostgresCancelContext>,
+) -> Result<u64, String> {
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(crate::query::canceled_error());
+    }
+    let pg_cancel_token = client.cancel_token();
+    let progress_clock = Arc::new(StreamProgressClock::new());
+    let progress_clock_for_stream = progress_clock.clone();
+    let mut on_stream_item = |item| {
+        let row_received = matches!(&item, PostgresQueryStreamItem::Row(_));
+        on_item(item)?;
+        if row_received {
+            progress_clock_for_stream.mark();
+        }
+        Ok(())
+    };
+    let timeout_error =
+        format!("Query timed out after {} seconds", budget.query_timeout.map_or(0, |timeout| timeout.as_secs()));
+    let stream = stream_select_query_inner_with_mode(client, sql, row_limit, &mut on_stream_item, true);
+    tokio::pin!(stream);
+    let result = await_stream_with_progress_timeout(
+        stream.as_mut(),
+        budget.query_timeout,
+        progress_clock,
+        cancel_token,
+        timeout_error.clone(),
+    )
+    .await;
+
+    if result.as_ref().is_err_and(|error| error == &timeout_error || error == crate::query::QUERY_CANCELED) {
+        let original_error = result.as_ref().expect_err("timeout or cancellation result").clone();
+        cancel_postgres_query(pg_cancel_token, cancel_context, budget.cancel_timeout).await;
+        if tokio::time::timeout(budget.cleanup_timeout, stream.as_mut()).await.is_err() {
+            return Err(format!(
+                "{}; PostgreSQL stream cleanup timed out after {} seconds",
+                original_error,
+                budget.cleanup_timeout.as_secs()
+            ));
+        }
+    }
+
+    result
 }
 
 async fn stream_select_query_inner_with_mode(
@@ -2832,6 +2884,29 @@ pub async fn list_tables_filtered(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<TableInfo>, String> {
+    list_tables_filtered_by_kind(pool, schema, filter, limit, offset, false).await
+}
+
+/// Lists only table-like relations, excluding views and materialized views while
+/// retaining server-side filtering and pagination.
+pub async fn list_table_objects_filtered(
+    pool: &Pool,
+    schema: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<TableInfo>, String> {
+    list_tables_filtered_by_kind(pool, schema, filter, limit, offset, true).await
+}
+
+async fn list_tables_filtered_by_kind(
+    pool: &Pool,
+    schema: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    table_objects_only: bool,
+) -> Result<Vec<TableInfo>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let filter = filter.unwrap_or("").trim();
     let filter_pattern = like_contains_pattern(filter);
@@ -2840,7 +2915,11 @@ pub async fn list_tables_filtered(
     let limit_param = limit.and_then(|value| i64::try_from(value).ok());
     let offset_param = offset.and_then(|value| i64::try_from(value).ok()).unwrap_or(0);
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let sql = postgres_tables_sql(limit_param, offset_param);
+    let sql = if table_objects_only {
+        postgres_table_objects_sql(limit_param, offset_param)
+    } else {
+        postgres_tables_sql(limit_param, offset_param)
+    };
     let params: &[(&(dyn tokio_postgres::types::ToSql + Sync), Type)] =
         &[(&schema, Type::VARCHAR), (&filter_pattern, Type::VARCHAR), (&fuzzy_filter_pattern, Type::VARCHAR)];
     // The pagination literals make this SQL vary by page. Use an unnamed typed
@@ -4030,6 +4109,14 @@ fn postgres_table_comment_sql() -> &'static str {
 }
 
 fn postgres_tables_sql(limit: Option<i64>, offset: i64) -> String {
+    postgres_tables_sql_with_kind(limit, offset, false)
+}
+
+fn postgres_table_objects_sql(limit: Option<i64>, offset: i64) -> String {
+    postgres_tables_sql_with_kind(limit, offset, true)
+}
+
+fn postgres_tables_sql_with_kind(limit: Option<i64>, offset: i64, table_objects_only: bool) -> String {
     // PostgreSQL-compatible servers do not agree on the inferred wire types
     // or accepted expression grammar for LIMIT/OFFSET parameters. These values
     // originate as usize and are converted to non-negative i64 literals.
@@ -4039,6 +4126,7 @@ fn postgres_tables_sql(limit: Option<i64>, offset: i64) -> String {
         Some(limit) => format!("LIMIT {limit} OFFSET {offset}"),
         None => format!("OFFSET {offset}"),
     };
+    let relation_kinds = if table_objects_only { "'r','f','p'" } else { "'r','v','m','f','p'" };
     format!(
         "SELECT c.relname AS table_name, \
          CASE c.relkind WHEN 'r' THEN 'BASE TABLE' WHEN 'v' THEN 'VIEW' \
@@ -4052,7 +4140,7 @@ fn postgres_tables_sql(limit: Option<i64>, offset: i64) -> String {
          LEFT JOIN pg_catalog.pg_inherits i ON i.inhrelid = c.oid \
          LEFT JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
          LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
-         WHERE n.nspname = $1 AND c.relkind IN ('r','v','m','f','p') \
+         WHERE n.nspname = $1 AND c.relkind IN ({relation_kinds}) \
            AND ($2 = '%%' OR c.relname ILIKE $2 OR ($3 <> '' AND c.relname ILIKE $3)) \
          ORDER BY CASE WHEN pc.relkind = 'p' THEN 1 ELSE 0 END, c.relname \
          {pagination}"
@@ -9756,6 +9844,44 @@ mod tests {
         assert_eq!(error, "query inactivity timeout");
     }
 
+    #[tokio::test]
+    async fn postgres_row_query_timeout_covers_stall_after_last_row() {
+        let progress_clock = Arc::new(StreamProgressClock::new());
+        let progress_clock_for_query = progress_clock.clone();
+        let error = await_stream_with_progress_timeout(
+            async move {
+                progress_clock_for_query.mark();
+                std::future::pending::<Result<(), String>>().await
+            },
+            Some(Duration::from_millis(10)),
+            progress_clock,
+            None,
+            "query completion inactivity timeout".to_string(),
+        )
+        .await
+        .expect_err("a stream stalled after its last row should time out");
+
+        assert_eq!(error, "query completion inactivity timeout");
+    }
+
+    #[tokio::test]
+    async fn postgres_row_query_without_timeout_still_honors_cancellation() {
+        let progress_clock = Arc::new(StreamProgressClock::new());
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let error = await_stream_with_progress_timeout(
+            std::future::pending::<Result<(), String>>(),
+            None,
+            progress_clock,
+            Some(&cancel_token),
+            "disabled query timeout".to_string(),
+        )
+        .await
+        .expect_err("cancellation must remain active when query timeout is disabled");
+
+        assert_eq!(error, crate::query::QUERY_CANCELED);
+    }
+
     #[test]
     fn postgres_cancel_context_omits_disabled_ssl_mode() {
         assert!(build_postgres_cancel_context("postgres://localhost/app?sslmode=disable").is_none());
@@ -9829,6 +9955,14 @@ mod tests {
         assert!(sql.contains("VIEW"));
         assert!(sql.contains("MATERIALIZED_VIEW"));
         assert!(sql.contains("FOREIGN TABLE"));
+    }
+
+    #[test]
+    fn postgres_table_objects_sql_excludes_views_before_pagination() {
+        let sql = postgres_table_objects_sql(Some(101), 100);
+
+        assert!(sql.contains("c.relkind IN ('r','f','p')"));
+        assert!(sql.contains("LIMIT 101 OFFSET 100"));
     }
 
     #[test]
