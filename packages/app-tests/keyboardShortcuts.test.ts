@@ -10,6 +10,7 @@ import {
   isCopySidebarSelectionShortcut,
   isExecuteSqlShortcut,
   isEditSidebarConnectionShortcut,
+  isEditTableStructureShortcut,
   isFocusSearchShortcut,
   isModRShortcut,
   isNavigateTabHistoryBackShortcut,
@@ -392,8 +393,9 @@ test("matches Cmd+S for saving", () => {
   assert.equal(isSaveShortcut({ key: "s", metaKey: true }), true);
 });
 
-test("matches Mod+D for copying current row", () => {
-  assert.equal(isCopyCurrentRowShortcut({ key: "d", metaKey: true }), true);
+test("matches Mod+D for editing table structure", () => {
+  assert.equal(isEditTableStructureShortcut({ key: "d", metaKey: true }), true);
+  assert.equal(isCopyCurrentRowShortcut({ key: "d", metaKey: true }), false);
 });
 
 test("matches Delete for deleting current row", () => {

@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   getTablePartitionStatus: vi.fn(),
   getTableOwner: vi.fn(),
   buildTableOwnerChangeSql: vi.fn(),
+  buildMysqlAutoIncrementSql: vi.fn(),
   toast: vi.fn(),
 }));
 
@@ -228,6 +229,7 @@ vi.mock("@/lib/backend/api", () => ({
   listDataTypes: mocks.listDataTypes,
   buildTableStructureChangeSql: mocks.buildTableStructureChangeSql,
   buildTableOwnerChangeSql: mocks.buildTableOwnerChangeSql,
+  buildMysqlAutoIncrementSql: mocks.buildMysqlAutoIncrementSql,
   getTablePartitionStatus: mocks.getTablePartitionStatus,
   getTableOwner: mocks.getTableOwner,
 }));
