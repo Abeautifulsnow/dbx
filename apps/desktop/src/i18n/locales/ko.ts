@@ -5912,6 +5912,7 @@ export default withEnglishFallback({
     shortcutUndo: "실행 취소",
     shortcutRedo: "다시 실행",
     shortcutSelectAll: "모두 선택",
+    shortcutEditTableStructure: "테이블 구조 편집",
     shortcutCopyCurrentRow: "현재 데이터 행 복사",
     shortcutDeleteCurrentRow: "현재 데이터 행 삭제",
     shortcutGoToColumn: "컬럼으로 이동",

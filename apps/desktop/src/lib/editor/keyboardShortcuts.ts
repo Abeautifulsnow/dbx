@@ -203,6 +203,10 @@ export function isCopyCurrentRowShortcut(event: ShortcutLikeEvent, shortcuts?: P
   return matchesShortcut(event, actionShortcut("copyCurrentRow", shortcuts));
 }
 
+export function isEditTableStructureShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
+  return matchesShortcut(event, actionShortcut("editTableStructure", shortcuts, platform), platform);
+}
+
 export function isDeleteCurrentRowShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("deleteCurrentRow", shortcuts));
 }

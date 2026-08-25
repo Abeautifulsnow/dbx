@@ -6530,6 +6530,7 @@ export default {
     shortcutRedo: "Redo",
     shortcutSelectAll: "Select all",
     shortcutExtendSelection: "Extend selection",
+    shortcutEditTableStructure: "Edit table structure",
     shortcutCopyCurrentRow: "Copy current data row",
     shortcutDeleteCurrentRow: "Delete current data row",
     shortcutGoToColumn: "Go to column",

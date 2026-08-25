@@ -28,6 +28,7 @@ export type ShortcutActionId =
   | "lowercaseSelection"
   | "exPasteSqlInCondition"
   | "toggleFold"
+  | "editTableStructure"
   | "copyCurrentRow"
   | "deleteCurrentRow"
   | "goToColumn"
@@ -108,6 +109,7 @@ const PLATFORM_DEFAULT_SHORTCUTS: Partial<Record<ShortcutActionId, ReadonlySet<s
   navigateTabHistoryForward: new Set(["Ctrl+Alt+ArrowRight", "Mod+Alt+ArrowRight"]),
 };
 const LEGACY_CLOSE_TAB_DEFAULT = "Meta+W";
+const LEGACY_COPY_CURRENT_ROW_DEFAULT = "Mod+D";
 const TAB_NAVIGATION_HISTORY_ACTIONS: ShortcutActionId[] = ["navigateTabHistoryBack", "navigateTabHistoryForward"];
 
 export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
@@ -274,10 +276,16 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+.",
   },
   {
+    id: "editTableStructure",
+    labelKey: "settings.shortcutEditTableStructure",
+    scope: "grid",
+    defaultShortcut: "Mod+D",
+  },
+  {
     id: "copyCurrentRow",
     labelKey: "settings.shortcutCopyCurrentRow",
     scope: "grid",
-    defaultShortcut: "Mod+D",
+    defaultShortcut: "",
   },
   {
     id: "deleteCurrentRow",
@@ -590,6 +598,11 @@ export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>, 
       return [definition.id, normalized];
     }),
   ) as ShortcutSettings;
+
+  if (!hasExplicitShortcut(settings, "editTableStructure") && settings?.copyCurrentRow === LEGACY_COPY_CURRENT_ROW_DEFAULT) {
+    normalized.editTableStructure = LEGACY_COPY_CURRENT_ROW_DEFAULT;
+    normalized.copyCurrentRow = "";
+  }
 
   for (const actionId of TAB_NAVIGATION_HISTORY_ACTIONS) {
     if (hasExplicitShortcut(settings, actionId)) continue;

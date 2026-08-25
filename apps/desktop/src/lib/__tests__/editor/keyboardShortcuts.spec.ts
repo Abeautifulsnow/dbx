@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   eventToModifierOnlyShortcut,
   eventToShortcut,
+  isEditTableStructureShortcut,
   isExecuteSqlInNewResultTabShortcut,
   isGoToColumnShortcut,
   isGoToFirstPageShortcut,
@@ -105,6 +106,19 @@ describe("keyboard shortcut matching", () => {
     expect(isGoToColumnShortcut({ key: "g", ctrlKey: true })).toBe(false);
     expect(isGoToColumnShortcut({ key: "g", ctrlKey: true }, { goToColumn: "" })).toBe(false);
     expect(isGoToColumnShortcut({ key: "g", ctrlKey: true, isComposing: true }, { goToColumn: "Mod+G" })).toBe(false);
+  });
+
+  it("matches the edit-table-structure shortcut on Windows and macOS", () => {
+    expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true }, undefined, "Win32")).toBe(true);
+    expect(isEditTableStructureShortcut({ key: "d", metaKey: true }, undefined, "MacIntel")).toBe(true);
+    expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true }, undefined, "MacIntel")).toBe(false);
+  });
+
+  it("honors custom and disabled edit-table-structure shortcuts", () => {
+    expect(isEditTableStructureShortcut({ key: "e", ctrlKey: true, shiftKey: true }, { editTableStructure: "Shift+Mod+E" }, "Win32")).toBe(true);
+    expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true }, { editTableStructure: "Shift+Mod+E" }, "Win32")).toBe(false);
+    expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true }, { editTableStructure: "" }, "Win32")).toBe(false);
+    expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true, isComposing: true }, undefined, "Win32")).toBe(false);
   });
 
   it.each([

@@ -6201,6 +6201,7 @@ export default withEnglishFallback({
     shortcutRedo: "Rehacer",
     shortcutSelectAll: "Seleccionar todo",
     shortcutExtendSelection: "Ampliar selección",
+    shortcutEditTableStructure: "Editar estructura de tabla",
     shortcutCopyCurrentRow: "Copiar fila de datos actual",
     shortcutDeleteCurrentRow: "Eliminar fila de datos actual",
     shortcutGoToColumn: "Ir a la columna",

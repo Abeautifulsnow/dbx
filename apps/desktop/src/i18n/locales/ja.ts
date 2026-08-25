@@ -6215,6 +6215,7 @@ export default withEnglishFallback({
     shortcutRedo: "やり直す",
     shortcutSelectAll: "すべて選択",
     shortcutExtendSelection: "選択範囲を拡張",
+    shortcutEditTableStructure: "テーブル構造を編集",
     shortcutCopyCurrentRow: "現在のデータ行をコピー",
     shortcutDeleteCurrentRow: "現在のデータ行を削除",
     shortcutGoToColumn: "列へ移動",

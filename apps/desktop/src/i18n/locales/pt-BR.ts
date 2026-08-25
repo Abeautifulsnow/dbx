@@ -6203,6 +6203,7 @@ export default withEnglishFallback({
     shortcutRedo: "Refazer",
     shortcutSelectAll: "Selecionar tudo",
     shortcutExtendSelection: "Expandir seleção",
+    shortcutEditTableStructure: "Editar estrutura da tabela",
     shortcutCopyCurrentRow: "Copiar linha de dados atual",
     shortcutDeleteCurrentRow: "Excluir linha de dados atual",
     shortcutGoToColumn: "Ir para a coluna",

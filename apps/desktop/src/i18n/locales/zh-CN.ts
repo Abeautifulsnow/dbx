@@ -6516,6 +6516,7 @@ export default withEnglishFallback({
     shortcutUppercaseSelection: "选中内容转为大写",
     shortcutLowercaseSelection: "选中内容转为小写",
     shortcutExPasteSqlInCondition: "ExPaste：粘贴为 IN 条件",
+    shortcutEditTableStructure: "编辑表结构",
     shortcutCopyCurrentRow: "复制当前数据行",
     shortcutDeleteCurrentRow: "删除当前数据行",
     shortcutGoToColumn: "跳转列",

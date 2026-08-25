@@ -187,6 +187,7 @@ import {
   isCancelSearchShortcut,
   isCopyCurrentRowShortcut,
   isDeleteCurrentRowShortcut,
+  isEditTableStructureShortcut,
   isFocusSearchShortcut,
   isGoToColumnShortcut,
   isGoToFirstPageShortcut,
@@ -9040,6 +9041,12 @@ async function onGridKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
 
   const targetAllowsNativeClipboard = eventTargetAllowsNativeClipboard(event);
+  if (!targetAllowsNativeClipboard && props.context === "table-data" && canOpenTableStructureEditor.value && isEditTableStructureShortcut(event, settingsStore.editorSettings.shortcuts)) {
+    event.preventDefault();
+    event.stopPropagation();
+    openTableStructureEditor();
+    return;
+  }
   if (!targetAllowsNativeClipboard && displayableColumnIndexes.value.length > 0 && isGoToColumnShortcut(event, settingsStore.editorSettings.shortcuts)) {
     event.preventDefault();
     event.stopPropagation();

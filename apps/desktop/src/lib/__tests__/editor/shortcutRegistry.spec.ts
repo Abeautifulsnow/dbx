@@ -83,8 +83,30 @@ describe("shortcutRegistry editor actions", () => {
   it("detects go-to-column conflicts only within the grid scope", () => {
     const shortcuts = normalizeShortcutSettings({ goToColumn: "Mod+D" });
 
-    expect(findShortcutConflict("goToColumn", shortcuts.goToColumn, shortcuts)).toBe("copyCurrentRow");
+    expect(findShortcutConflict("goToColumn", shortcuts.goToColumn, shortcuts)).toBe("editTableStructure");
     expect(findShortcutConflict("goToColumn", "Mod+F", shortcuts)).toBeNull();
+  });
+
+  it("registers edit table structure as the conflict-free default Mod+D grid action", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "editTableStructure");
+
+    expect(definition).toMatchObject({
+      labelKey: "settings.shortcutEditTableStructure",
+      scope: "grid",
+      defaultShortcut: "Mod+D",
+    });
+    expect(DEFAULT_SHORTCUT_SETTINGS.editTableStructure).toBe("Mod+D");
+    expect(DEFAULT_SHORTCUT_SETTINGS.copyCurrentRow).toBe("");
+    expect(findShortcutConflict("editTableStructure", DEFAULT_SHORTCUT_SETTINGS.editTableStructure, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+    expect(findShortcutConflict("duplicateLine", DEFAULT_SHORTCUT_SETTINGS.duplicateLine, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("migrates the legacy copy-row Mod+D default without overwriting explicit shortcuts", () => {
+    expect(normalizeShortcutSettings()).toMatchObject({ editTableStructure: "Mod+D", copyCurrentRow: "" });
+    expect(normalizeShortcutSettings({ copyCurrentRow: "Mod+D" })).toMatchObject({ editTableStructure: "Mod+D", copyCurrentRow: "" });
+    expect(normalizeShortcutSettings({ copyCurrentRow: "Shift+Mod+C" })).toMatchObject({ editTableStructure: "Mod+D", copyCurrentRow: "Shift+Mod+C" });
+    expect(normalizeShortcutSettings({ editTableStructure: "", copyCurrentRow: "Mod+D" })).toMatchObject({ editTableStructure: "", copyCurrentRow: "Mod+D" });
+    expect(normalizeShortcutSettings({ editTableStructure: "Shift+Mod+D", copyCurrentRow: "Mod+D" })).toMatchObject({ editTableStructure: "Shift+Mod+D", copyCurrentRow: "Mod+D" });
   });
 
   it("registers the new-data-tab mouse modifier as a configurable sidebar shortcut", () => {

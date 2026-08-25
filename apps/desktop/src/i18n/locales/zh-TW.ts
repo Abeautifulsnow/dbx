@@ -5508,6 +5508,7 @@ export default withEnglishFallback({
     shortcutRedo: "重做",
     shortcutSelectAll: "全選",
     shortcutExtendSelection: "擴展選取範圍",
+    shortcutEditTableStructure: "編輯資料表結構",
     shortcutCopyCurrentRow: "複製目前資料列",
     shortcutDeleteCurrentRow: "刪除目前資料列",
     shortcutGoToColumn: "跳轉欄",
