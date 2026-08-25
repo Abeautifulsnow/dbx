@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   executeQuery: vi.fn(),
   listDataTypes: vi.fn(),
   buildTableStructureChangeSql: vi.fn(),
+  buildMysqlAutoIncrementSql: vi.fn(),
   updateEditorSettings: vi.fn(),
   loadObjectDdl: vi.fn(),
   invalidateObjectDdl: vi.fn(),
@@ -23,7 +24,6 @@ const mocks = vi.hoisted(() => ({
   getTablePartitionStatus: vi.fn(),
   getTableOwner: vi.fn(),
   buildTableOwnerChangeSql: vi.fn(),
-  buildMysqlAutoIncrementSql: vi.fn(),
   toast: vi.fn(),
 }));
 
@@ -228,8 +228,8 @@ vi.mock("@/lib/backend/api", () => ({
   executeQuery: mocks.executeQuery,
   listDataTypes: mocks.listDataTypes,
   buildTableStructureChangeSql: mocks.buildTableStructureChangeSql,
-  buildTableOwnerChangeSql: mocks.buildTableOwnerChangeSql,
   buildMysqlAutoIncrementSql: mocks.buildMysqlAutoIncrementSql,
+  buildTableOwnerChangeSql: mocks.buildTableOwnerChangeSql,
   getTablePartitionStatus: mocks.getTablePartitionStatus,
   getTableOwner: mocks.getTableOwner,
 }));
