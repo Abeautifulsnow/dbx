@@ -174,6 +174,7 @@ import { buildAiAnalysisExport } from "@/lib/export/aiAnalysisExport";
 import { buildAiConversationSearchIndex, filterAiConversationSearchIndex } from "@/lib/ai/aiConversationSearch";
 import AiAttachmentCard from "@/components/editor/AiAttachmentCard.vue";
 import { resolveAiMessageCopyText } from "@/lib/ai/aiMessageCopy";
+import AiChartRenderer from "@/components/ai/rich/AiChartRenderer.vue";
 
 const { t } = useI18n();
 const settings = useSettingsStore();
@@ -4701,6 +4702,7 @@ async function openExternalUrl(url: string) {
                   <div v-if="seg.type === 'text'" class="ai-markdown whitespace-normal" @click.capture="onMarkdownClick">
                     <div v-html="seg.html" />
                   </div>
+                  <AiChartRenderer v-else-if="seg.type === 'chart'" :spec="seg.spec" />
                   <div v-else class="my-2 overflow-hidden rounded-md border border-zinc-200 bg-zinc-50 dark:border-zinc-700/50 dark:bg-zinc-900">
                     <div class="flex items-center border-b border-zinc-200 px-3 py-1.5 text-[10px] font-medium text-zinc-600 dark:border-zinc-700/50 dark:text-zinc-400">
                       <component :is="seg.isSql ? Database : Terminal" class="h-3 w-3 mr-1.5" />
