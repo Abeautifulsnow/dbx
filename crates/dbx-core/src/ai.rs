@@ -2917,14 +2917,11 @@ fn push_redacted_url(output: &mut String, url: &str) {
     // Only inside it does `@` separate credentials from the host, so scanning
     // the authority first keeps a legitimate `@` in a path untouched.
     let authority_start = url.find("://").map_or(0, |index| index + 3);
-    let authority_end = url[authority_start..]
-        .find(|character| matches!(character, '/' | '?' | '#'))
-        .map_or_else(|| url.len(), |offset| authority_start + offset);
+    let authority_end =
+        url[authority_start..].find(['/', '?', '#']).map_or_else(|| url.len(), |offset| authority_start + offset);
     let authority = &url[authority_start..authority_end];
     let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-    let tail_end = url[authority_end..]
-        .find(|character| matches!(character, '?' | '#'))
-        .map_or_else(|| url.len(), |offset| authority_end + offset);
+    let tail_end = url[authority_end..].find(['?', '#']).map_or_else(|| url.len(), |offset| authority_end + offset);
 
     output.push_str(&url[..authority_start]);
     output.push_str(host);
@@ -5121,7 +5118,7 @@ mod tests {
         ollama_selected_model_tool_support, openai_message_content, openai_response_text, openai_stream_reasoning,
         openai_stream_text, parse_dynamic_effort_capability, parse_gemini_model_list_response,
         parse_model_list_response, parse_retry_after, parse_retry_after_secs, provider_requires_api_key,
-        redact_url_query, resolve_endpoint, resolve_gemini_stream_endpoint, resolve_model_effort_core,
+        redact_secrets, redact_url_query, resolve_endpoint, resolve_gemini_stream_endpoint, resolve_model_effort_core,
         resolve_model_list_endpoint, resolve_ollama_show_endpoint, responses_function_tool,
         responses_max_output_tokens, responses_stream_text, responses_text, responses_token_usage,
         retain_ollama_completion_models, retry_after_secs, set_chat_completion_token_limit, stream, stream_claude,
