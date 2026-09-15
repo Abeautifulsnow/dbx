@@ -7273,6 +7273,7 @@ export default withEnglishFallback({
     shortcutSearchPlaceholder: "Kısayollarda ara",
     shortcutSearchNoResults: "Aramanızla eşleşen kısayol yok.",
     shortcutConflict: "Bu kısayol aynı kapsamdaki başka bir eylemle çakışıyor.",
+    shortcutReserved: "Bu kısayol sistem tarafından ayrılmıştır.",
     shortcutClear: "Kısayolu temizle",
     preview: "Canlı Önizleme",
     previewSyntaxErrorHint: "Salt okunur önizleme. Örnek SQL'deki FOM yazım hatası kasıtlıdır ve sözdizimi hatası vurgulamasını gösterir.",

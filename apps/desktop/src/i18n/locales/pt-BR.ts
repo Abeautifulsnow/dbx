@@ -7078,6 +7078,7 @@ export default withEnglishFallback({
     shortcutSearchPlaceholder: "Pesquisar atalhos",
     shortcutSearchNoResults: "Nenhum atalho corresponde à pesquisa.",
     shortcutConflict: "Este atalho conflita com outra ação no mesmo escopo.",
+    shortcutReserved: "Este atalho é reservado pelo sistema.",
     shortcutClear: "Limpar atalho",
     preview: "Pré-visualização ao vivo",
     previewSyntaxErrorHint: "Pré-visualização somente leitura. O erro FOM no SQL de exemplo é intencional e demonstra o destaque de erros de sintaxe.",

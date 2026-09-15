@@ -7563,6 +7563,7 @@ export default {
     shortcutSearchPlaceholder: "Search shortcuts",
     shortcutSearchNoResults: "No shortcuts match your search.",
     shortcutConflict: "This shortcut conflicts with another action in the same scope.",
+    shortcutReserved: "This shortcut is reserved by the system.",
     shortcutClear: "Clear shortcut",
     preview: "Live Preview",
     previewSyntaxErrorHint: "Read-only preview. The FOM typo in the demo SQL is intentional and demonstrates syntax-error highlighting.",

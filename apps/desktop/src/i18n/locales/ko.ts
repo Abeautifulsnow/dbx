@@ -6847,6 +6847,7 @@ export default withEnglishFallback({
     shortcutSearchPlaceholder: "단축키 검색",
     shortcutSearchNoResults: "검색과 일치하는 단축키가 없습니다.",
     shortcutConflict: "이 단축키는 같은 범위의 다른 작업과 충돌합니다.",
+    shortcutReserved: "이 단축키는 시스템에서 예약되었습니다.",
     shortcutClear: "단축키 지우기",
     preview: "실시간 미리보기",
     previewSyntaxErrorHint: "미리보기는 읽기 전용입니다. 데모 SQL의 FOM 오타는 의도적인 구문 오류이며 오류 강조 표시를 보여줍니다.",

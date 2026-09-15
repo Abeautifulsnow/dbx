@@ -167,7 +167,7 @@ import {
   type WebDavConfig,
 } from "@/lib/backend/api";
 import { eventToModifierOnlyShortcut, eventToShortcut } from "@/lib/editor/keyboardShortcuts";
-import { SHORTCUT_DEFINITIONS, findShortcutConflict, normalizeShortcutSettings, type ShortcutActionId } from "@/lib/editor/shortcutRegistry";
+import { SHORTCUT_DEFINITIONS, findShortcutConflict, isReservedShortcut, normalizeShortcutSettings, type ShortcutActionId } from "@/lib/editor/shortcutRegistry";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { COLUMN_NAME_COPY_SEPARATOR_LABELS, COLUMN_NAME_COPY_SEPARATOR_OPTIONS, isColumnNameCopySeparator, type ColumnNameCopySeparator } from "@/lib/dataGrid/dataGridColumnNameCopy";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebar/sidebarTableNameDisplay";
@@ -1131,6 +1131,13 @@ function onSqlShortcutBindingKeydown(id: string, event: KeyboardEvent) {
   }
   const shortcut = eventToShortcut(event);
   if (!shortcut) return;
+  // macOS 上 ⌘H/⌥⌘H 属于系统 Hide 快捷键（见 MACOS_RESERVED_SHORTCUTS），
+  // 若允许记录并持久化，配置层仍会 preventDefault 并重新劫持它们，因此输入时直接拒绝。
+  if (isReservedShortcut(shortcut)) {
+    toast(t("settings.shortcutReserved"), 3000);
+    editingSqlShortcutInputId.value = null;
+    return;
+  }
   sqlShortcutForm.value = { ...sqlShortcutForm.value, shortcut };
   editingSqlShortcutInputId.value = null;
 }
@@ -2155,6 +2162,14 @@ function onShortcutKeydown(actionId: ShortcutActionId, event: KeyboardEvent) {
   const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === actionId);
   const shortcut = definition?.inputKind === "modifier-only" ? eventToModifierOnlyShortcut(event) : eventToShortcut(event);
   if (!shortcut) return;
+  // macOS 上 ⌘H/⌥⌘H 由系统保留（Hide / Hide Others），配置层一旦绑定并在
+  // CodeMirror 中 preventDefault，AppKit 菜单的 key equivalent 就无法触发
+  // （#9068 的配置层复现），故此处输入时直接拒绝。
+  if (isReservedShortcut(shortcut)) {
+    toast(t("settings.shortcutReserved"), 3000);
+    editingShortcutId.value = null;
+    return;
+  }
   onShortcutChange(actionId, shortcut);
   editingShortcutId.value = null;
 }

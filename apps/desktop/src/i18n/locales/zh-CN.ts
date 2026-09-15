@@ -7539,6 +7539,7 @@ export default withEnglishFallback({
     shortcutSearchPlaceholder: "搜索快捷键",
     shortcutSearchNoResults: "没有匹配的快捷键。",
     shortcutConflict: "这个快捷键与同一作用域内的其他操作冲突。",
+    shortcutReserved: "该快捷键由系统保留，请换一个组合。",
     shortcutClear: "清除快捷键",
     preview: "实时预览",
     previewSyntaxErrorHint: "预览为只读。示例 SQL 中的 FOM 拼写是故意设置的语法错误，用于演示错误高亮效果。",

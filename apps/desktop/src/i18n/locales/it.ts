@@ -7076,6 +7076,7 @@ export default withEnglishFallback({
     shortcutSearchPlaceholder: "Cerca scorciatoie",
     shortcutSearchNoResults: "Nessuna scorciatoia corrisponde alla ricerca.",
     shortcutConflict: "Questa scorciatoia è in conflitto con un'altra azione nello stesso ambito.",
+    shortcutReserved: "Questa scorciatoia è riservata dal sistema.",
     shortcutClear: "Cancella scorciatoia",
     preview: "Anteprima in tempo reale",
     previewSyntaxErrorHint: "Anteprima di sola lettura. L'errore FOM nell'SQL di esempio è intenzionale e mostra l'evidenziazione degli errori di sintassi.",
