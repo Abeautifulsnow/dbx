@@ -1659,6 +1659,11 @@ async function restartDbxForDuckDbIsolation() {
 }
 
 function resetDefaultsForTab(tab: SettingsCategory) {
+  // Restoring defaults exits any in-progress shortcut capture so the affected
+  // rows return to their initial (non-editing) state instead of staying stuck
+  // in edit mode (#9066). Cleared unconditionally because the edit state can
+  // leak across tab switches (shortcuts/formatter tabs share the table).
+  editingShortcutId.value = null;
   if (tab === "editor") {
     editFontFamily.value = DEFAULT_EDITOR_SETTINGS.fontFamily;
     editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
@@ -1787,6 +1792,9 @@ function resetDefaultsForTab(tab: SettingsCategory) {
 }
 
 function resetAllDefaults() {
+  // Same contract as resetDefaultsForTab: a full reset also exits any
+  // in-progress shortcut capture (#9066).
+  editingShortcutId.value = null;
   editFontFamily.value = DEFAULT_EDITOR_SETTINGS.fontFamily;
   editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
   editTableFontFamily.value = DEFAULT_EDITOR_SETTINGS.tableFontFamily;
