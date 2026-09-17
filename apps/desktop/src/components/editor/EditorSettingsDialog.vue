@@ -8315,6 +8315,22 @@ LIMIT 100;</pre
                 </div>
               </div>
 
+              <!-- Default auto intent routing (list mode, global) -->
+              <div v-if="aiConfigListMode === 'list'" class="space-y-3">
+                <Separator />
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="ai-default-auto-routing">
+                      {{ t("ai.defaultAutoRouting") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("ai.defaultAutoRoutingDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="ai-default-auto-routing" :model-value="settingsStore.defaultAutoRouting" @update:model-value="(value) => settingsStore.setDefaultAutoRouting(Boolean(value))" />
+                </div>
+              </div>
+
               <!-- Restore last AI conversation (list mode, global) -->
               <div v-if="aiConfigListMode === 'list'" class="space-y-3">
                 <Separator />

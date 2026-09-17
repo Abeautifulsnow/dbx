@@ -3105,6 +3105,7 @@ export default withEnglishFallback({
       cursorRunFailed: "Cursor CLI 异常退出。请根据错误代码和下方诊断详情确认失败的可执行文件或 CLI 输出。",
     },
     actions: {
+      auto: "自动",
       general: "通用问答",
       generate: "生成 SQL",
       explain: "解释 SQL",
@@ -3116,6 +3117,11 @@ export default withEnglishFallback({
       exploreSchema: "查看表结构",
       executeAndExplain: "执行并解释",
       generateNoExec: "生成但不执行",
+    },
+    routing: {
+      recognizing: "识别中…",
+      chip: "自动 · {action}",
+      switchTo: "切换到{action}",
     },
     placeholders: {
       general: "问我任何问题...",
@@ -3146,6 +3152,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "Agent 回合上限已保存",
     defaultAiMode: "默认 AI 模式",
     defaultAiModeDescription: "新建 AI 对话时使用的模式。切换当前对话的模式不会修改此设置。",
+    defaultAutoRouting: "默认启用自动意图路由",
+    defaultAutoRoutingDescription: "新建 AI 对话时默认选择“自动”操作，发送时由 AI 识别意图并路由到具体操作。不影响当前对话。",
     restoreLastConversation: "打开时恢复最近的 AI 对话",
     restoreLastConversationDescription: "开启后，打开 AI 助手时会加载最近更新的对话，而不是显示空白新对话。",
     promptTemplates: "场景 Prompt 模板",

@@ -2905,6 +2905,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "Limite di turni dell'agente salvato",
     defaultAiMode: "Modalità IA predefinita",
     defaultAiModeDescription: "Modalità usata all'avvio di una nuova conversazione IA. Cambiare modalità nella conversazione corrente non modifica questa impostazione.",
+    defaultAutoRouting: "Routing automatico delle intenzioni predefinito",
+    defaultAutoRoutingDescription: "Avvia le nuove conversazioni IA con l'azione Auto: l'IA rileva l'intento all'invio e lo instrada verso un'azione concreta. Non modifica la conversazione corrente.",
     restoreLastConversation: "Ripristina l'ultima conversazione IA all'apertura",
     restoreLastConversationDescription: "Quando è attiva, l'assistente IA carica la conversazione aggiornata più di recente invece di una conversazione vuota.",
     promptTemplates: "Modelli di prompt per scenario",
@@ -3156,6 +3158,7 @@ export default withEnglishFallback({
       qoderRunFailed: "Qoder CLI è terminato in modo imprevisto. Usa il codice errore e i dettagli seguenti per identificare l'eseguibile o l'output non riuscito.",
     },
     actions: {
+      auto: "Auto",
       general: "Generale",
       generate: "Genera SQL",
       explain: "Spiega SQL",
@@ -3167,6 +3170,11 @@ export default withEnglishFallback({
       exploreSchema: "Ispeziona schema",
       executeAndExplain: "Esegui e spiega",
       generateNoExec: "Genera (senza eseguire)",
+    },
+    routing: {
+      recognizing: "Rilevamento intento…",
+      chip: "Auto · {action}",
+      switchTo: "Passa a {action}",
     },
     placeholders: {
       general: "Chiedi qualsiasi cosa...",

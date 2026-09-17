@@ -3047,6 +3047,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "エージェントターン上限を保存しました",
     defaultAiMode: "既定の AI モード",
     defaultAiModeDescription: "新しい AI 会話を開始するときに使用されるモードです。現在の会話でモードを切り替えてもこの設定は変更されません。",
+    defaultAutoRouting: "自動インテントルーティングを既定で有効化",
+    defaultAutoRoutingDescription: "新しい AI 会話を「自動」アクションで開始します。送信時に AI が意図を判定して具体的なアクションにルーティングします。現在の会話には影響しません。",
     restoreLastConversation: "起動時に最後の AI 会話を復元",
     restoreLastConversationDescription: "有効にすると、AI アシスタントを開いたときに空白の会話ではなく、最後に更新された会話を読み込みます。",
     promptTemplates: "シナリオプロンプトテンプレート",
@@ -3182,6 +3184,7 @@ export default withEnglishFallback({
     anthropicMessagesHint: "Anthropic Messages 互換 API は通常 /v1/messages を使用します。",
     openAiCompatibleEndpointHint: "ほとんどの OpenAI 互換 API は /v1 パスプレフィックスが必要です。",
     actions: {
+      auto: "自動",
       general: "一般的な質問",
       generate: "SQLを生成",
       explain: "SQLを説明",
@@ -3193,6 +3196,11 @@ export default withEnglishFallback({
       exploreSchema: "スキーマを確認",
       executeAndExplain: "実行して解説",
       generateNoExec: "生成のみ（実行しない）",
+    },
+    routing: {
+      recognizing: "意図を判定中…",
+      chip: "自動 · {action}",
+      switchTo: "{action}に切り替え",
     },
     placeholders: {
       general: "何でも聞いてください...",

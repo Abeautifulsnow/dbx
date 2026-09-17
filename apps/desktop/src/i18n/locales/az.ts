@@ -3057,6 +3057,7 @@ export default withEnglishFallback({
       cursorRunFailed: "Cursor CLI gözlənilmədən bağlandı. Problemli icra faylını və ya CLI çıxışını müəyyən etmək üçün aşağıdakı xəta kodundan və diaqnostikadan istifadə edin.",
     },
     actions: {
+      auto: "Avtomatik",
       general: "Ümumi",
       generate: "SQL yarat",
       explain: "SQL-i izah et",
@@ -3068,6 +3069,11 @@ export default withEnglishFallback({
       exploreSchema: "Sxemi yoxla",
       executeAndExplain: "İşlət və izah et",
       generateNoExec: "Yarat (işlətmədən)",
+    },
+    routing: {
+      recognizing: "Niyyət müəyyən edilir…",
+      chip: "Avtomatik · {action}",
+      switchTo: "{action} seçiminə keç",
     },
     placeholders: {
       general: "Mənə istənilən sualı verin...",
@@ -3098,6 +3104,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "Agentin gediş limiti yadda saxlanıldı",
     defaultAiMode: "Standart AI rejimi",
     defaultAiModeDescription: "Yeni AI söhbətinə başlayarkən istifadə olunan rejim. Cari söhbətdə rejimin dəyişdirilməsi bu parametri dəyişmir.",
+    defaultAutoRouting: "Standart olaraq avtomatik niyyət marşrutlaşdırması",
+    defaultAutoRoutingDescription: "Yeni AI söhbətləri Avtomatik seçimi ilə başlayır: AI göndərərkən niyyətinizi müəyyən edib uyğun əməliyyata yönləndirir. Cari söhbətə təsir etmir.",
     restoreLastConversation: "Son AI söhbətini bərpa et",
     restoreLastConversationDescription: "Aktiv olduqda AI köməkçisi açılarkən boş söhbət əvəzinə ən son yenilənmiş söhbət yüklənir.",
     promptTemplates: "Ssenari sorğu şablonları",

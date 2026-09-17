@@ -2985,6 +2985,7 @@ export default withEnglishFallback({
       qoderRunFailed: "Qoder CLI가 예기치 않게 종료되었습니다. 아래 오류 코드와 진단을 사용하여 실패한 실행 파일이나 CLI 출력을 확인하세요.",
     },
     actions: {
+      auto: "자동",
       general: "일반",
       generate: "SQL 생성",
       explain: "SQL 설명",
@@ -2996,6 +2997,11 @@ export default withEnglishFallback({
       exploreSchema: "스키마 검사",
       executeAndExplain: "실행 및 설명",
       generateNoExec: "생성 (실행 안 함)",
+    },
+    routing: {
+      recognizing: "의도 파악 중…",
+      chip: "자동 · {action}",
+      switchTo: "{action}(으)로 전환",
     },
     placeholders: {
       general: "무엇이든 물어보세요...",
@@ -3026,6 +3032,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "에이전트 턴 제한을 저장했습니다",
     defaultAiMode: "기본 AI 모드",
     defaultAiModeDescription: "새 AI 대화를 시작할 때 사용되는 모드입니다. 현재 대화에서 모드를 전환해도 이 설정은 변경되지 않습니다.",
+    defaultAutoRouting: "자동 의도 라우팅 기본 사용",
+    defaultAutoRoutingDescription: "새 AI 대화를 '자동' 선택으로 시작합니다. 전송 시 AI가 의도를 파악해 적절한 기능으로 전환합니다. 현재 대화에는 영향을 주지 않습니다.",
     restoreLastConversation: "열 때 마지막 AI 대화 복원",
     restoreLastConversationDescription: "사용하면 AI 어시스턴트를 열 때 빈 대화 대신 가장 최근에 업데이트된 대화를 불러옵니다.",
     promptTemplates: "시나리오 프롬프트 템플릿",

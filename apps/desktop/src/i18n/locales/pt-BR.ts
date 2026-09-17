@@ -3013,6 +3013,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "Limite de turnos do agente salvo",
     defaultAiMode: "Modo de IA padrão",
     defaultAiModeDescription: "Modo usado ao iniciar uma nova conversa de IA. Alterar o modo na conversa atual não altera esta configuração.",
+    defaultAutoRouting: "Roteamento automático de intenção por padrão",
+    defaultAutoRoutingDescription: "Inicia novas conversas de IA com a ação Automático: a IA detecta sua intenção ao enviar e a direciona para uma ação concreta. Não altera a conversa atual.",
     restoreLastConversation: "Restaurar a última conversa de IA ao abrir",
     restoreLastConversationDescription: "Quando ativado, o assistente de IA carrega a conversa atualizada mais recentemente em vez de uma conversa vazia.",
     promptTemplates: "Modelos de prompt por cenário",
@@ -3158,6 +3160,7 @@ export default withEnglishFallback({
     enableThinkingOff: "Desativado",
     enableThinkingHint: "Esta opção só tem efeito em APIs /chat/completions e modelos compatíveis. Quando desativada, pode reduzir significativamente o uso de tokens, mas a qualidade dos resultados gerados pode diminuir ligeiramente.",
     actions: {
+      auto: "Automático",
       general: "Geral",
       generate: "Gerar SQL",
       explain: "Explicar SQL",
@@ -3169,6 +3172,11 @@ export default withEnglishFallback({
       exploreSchema: "Inspecionar esquema",
       executeAndExplain: "Executar e explicar",
       generateNoExec: "Gerar (sem executar)",
+    },
+    routing: {
+      recognizing: "Detectando intenção…",
+      chip: "Automático · {action}",
+      switchTo: "Mudar para {action}",
     },
     placeholders: {
       general: "Pergunte qualquer coisa...",

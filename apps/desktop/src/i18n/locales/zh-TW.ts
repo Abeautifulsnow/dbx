@@ -2904,6 +2904,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "Agent 回合上限已儲存",
     defaultAiMode: "預設 AI 模式",
     defaultAiModeDescription: "建立新 AI 對話時使用的模式。切換目前對話的模式不會變更此設定。",
+    defaultAutoRouting: "預設啟用自動意圖路由",
+    defaultAutoRoutingDescription: "建立新 AI 對話時預設選擇「自動」動作，傳送時由 AI 辨識意圖並路由到具體動作。不影響目前對話。",
     restoreLastConversation: "開啟時恢復最近的 AI 對話",
     restoreLastConversationDescription: "開啟後，開啟 AI 助手時會載入最近更新的對話，而不是顯示空白新對話。",
     promptTemplates: "場景 Prompt 範本",
@@ -3132,6 +3134,7 @@ export default withEnglishFallback({
       qoderRunFailed: "Qoder CLI 異常結束。請依據錯誤代碼和下方診斷詳情確認失敗的執行檔或 CLI 輸出。",
     },
     actions: {
+      auto: "自動",
       general: "通用問答",
       generate: "產生 SQL",
       explain: "解釋 SQL",
@@ -3143,6 +3146,11 @@ export default withEnglishFallback({
       exploreSchema: "查看資料表結構",
       executeAndExplain: "執行並解釋",
       generateNoExec: "產生但不執行",
+    },
+    routing: {
+      recognizing: "辨識中…",
+      chip: "自動 · {action}",
+      switchTo: "切換為{action}",
     },
     placeholders: {
       general: "問我任何問題...",

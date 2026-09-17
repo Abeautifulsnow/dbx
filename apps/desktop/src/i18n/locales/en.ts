@@ -3191,6 +3191,7 @@ export default {
       cursorRunFailed: "Cursor CLI exited unexpectedly. Use the error code and diagnostics below to identify the failing executable or CLI output.",
     },
     actions: {
+      auto: "Auto",
       general: "General",
       generate: "Generate SQL",
       explain: "Explain SQL",
@@ -3202,6 +3203,11 @@ export default {
       exploreSchema: "Inspect Schema",
       executeAndExplain: "Run & Explain",
       generateNoExec: "Generate (no run)",
+    },
+    routing: {
+      recognizing: "Detecting intent…",
+      chip: "Auto · {action}",
+      switchTo: "Switch to {action}",
     },
     placeholders: {
       general: "Ask me anything...",
@@ -3232,6 +3238,8 @@ export default {
     maxAgentTurnsSaved: "Agent turn limit saved",
     defaultAiMode: "Default AI Mode",
     defaultAiModeDescription: "Mode used when starting a new AI conversation. Switching mode in the current conversation does not change this setting.",
+    defaultAutoRouting: "Auto Intent Routing by Default",
+    defaultAutoRoutingDescription: "Start new AI conversations with the Auto action: the assistant detects your intent at send time and routes it to a concrete action. Does not change the current conversation.",
     restoreLastConversation: "Restore last AI conversation",
     restoreLastConversationDescription: "When enabled, opening the AI assistant loads the most recently updated conversation instead of a blank one.",
     promptTemplates: "Scenario Prompt Templates",

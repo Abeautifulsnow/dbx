@@ -3011,6 +3011,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "Límite de turnos del agente guardado",
     defaultAiMode: "Modo de IA predeterminado",
     defaultAiModeDescription: "Modo usado al iniciar una nueva conversación de IA. Cambiar de modo en la conversación actual no modifica esta configuración.",
+    defaultAutoRouting: "Enrutamiento de intención automático por defecto",
+    defaultAutoRoutingDescription: "Inicia nuevas conversaciones de IA con la acción Auto: la IA detecta tu intención al enviar y la dirige a una acción concreta. No cambia la conversación actual.",
     restoreLastConversation: "Restaurar la última conversación de IA al abrir",
     restoreLastConversationDescription: "Al activarlo, el asistente de IA carga la conversación actualizada más recientemente en lugar de una conversación en blanco.",
     promptTemplates: "Plantillas de prompt por escenario",
@@ -3158,6 +3160,7 @@ export default withEnglishFallback({
     codexCliPath: "Ruta de Codex CLI",
     codexCliPathHint: "Déjalo vacío para usar codex desde PATH. Inicia sesión por separado con codex login.",
     actions: {
+      auto: "Auto",
       general: "General",
       generate: "Generar SQL",
       explain: "Explicar SQL",
@@ -3169,6 +3172,11 @@ export default withEnglishFallback({
       exploreSchema: "Inspeccionar esquema",
       executeAndExplain: "Ejecutar y explicar",
       generateNoExec: "Generar (sin ejecutar)",
+    },
+    routing: {
+      recognizing: "Detectando intención…",
+      chip: "Auto · {action}",
+      switchTo: "Cambiar a {action}",
     },
     placeholders: {
       general: "Pregunta lo que quieras...",
