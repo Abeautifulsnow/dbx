@@ -193,6 +193,8 @@ export default withEnglishFallback({
     pluginHomepage: "ホームページ",
     marketplaceStatus: { install: "インストール", installed: "インストール済み", update: "更新", unsupported: "非対応" },
     updateSuccess: "{name} を {version} に更新しました",
+    pinPlugin: "プラグインをピン留め",
+    unpinPlugin: "ピン留めを解除",
     noInstalledPlugins: "プラグインはまだありません",
     browseMarketplace: "マーケットプレイスを見る",
     localInstallTitle: "プラグインパッケージをインストール",

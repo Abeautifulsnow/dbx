@@ -118,6 +118,8 @@ export default withEnglishFallback({
     updateBlockedByConnections: "请先关闭以下连接后再更新或回滚插件：{labels}",
     updateBlockedByOperations: "该插件仍有操作正在执行，请等待完成后再更新或回滚。",
     updateInProgress: "该插件正在更新，请等待完成后重试。",
+    pinPlugin: "置顶插件",
+    unpinPlugin: "取消置顶",
     noInstalledPlugins: "尚未安装插件",
     browseMarketplace: "浏览插件商店",
     localInstallTitle: "安装插件包",

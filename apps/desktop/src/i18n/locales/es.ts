@@ -193,6 +193,8 @@ export default withEnglishFallback({
     pluginHomepage: "Página principal",
     marketplaceStatus: { install: "Instalar", installed: "Instalado", update: "Actualizar", unsupported: "No compatible" },
     updateSuccess: "Se actualizó {name} a {version}",
+    pinPlugin: "Fijar plugin",
+    unpinPlugin: "Quitar fijación",
     noInstalledPlugins: "No hay plugins instalados",
     browseMarketplace: "Explorar Marketplace",
     localInstallTitle: "Instalar un paquete de plugin",

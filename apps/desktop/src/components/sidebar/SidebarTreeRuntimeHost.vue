@@ -2631,6 +2631,16 @@ async function compileDamengView() {
     if (!executed) return;
     toast(t("contextMenu.compileObjectSuccess", { name: node.label }), 3000);
     await connectionStore.refreshObjectListTreeNode(node.connectionId, node.database, node.schema);
+    window.dispatchEvent(
+      new CustomEvent("dbx-refresh-object-browser", {
+        detail: {
+          connectionId: node.connectionId,
+          database: node.database,
+          schema: node.schema,
+          catalog: node.catalog,
+        },
+      }),
+    );
   } catch (e: any) {
     compileErrorTitle.value = t("contextMenu.compileObjectFailedTitle");
     compileErrorMessage.value = t("contextMenu.compileObjectFailedMessage", { name: node.label, message: e?.message || String(e) });

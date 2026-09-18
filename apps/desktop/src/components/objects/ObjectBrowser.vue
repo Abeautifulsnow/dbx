@@ -3102,7 +3102,11 @@ function clearObjectSearch() {
   getSearchInput()?.focus();
 }
 
-defineExpose({ focusSearch, refresh });
+function matchesRefreshScope(scope: { schema?: string; catalog?: string }): boolean {
+  return (selectedSchema.value || "") === (scope.schema || "") && (props.catalog || "") === (scope.catalog || "");
+}
+
+defineExpose({ focusSearch, refresh, matchesRefreshScope });
 
 onBeforeUnmount(() => {
   objectBrowserRowsLoadGuard.invalidate();

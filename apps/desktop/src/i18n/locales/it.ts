@@ -192,6 +192,8 @@ export default withEnglishFallback({
     pluginHomepage: "Sito web",
     marketplaceStatus: { install: "Installa", installed: "Installato", update: "Aggiorna", unsupported: "Non supportato" },
     updateSuccess: "{name} aggiornato alla versione {version}",
+    pinPlugin: "Fissa il plugin",
+    unpinPlugin: "Togli fissaggio",
     noInstalledPlugins: "Nessun plugin installato",
     browseMarketplace: "Sfoglia Marketplace",
     localInstallTitle: "Installa un pacchetto plugin",

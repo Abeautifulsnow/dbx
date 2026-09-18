@@ -197,6 +197,8 @@ export default withEnglishFallback({
       unsupported: "지원되지 않음",
     },
     updateSuccess: "{name} 업데이트 완료: {version}",
+    pinPlugin: "플러그인 고정",
+    unpinPlugin: "고정 해제",
     noInstalledPlugins: "설치된 플러그인이 없습니다",
     browseMarketplace: "마켓플레이스 둘러보기",
     localInstallTitle: "플러그인 패키지 설치",

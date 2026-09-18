@@ -198,6 +198,8 @@ export default {
     updateBlockedByConnections: "Close these connections before updating or rolling back the plugin: {labels}",
     updateBlockedByOperations: "Wait for this plugin's active operations to finish before updating or rolling back.",
     updateInProgress: "This plugin is being updated. Try again after the update finishes.",
+    pinPlugin: "Pin plugin",
+    unpinPlugin: "Unpin plugin",
     noInstalledPlugins: "No plugins installed",
     browseMarketplace: "Browse Marketplace",
     localInstallTitle: "Install a plugin package",

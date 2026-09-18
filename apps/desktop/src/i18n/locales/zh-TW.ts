@@ -196,6 +196,8 @@ export default withEnglishFallback({
     updateBlockedByConnections: "請先關閉以下連線後再更新或回復外掛：{labels}",
     updateBlockedByOperations: "此外掛仍有操作正在執行，請等待完成後再更新或回復。",
     updateInProgress: "此外掛正在更新，請等待完成後重試。",
+    pinPlugin: "置頂外掛程式",
+    unpinPlugin: "取消置頂",
     noInstalledPlugins: "尚未安裝外掛",
     browseMarketplace: "瀏覽外掛商店",
     localInstallTitle: "安裝外掛套件",
