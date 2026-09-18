@@ -36,6 +36,14 @@ const MAX_ALLOWED_ROWS: usize = 100;
 /// fetch ceiling (`dbx_drivers::execution::MAX_ROWS = 10000`).
 pub const MAX_EXECUTE_QUERY_ROWS: usize = 1_000;
 
+/// The published "up to `MAX_EXECUTE_QUERY_ROWS` rows" contract only holds while this
+/// ceiling stays below what the driver will actually fetch. If the agent ceiling ever met
+/// or exceeded the driver ceiling, a large `max_rows` request would come back truncated by
+/// the driver instead of by our own cap, and the tool description would be a lie.
+///
+/// Asserted at compile time so it cannot be silently dropped.
+const _: () = assert!(MAX_EXECUTE_QUERY_ROWS < dbx_drivers::execution::MAX_ROWS);
+
 /// Default string-cell character budget for AI and local MCP query results.
 const DEFAULT_QUERY_CELL_CHAR_LIMIT: usize = 200;
 
@@ -1411,16 +1419,6 @@ mod tests {
         // MongoDB keeps its own, narrower ceiling.
         assert_eq!(execute_query_row_limit(Some(500), &DatabaseType::MongoDb), MAX_ALLOWED_ROWS);
         assert_eq!(execute_query_row_limit(None, &DatabaseType::MongoDb), EXECUTE_QUERY_LIMIT);
-    }
-
-    #[test]
-    fn max_execute_query_rows_stays_below_the_driver_fetch_ceiling() {
-        // The published "up to MAX_EXECUTE_QUERY_ROWS rows" contract only holds while
-        // this ceiling stays below what the driver will actually fetch. If the agent
-        // ceiling ever met or exceeded the driver ceiling, a large `max_rows` request
-        // would silently come back truncated by the driver instead of by our own cap,
-        // and the tool description would be a lie.
-        assert!(MAX_EXECUTE_QUERY_ROWS < dbx_drivers::execution::MAX_ROWS);
     }
 
     #[test]
