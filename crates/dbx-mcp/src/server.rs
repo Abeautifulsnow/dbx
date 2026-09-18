@@ -1951,9 +1951,9 @@ fn mcp_sql_activity_kind(sql: &str, database_type: DatabaseType) -> &'static str
         .into_iter()
         .filter_map(|statement| classify_sql_risk_for_database(&statement, database_type).ok())
         .collect::<Vec<_>>();
-    if risks.iter().any(|risk| *risk == SqlRisk::Ddl) {
+    if risks.contains(&SqlRisk::Ddl) {
         "schema_change"
-    } else if risks.iter().any(|risk| *risk == SqlRisk::Write) {
+    } else if risks.contains(&SqlRisk::Write) {
         "data_change"
     } else {
         "query"
