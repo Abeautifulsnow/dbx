@@ -4112,6 +4112,7 @@ mod tests {
             database: None,
             sql: sql.to_string(),
             session_id: None,
+            max_rows: None,
             cell_char_offset: None,
             cell_char_limit: None,
         };
