@@ -108,6 +108,7 @@ const COLLECTION_METHODS = [
   { label: "createIndex", detail: "Create an index", apply: "createIndex({ ${field}: 1 })" },
   { label: "dropIndex", detail: "Drop one index", apply: 'dropIndex("${indexName}")' },
   { label: "dropIndexes", detail: "Drop collection indexes", apply: "dropIndexes()" },
+  { label: "renameCollection", detail: "Rename the collection", apply: 'renameCollection("${newName}")' },
   { label: "drop", detail: "Drop the collection", apply: "drop()" },
 ] as const;
 
@@ -136,6 +137,7 @@ const COLLECTION_METHOD_BOOST: Record<(typeof COLLECTION_METHODS)[number]["label
   dataSize: 75,
   storageSize: 70,
   totalIndexSize: 65,
+  renameCollection: 55,
   dropIndex: 50,
   dropIndexes: 45,
   drop: 30,
@@ -145,8 +147,11 @@ const COLLECTION_METHOD_BOOST: Record<(typeof COLLECTION_METHODS)[number]["label
 const DATABASE_METHODS = [
   { label: "getCollection", detail: "Reference a collection by name", apply: 'getCollection("${}")' },
   { label: "version", detail: "Show the MongoDB server version", apply: "version()" },
+  { label: "getSiblingDB", detail: "Run the next command against another database", apply: 'getSiblingDB("${database}")' },
   { label: "stats", detail: "Show database statistics", apply: "stats()" },
   { label: "serverStatus", detail: "Show server status", apply: "serverStatus()" },
+  { label: "createCollection", detail: "Create a collection", apply: 'createCollection("${name}")' },
+  { label: "dropDatabase", detail: "Drop the current database", apply: "dropDatabase()" },
 ] as const;
 
 const CURSOR_METHODS = [
