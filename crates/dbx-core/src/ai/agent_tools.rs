@@ -27,8 +27,14 @@ const SAMPLE_DATA_LIMIT: usize = 20;
 /// Maximum number of rows returned by browse_collection tool.
 const BROWSE_COLLECTION_LIMIT: usize = 20;
 
-/// Absolute maximum rows any query tool may request.
+/// Absolute maximum rows requested by the sampling tools (get_sample_data,
+/// browse_collection) and by execute_query on MongoDB shell commands.
 const MAX_ALLOWED_ROWS: usize = 100;
+
+/// Absolute maximum rows `execute_query` may request on SQL connections.
+/// MCP publishes this as the `max_rows` tool parameter; kept below the driver
+/// fetch ceiling (`dbx_drivers::execution::MAX_ROWS = 10000`).
+pub const MAX_EXECUTE_QUERY_ROWS: usize = 1_000;
 
 /// Default string-cell character budget for AI and local MCP query results.
 const DEFAULT_QUERY_CELL_CHAR_LIMIT: usize = 200;
@@ -129,6 +135,15 @@ impl QueryCellWindow {
 
 fn bounded_query_cell_option(value: Option<u64>, default: usize, maximum: usize) -> usize {
     value.map(|value| value.min(maximum as u64) as usize).unwrap_or(default)
+}
+
+/// Resolve the row cap for execute_query. Splitting by db_type is deliberate:
+/// SQL connections may go up to MAX_EXECUTE_QUERY_ROWS, while the MongoDB shell
+/// path keeps MAX_ALLOWED_ROWS, so widening the SQL ceiling does not also
+/// widen what a Mongo command can return.
+fn execute_query_row_limit(requested: Option<usize>, db_type: &DatabaseType) -> usize {
+    let ceiling = if *db_type == DatabaseType::MongoDb { MAX_ALLOWED_ROWS } else { MAX_EXECUTE_QUERY_ROWS };
+    requested.map(|rows| rows.min(ceiling)).unwrap_or(EXECUTE_QUERY_LIMIT.min(ceiling))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -441,7 +456,7 @@ fn execute_query_tool(sql_permissions: AgentSqlPermissions) -> ToolDefinition {
     } else if sql_permissions.allow_writes {
         "Execute SQL after the user explicitly confirmed this operation. Read queries and non-DDL writes are allowed for this run."
     } else {
-        "Execute a read-only SQL query and return results (max 50 rows). Cross-database reads may use fully qualified names such as database.table (or database.schema.table for SQL Server) without switching the current database. This run cannot execute writes or DDL because no specific SQL has been confirmed yet; this does not mean the database itself is read-only. When the user requests a write, first propose the exact SQL in one ```sql code block and ask for confirmation. After confirmation, DBX starts a new run that can execute only that exact SQL. Only SELECT, WITH, SHOW, DESCRIBE, EXPLAIN statements may be executed in this run."
+        "Execute a read-only SQL query and return results (default 50 rows, up to 1000 with the limit argument). Cross-database reads may use fully qualified names such as database.table (or database.schema.table for SQL Server) without switching the current database. This run cannot execute writes or DDL because no specific SQL has been confirmed yet; this does not mean the database itself is read-only. When the user requests a write, first propose the exact SQL in one ```sql code block and ask for confirmation. After confirmation, DBX starts a new run that can execute only that exact SQL. Only SELECT, WITH, SHOW, DESCRIBE, EXPLAIN statements may be executed in this run."
     };
     ToolDefinition {
         name: "execute_query",
@@ -455,7 +470,9 @@ fn execute_query_tool(sql_permissions: AgentSqlPermissions) -> ToolDefinition {
                 },
                 "limit": {
                     "type": "number",
-                    "description": "Max rows to return (default 50, max 100)"
+                    "minimum": 1,
+                    "maximum": MAX_EXECUTE_QUERY_ROWS,
+                    "description": format!("Max rows to return (default {EXECUTE_QUERY_LIMIT}, max {MAX_EXECUTE_QUERY_ROWS})")
                 },
                 "cell_char_offset": {
                     "type": "integer",
@@ -840,12 +857,8 @@ async fn execute_execute_query(
         return Err("SQL query cannot be empty".to_string());
     }
 
-    let limit = tool_call
-        .arguments
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|l| (l as usize).min(MAX_ALLOWED_ROWS))
-        .unwrap_or(EXECUTE_QUERY_LIMIT);
+    let limit =
+        execute_query_row_limit(tool_call.arguments.get("limit").and_then(|v| v.as_u64()).map(|l| l as usize), db_type);
     let cell_window = QueryCellWindow::from_arguments(&tool_call.arguments);
 
     if *db_type == DatabaseType::MongoDb {
@@ -988,9 +1001,18 @@ pub fn format_query_result_as_text(
         lines.push(format!("| {} |", cells.join(" | ")));
     }
 
-    // Truncation notice
+    // Truncation notice. `truncated` is not only a row-cap signal: a driver-side
+    // size budget (e.g. the SQLite worker's blob/response limits) raises it
+    // before `limit` rows come back, so only claim the row cap when the returned
+    // rows actually reach it. The remedy differs — raising the limit helps in one
+    // case and does nothing in the other — so the notice never states one.
     if result.truncated || result.rows.len() >= limit {
-        lines.push(format!("... (showing {} rows, result may be truncated)", result.rows.len()));
+        let detail = if result.rows.len() >= limit {
+            format!("the {limit}-row cap was reached — the result may be truncated")
+        } else {
+            format!("the result was truncated by a driver size limit, not the {limit}-row cap")
+        };
+        lines.push(format!("... (showing {} rows; {detail})", result.rows.len()));
     }
 
     // Stats line
@@ -1376,6 +1398,51 @@ async fn resolve_chroma_collection_uuid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execute_query_row_limit_splits_sql_and_mongo_ceilings() {
+        // No explicit limit keeps the historical default.
+        assert_eq!(execute_query_row_limit(None, &DatabaseType::Postgres), EXECUTE_QUERY_LIMIT);
+        // SQL connections may go up to the published ceiling.
+        assert_eq!(execute_query_row_limit(Some(500), &DatabaseType::Postgres), 500);
+        assert_eq!(execute_query_row_limit(Some(100_000), &DatabaseType::Postgres), MAX_EXECUTE_QUERY_ROWS);
+        // 0 keeps today's pass-through behaviour (the MCP layer clamps to 1).
+        assert_eq!(execute_query_row_limit(Some(0), &DatabaseType::Postgres), 0);
+        // MongoDB keeps its own, narrower ceiling.
+        assert_eq!(execute_query_row_limit(Some(500), &DatabaseType::MongoDb), MAX_ALLOWED_ROWS);
+        assert_eq!(execute_query_row_limit(None, &DatabaseType::MongoDb), EXECUTE_QUERY_LIMIT);
+    }
+
+    #[test]
+    fn max_execute_query_rows_stays_below_the_driver_fetch_ceiling() {
+        // The published "up to MAX_EXECUTE_QUERY_ROWS rows" contract only holds while
+        // this ceiling stays below what the driver will actually fetch. If the agent
+        // ceiling ever met or exceeded the driver ceiling, a large `max_rows` request
+        // would silently come back truncated by the driver instead of by our own cap,
+        // and the tool description would be a lie.
+        assert!(MAX_EXECUTE_QUERY_ROWS < dbx_drivers::execution::MAX_ROWS);
+    }
+
+    #[test]
+    fn execute_query_tool_schema_publishes_the_sql_row_ceiling_only() {
+        let tool = |db_type| {
+            all_tools(db_type, AgentSqlPermissions::default())
+                .into_iter()
+                .find(|tool| tool.name == "execute_query")
+                .expect("execute_query must be registered for this database type")
+        };
+
+        // The published SQL schema must track the single ceiling constant, or the
+        // model would be told a bound the backend does not enforce.
+        assert_eq!(
+            tool(DatabaseType::Postgres).parameters["properties"]["limit"]["maximum"].as_u64(),
+            Some(MAX_EXECUTE_QUERY_ROWS as u64)
+        );
+        // The MongoDB variant has its own tool definition and must stay at 100.
+        let mongo_limit = &tool(DatabaseType::MongoDb).parameters["properties"]["limit"];
+        assert_eq!(mongo_limit["maximum"].as_u64(), None);
+        assert!(mongo_limit["description"].as_str().unwrap_or_default().contains("max 100"));
+    }
 
     #[test]
     fn agent_query_timeout_resolves_by_precedence() {
@@ -1846,6 +1913,32 @@ for line in sys.stdin:
             QueryCellWindow::from_options(Some(1_000_001), Some(u64::MAX)),
             QueryCellWindow { offset: 1_000_000, limit: 4_000 }
         );
+    }
+
+    #[test]
+    fn query_result_formatter_only_claims_the_row_cap_when_it_was_reached() {
+        let row = vec![vec![serde_json::json!(1)]];
+
+        // Returned rows reach the cap: the notice names the effective cap so the
+        // model can connect it to the tool's limit argument.
+        let at_cap = query_result(vec!["id"], row.clone(), 0);
+        let output = format_query_result_as_text(&at_cap, 1, QueryCellWindow::default()).unwrap();
+        assert!(
+            output.contains("... (showing 1 rows; the 1-row cap was reached — the result may be truncated)"),
+            "unexpected notice: {output}"
+        );
+
+        // `truncated` without reaching the cap comes from a driver size budget
+        // (SQLite worker blobs / response size). It must not claim the row cap,
+        // because raising the limit would not return the missing rows.
+        let mut size_limited = query_result(vec!["id"], row, 0);
+        size_limited.truncated = true;
+        let output = format_query_result_as_text(&size_limited, 100, QueryCellWindow::default()).unwrap();
+        assert!(
+            output.contains("the result was truncated by a driver size limit, not the 100-row cap"),
+            "unexpected notice: {output}"
+        );
+        assert!(!output.contains("cap was reached"), "a size truncation must not claim the row cap: {output}");
     }
 
     #[test]

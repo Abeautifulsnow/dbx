@@ -13,7 +13,9 @@ use crate::backend::{format_query_result, new_connection_config, parse_database_
 use crate::mongo::{self, MongoCommand, MongoSafetyError};
 use crate::session::{McpSession, McpSessionStore};
 use dbx_core::{
-    agent_tools::{format_query_result_as_text, normalize_sql_for_confirmation, QueryCellWindow},
+    agent_tools::{
+        format_query_result_as_text, normalize_sql_for_confirmation, QueryCellWindow, MAX_EXECUTE_QUERY_ROWS,
+    },
     database_manifest,
     db::redis_driver::{classify_command, parse_command_argv, RedisCommandResult, RedisCommandSafety},
     models::connection::DatabaseType,
@@ -133,6 +135,11 @@ pub struct ExecuteQueryRequest {
     )]
     #[schemars(extend("type" = "integer"))]
     pub cell_char_limit: Option<u64>,
+    #[schemars(
+        description = "Maximum rows returned for this call (default 100, max 1000; larger values are clamped). SQL connections only - MongoDB shell commands always return at most 100 rows, and multi-statement scripts routed to the batch executor return at most 100 rows per statement."
+    )]
+    #[schemars(extend("type" = "integer"))]
+    pub max_rows: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -605,7 +612,7 @@ impl DbxMcpServer {
 
     #[tool(
         name = "dbx_execute_query",
-        description = "Execute a SQL query on a database connection (max 100 rows returned). For backwards compatibility, multi-statement scripts and stored-procedure scripts are routed through the dialect-aware batch executor."
+        description = "Execute a SQL query on a database connection (default 100 rows; pass max_rows to return up to 1000 rows; larger values are clamped; MongoDB shell commands and multi-statement scripts routed through the batch executor stay at 100 rows). For backwards compatibility, multi-statement scripts and stored-procedure scripts are routed through the dialect-aware batch executor."
     )]
     async fn execute_query(&self, Parameters(request): Parameters<ExecuteQueryRequest>) -> CallToolResult {
         if let Err(error) = self.ensure_tool_allowed("dbx_execute_query").await {
@@ -687,6 +694,9 @@ impl DbxMcpServer {
             }
         }
         if connection.db_type == DatabaseType::MongoDb {
+            // max_rows is deliberately ignored here: MongoDB shell commands
+            // always return at most 100 rows, and this branch returns before the
+            // arguments below are built.
             let command = match validate_mongo_command_with_groups(
                 connection,
                 &resolved.policy,
@@ -729,7 +739,8 @@ impl DbxMcpServer {
             Ok(permissions) => permissions,
             Err(error) => return error,
         };
-        let mut arguments = json!({ "sql": request.sql, "limit": 100 });
+        let max_rows = request.max_rows.map(|value| value.clamp(1, MAX_EXECUTE_QUERY_ROWS as u64)).unwrap_or(100);
+        let mut arguments = json!({ "sql": request.sql, "limit": max_rows });
         if let Some(schema) = self.scope.schema.as_deref() {
             arguments["schema"] = json!(schema);
         }
@@ -1861,9 +1872,9 @@ fn sql_requires_batch_execution(sql: &str, database_type: DatabaseType) -> bool 
     dbx_core::sql::sql_execution_plan_for_database(sql, database_type).statements.len() > 1
 }
 
-/// Maximum rows returned per statement in a `dbx_execute_batch` call, matching
-/// the `dbx_execute_query` "at most 100 rows" contract so batch responses stay
-/// bounded.
+/// Maximum rows returned per statement in a `dbx_execute_batch` call. The batch
+/// executor is deliberately tighter than dbx_execute_query's default: a script
+/// has many statements, so its row budget multiplies.
 const BATCH_MAX_ROWS: usize = 100;
 
 /// Render a multi-statement batch result as one Markdown text block per
@@ -2930,7 +2941,7 @@ mod tests {
             ("dbx_describe_table", &["database", "schema"]),
             ("dbx_list_routines", &["database", "schema", "routine_type"]),
             ("dbx_get_routine_source", &["database", "schema", "signature"]),
-            ("dbx_execute_query", &["database", "session_id", "cell_char_offset", "cell_char_limit"]),
+            ("dbx_execute_query", &["database", "session_id", "cell_char_offset", "cell_char_limit", "max_rows"]),
             ("dbx_execute_batch", &["database", "session_id", "continue_on_error", "use_transaction"]),
             ("dbx_open_session", &["database"]),
             ("dbx_open_table", &["database", "schema"]),
@@ -2987,10 +2998,14 @@ mod tests {
 
         assert!(omitted.selector.connection_id.is_none());
         assert!(omitted.selector.connection_name.is_none());
+        assert!(omitted.max_rows.is_none());
         assert!(explicit_nulls.selector.connection_id.is_none());
         assert!(explicit_nulls.selector.connection_name.is_none());
         assert_eq!(by_name.selector.connection_name.as_deref(), Some("test_conn"));
         assert_eq!(by_id.selector.connection_id.as_deref(), Some("123e4567-e89b-12d3-a456-426614174000"));
+
+        let with_max_rows: ExecuteQueryRequest = serde_json::from_str(r#"{"sql":"SELECT 1","max_rows":500}"#).unwrap();
+        assert_eq!(with_max_rows.max_rows, Some(500));
 
         let nested = serde_json::from_str::<ExecuteQueryRequest>(
             r#"{"connection_name":{"tool":"dbx_dbx_execute_query","error":"Invalid input"},"sql":"SELECT 1"}"#,
@@ -3225,6 +3240,7 @@ mod tests {
                 session_id: None,
                 cell_char_offset: None,
                 cell_char_limit: None,
+                max_rows: None,
             }))
             .await;
         assert_eq!(result_text(&show_databases), "- aa\n- aaa\n- abc");
@@ -3519,6 +3535,7 @@ mod tests {
                 session_id: Some(session_id.clone()),
                 cell_char_offset: None,
                 cell_char_limit: None,
+                max_rows: None,
             }))
             .await;
         assert_eq!(result_text(&result), "ok");
@@ -3538,6 +3555,7 @@ mod tests {
                 session_id: Some(session_id.clone()),
                 cell_char_offset: None,
                 cell_char_limit: None,
+                max_rows: None,
             }))
             .await;
         assert!(result_text(&mismatch).contains("SESSION_DATABASE_MISMATCH"));
@@ -3556,6 +3574,7 @@ mod tests {
                 session_id: Some(session_id.clone()),
                 cell_char_offset: None,
                 cell_char_limit: None,
+                max_rows: None,
             }))
             .await;
         assert!(result_text(&missing).contains("SESSION_NOT_FOUND"));
@@ -3578,6 +3597,7 @@ mod tests {
                 session_id: None,
                 cell_char_offset: Some(200),
                 cell_char_limit: Some(800),
+                max_rows: None,
             }))
             .await;
 
@@ -3586,6 +3606,38 @@ mod tests {
         let (_, arguments) = recorded.iter().find(|(name, _)| name == "execute_query").unwrap();
         assert_eq!(arguments["cell_char_offset"], 200);
         assert_eq!(arguments["cell_char_limit"], 800);
+    }
+
+    #[tokio::test]
+    async fn execute_query_forwards_and_clamps_max_rows() {
+        let elasticsearch = connection("esm", "esm", "elasticsearch", "");
+        let backend = Arc::new(FakeBackend { connections: vec![elasticsearch], ..Default::default() });
+        let server = DbxMcpServer::with_runtime_options(backend.clone(), McpScope::default(), false);
+
+        for max_rows in [None, Some(500), Some(100_000), Some(0)] {
+            let result = server
+                .execute_query(Parameters(ExecuteQueryRequest {
+                    selector: selector("esm"),
+                    database: None,
+                    sql: "GET /logs/_search".to_string(),
+                    session_id: None,
+                    cell_char_offset: None,
+                    cell_char_limit: None,
+                    max_rows,
+                }))
+                .await;
+            assert_eq!(result_text(&result), "ok");
+        }
+
+        let recorded = backend.recorded_arguments.lock().unwrap();
+        let limits = recorded
+            .iter()
+            .filter(|(name, _)| name == "execute_query")
+            .map(|(_, arguments)| arguments["limit"].as_u64().expect("limit should be published"))
+            .collect::<Vec<_>>();
+        // Omitted keeps the historical 100-row default; explicit values are clamped
+        // into 1..=MAX_EXECUTE_QUERY_ROWS rather than rejected.
+        assert_eq!(limits, vec![100, 500, MAX_EXECUTE_QUERY_ROWS as u64, 1]);
     }
 
     #[tokio::test]
@@ -3607,6 +3659,7 @@ mod tests {
                     session_id: Some(session_id.clone()),
                     cell_char_offset: None,
                     cell_char_limit: None,
+                    max_rows: None,
                 }))
                 .await;
             assert_eq!(result_text(&result), "ok");
@@ -3644,6 +3697,7 @@ mod tests {
                 session_id: Some(session_id.clone()),
                 cell_char_offset: None,
                 cell_char_limit: None,
+                max_rows: None,
             }))
             .await;
         assert_eq!(result_text(&query), "ok");
@@ -3660,6 +3714,7 @@ mod tests {
                 session_id: Some(session_id.clone()),
                 cell_char_offset: None,
                 cell_char_limit: None,
+                max_rows: None,
             }))
             .await;
         assert_eq!(result_text(&retry_query), "ok");
@@ -3691,6 +3746,7 @@ mod tests {
                 session_id: Some("mcp-session-nope".to_string()),
                 cell_char_offset: None,
                 cell_char_limit: None,
+                max_rows: None,
             }))
             .await;
         assert!(result_text(&missing).contains("SESSION_NOT_FOUND"));

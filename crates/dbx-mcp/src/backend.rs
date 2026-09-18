@@ -1212,8 +1212,17 @@ impl DbxBackend for WebBackend {
                 }
             }
 
-            let max_rows = arguments.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-            let mut body = json!({ "connectionId": connection.id, "database": database, "sql": sql });
+            // Clamp here too: the Web backend does not go through the in-process
+            // `execute_tool` clamp, so an unclamped value would bypass the
+            // published max_rows ceiling. `maxRows` also bounds how many rows the
+            // route fetches, not just how many are rendered.
+            let max_rows = arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .clamp(1, agent_tools::MAX_EXECUTE_QUERY_ROWS as u64) as usize;
+            let mut body =
+                json!({ "connectionId": connection.id, "database": database, "sql": sql, "maxRows": max_rows });
             // Stateful MCP sessions pin every query to the same backend pool.
             if let Some(client_session_id) = arguments.get("client_session_id").and_then(Value::as_str) {
                 body["clientSessionId"] = json!(client_session_id);
@@ -2669,14 +2678,16 @@ mod tests {
         assert_eq!(request_line, "POST /api/query/execute HTTP/1.1");
         let request: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(request["timeoutSecs"], 60);
+        assert_eq!(request["maxRows"], 10);
 
-        // Policy argument 300 overrides the connection.
+        // Policy argument 300 overrides the connection; maxRows is clamped to the
+        // published ceiling instead of being forwarded as-is.
         let result = backend
             .execute_agent_tool(
                 &connection,
                 "postgres",
                 "execute_query",
-                json!({ "sql": "SELECT 1", "limit": 10, "timeout_secs": 300 }),
+                json!({ "sql": "SELECT 1", "limit": 100000, "timeout_secs": 300 }),
                 AgentSqlPermissions { allow_writes: false, allow_dangerous: false, confirmed_write_sql: None },
             )
             .await;
@@ -2686,6 +2697,7 @@ mod tests {
         let (_request_line, second_body) = request_receiver.recv().unwrap();
         let second_request: Value = serde_json::from_str(&second_body).unwrap();
         assert_eq!(second_request["timeoutSecs"], 300);
+        assert_eq!(second_request["maxRows"], agent_tools::MAX_EXECUTE_QUERY_ROWS);
     }
 
     #[cfg(feature = "mq-admin")]
