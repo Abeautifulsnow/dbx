@@ -1393,6 +1393,15 @@ function messagesForAgentHistory(historyMessages: ChatMessage[]): AiMessage[] {
 }
 
 const chatTitle = computed(() => {
+  // Same precedence as buildConversationSnapshot(): the user's rename wins,
+  // then the stored title, so renaming a conversation from the history list
+  // updates this header immediately instead of leaving the first-message
+  // excerpt stuck (issue #9904). Saved chats follow the stored title exactly
+  // like the history row (even if the first message is edited later); only
+  // unsaved/new chats derive from messages.
+  const activeConversation = conversations.value.find((conversation) => conversation.id === conversationId.value);
+  const conversationTitle = renamedConversationTitles.get(conversationId.value) || activeConversation?.title;
+  if (conversationTitle) return conversationTitle;
   const first = messages.value.find((m) => m.role === "user" && m.kind !== "contextSummary");
   return first ? messageTitle(first).slice(0, 30) : t("ai.newChat");
 });
@@ -4327,6 +4336,9 @@ async function commitRenameConversation(conv: AiConversation) {
     const i = conversations.value.findIndex((item) => item.id === conv.id);
     if (i >= 0) conversations.value[i] = updated;
   } catch {
+    // Save failed: retract the claim so the header, the history row and the
+    // persisted record all stay on the old title until a rename succeeds.
+    renamedConversationTitles.delete(conv.id);
     toast(t("ai.conversationRenameFailed"), 5000);
   } finally {
     cancelRenameConversation();
