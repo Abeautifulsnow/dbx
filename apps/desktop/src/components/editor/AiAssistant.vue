@@ -156,6 +156,7 @@ import { buildAiAgentStepItems, formatToolDurationMs, toolCallStepKey, upsertAge
 import { createAiShikiCodeHighlighter, type AiCodeHighlighter } from "@/lib/ai/aiCodeHighlighter";
 import { createAiMessageRenderer } from "@/lib/ai/aiMessageRender";
 import { formatAiInlineMarkdown, handleAiMarkdownLinkClick } from "@/lib/ai/aiMarkdown";
+import { renameConversationTitle, resolveConversationTitle, useConversationTitle } from "@/lib/ai/aiConversationTitle";
 import { aiStream, aiCancelStream, saveAiConversation, saveAiRun, saveAiRunState, loadAiConversations, loadAiRuns, deleteAiConversation, listSchemas, listTables, readUserSkills, type AiConversation, type AiRun, type AiRunStatus } from "@/lib/backend/api";
 import type { AiMessage } from "@/lib/backend/api";
 import type { AiConfigItem, AiEffortCapability, AiEffortOption, AiEffortSelection } from "@/types/ai";
@@ -1397,18 +1398,19 @@ function messagesForAgentHistory(historyMessages: ChatMessage[]): AiMessage[] {
   return compactedHistory.map(toModelMessage);
 }
 
-const chatTitle = computed(() => {
-  // Same precedence as buildConversationSnapshot(): the user's rename wins,
-  // then the stored title, so renaming a conversation from the history list
-  // updates this header immediately instead of leaving the first-message
-  // excerpt stuck (issue #9904). Saved chats follow the stored title exactly
-  // like the history row (even if the first message is edited later); only
-  // unsaved/new chats derive from messages.
-  const activeConversation = conversations.value.find((conversation) => conversation.id === conversationId.value);
-  const conversationTitle = renamedConversationTitles.get(conversationId.value) || activeConversation?.title;
-  if (conversationTitle) return conversationTitle;
-  const first = messages.value.find((m) => m.role === "user" && m.kind !== "contextSummary");
-  return pluginContext.value?.title || (first ? messageTitle(first).slice(0, 30) : t("ai.newChat"));
+// A plugin-owned conversation shows the plugin's title, then a rename from the
+// history list (issue #9904) or the stored title; only a chat with neither
+// derives its title from the transcript.
+const chatTitle = useConversationTitle({
+  pluginContextTitle: () => pluginContext.value?.title,
+  conversationId: () => conversationId.value,
+  renamedTitles: renamedConversationTitles,
+  conversations: () => conversations.value,
+  deriveFromFirstMessage: () => {
+    const first = messages.value.find((m) => m.role === "user" && m.kind !== "contextSummary");
+    return first ? messageTitle(first).slice(0, 30) : undefined;
+  },
+  fallback: () => t("ai.newChat"),
 });
 
 const promptMentionChips = computed<AiPromptMentionChip[]>(() => [...selectedMentions.value.map((mention) => ({ ...mention, kind: "table" as const })), ...selectedSqlFileMentions.value]);
@@ -4190,10 +4192,16 @@ function clearAttachmentDraftState() {
 function buildConversationSnapshot(targetConversationId: string, targetMessages: ChatMessage[], connectionName: string, database: string, createdAt = new Date().toISOString()): AiConversation | null {
   if (!targetConversationId || !targetMessages.length) return null;
   const first = targetMessages.find((m) => m.role === "user" && m.kind !== "contextSummary");
-  const existingConversation = conversations.value.find((conversation) => conversation.id === targetConversationId);
   return {
     id: targetConversationId,
-    title: first?.pluginContext?.title || renamedConversationTitles.get(targetConversationId) || existingConversation?.title || (first ? messageTitle(first).slice(0, 50) : "Untitled"),
+    title: resolveConversationTitle({
+      pluginContextTitle: first?.pluginContext?.title,
+      conversationId: targetConversationId,
+      renamedTitles: renamedConversationTitles,
+      conversations: conversations.value,
+      deriveFromFirstMessage: () => (first ? messageTitle(first).slice(0, 50) : undefined),
+      fallback: "Untitled",
+    }),
     pluginContext: pluginContextFromMessages(targetMessages),
     connectionName,
     database,
@@ -4311,10 +4319,15 @@ async function persistPendingInputRecovery(conversation: AiConversation, message
   const first = messages.find((m) => m.role === "user" && m.kind !== "contextSummary");
   const snapshot: AiConversation = {
     id: conversation.id,
-    // Same title precedence as buildConversationSnapshot(): a recovered run
-    // must not overwrite a title the user renamed; plugin-scoped chats keep
-    // the plugin-provided title.
-    title: conversation.pluginContext?.title || renamedConversationTitles.get(conversation.id) || conversation.title || (first ? messageTitle(first).slice(0, 50) : "Untitled"),
+    title: resolveConversationTitle({
+      pluginContextTitle: conversation.pluginContext?.title,
+      conversationId: conversation.id,
+      renamedTitles: renamedConversationTitles,
+      conversations: conversations.value,
+      storedTitle: conversation.title,
+      deriveFromFirstMessage: () => (first ? messageTitle(first).slice(0, 50) : undefined),
+      fallback: "Untitled",
+    }),
     pluginContext: conversation.pluginContext,
     connectionName: conversation.connectionName,
     database: conversation.database,
@@ -4368,20 +4381,26 @@ async function commitRenameConversation(conv: AiConversation) {
   const title = renamingConversationTitle.value.trim().slice(0, 50);
   if (!title || title === conv.title) return cancelRenameConversation();
   try {
+    // Flush the live run snapshot before the rename: it persists the transcript
+    // as it stands (under the pre-rename title, since the claim is not set yet)
+    // and refreshes the list entry `updated` spreads from, so the rename write
+    // must not run ahead of it.
     const activeRun = desktopAiRun<ChatMessage>(conv.id);
     if (activeRun) await runSnapshotScheduler.save(activeRun);
     const latestConversation = conversations.value.find((item) => item.id === conv.id) ?? conv;
-    const updated = { ...latestConversation, title, updatedAt: new Date().toISOString() };
-    // Claim the title before the async save so a throttled snapshot firing
-    // during the await window cannot persist the previous title over it.
-    renamedConversationTitles.set(conv.id, title);
-    await saveAiConversation(updated);
-    const i = conversations.value.findIndex((item) => item.id === conv.id);
-    if (i >= 0) conversations.value[i] = updated;
+    const persisted = await renameConversationTitle({
+      conversation: latestConversation,
+      title,
+      renamedTitles: renamedConversationTitles,
+      persist: saveAiConversation,
+      replaceInList: (updated) => {
+        const index = conversations.value.findIndex((item) => item.id === updated.id);
+        if (index >= 0) conversations.value[index] = updated;
+      },
+    });
+    if (!persisted) toast(t("ai.conversationRenameFailed"), 5000);
   } catch {
-    // Save failed: retract the claim so the header, the history row and the
-    // persisted record all stay on the old title until a rename succeeds.
-    renamedConversationTitles.delete(conv.id);
+    // The pre-rename snapshot flush failed; nothing was claimed yet.
     toast(t("ai.conversationRenameFailed"), 5000);
   } finally {
     cancelRenameConversation();
