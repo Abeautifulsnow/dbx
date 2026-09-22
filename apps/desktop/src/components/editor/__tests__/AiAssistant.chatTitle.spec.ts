@@ -63,4 +63,13 @@ describe("AI assistant header title tracks the conversation title", () => {
     // persisted record all keep the old title.
     expect(commit).toContain("renamedConversationTitles.delete(conv.id);");
   });
+
+  it("pending-input recovery keeps a renamed title instead of re-deriving it from the first message", () => {
+    // A recovered queued run used to persist `messageTitle(first)` outright,
+    // overwriting a renamed title on disk (and, via syncPersistedConversation,
+    // in the list the header now reads).
+    const recovery = bodyOf("async function persistPendingInputRecovery(");
+    expect(recovery).toContain("renamedConversationTitles.get(conversation.id)");
+    expect(recovery.indexOf("renamedConversationTitles.get(conversation.id)")).toBeLessThan(recovery.indexOf("messageTitle(first)"));
+  });
 });

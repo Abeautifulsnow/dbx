@@ -4272,7 +4272,9 @@ async function persistPendingInputRecovery(conversation: AiConversation, message
   const first = messages.find((m) => m.role === "user" && m.kind !== "contextSummary");
   const snapshot: AiConversation = {
     id: conversation.id,
-    title: first ? messageTitle(first).slice(0, 50) : conversation.title || "Untitled",
+    // Same title precedence as buildConversationSnapshot(): a recovered run
+    // must not overwrite a title the user renamed.
+    title: renamedConversationTitles.get(conversation.id) || conversation.title || (first ? messageTitle(first).slice(0, 50) : "Untitled"),
     connectionName: conversation.connectionName,
     database: conversation.database,
     messages: messages.map((m) => ({
