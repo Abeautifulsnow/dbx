@@ -282,6 +282,7 @@ import { buildFontFamilyOptions, displayFontFamily, isPresetFontFamily, loadSyst
 import { buildAppSupportInfoRows, formatAppSupportInfoForClipboard, type AppSupportInfoLabels } from "@/lib/app/supportInfo";
 import { useUiFontFamilyPreview } from "@/composables/useUiFontFamilyPreview";
 import { useMeasuredWidth } from "@/composables/useMeasuredWidth";
+import { createDelayedPreview } from "@/lib/common/delayedPreview";
 import { DateTimePatterns, normalizeSupportedDateTimePattern } from "@/lib/dataGrid/columnFormatter";
 import { MAX_RESULT_PAGE_SIZE, MIN_RESULT_PAGE_SIZE } from "@/lib/dataGrid/paginationPageSize";
 import { MAX_QUERY_RESULT_MAX_ROWS } from "@/lib/dataGrid/queryResultRowLimit";
@@ -304,25 +305,54 @@ const promptTemplateStore = usePromptTemplateStore();
 const tunnelProfileStore = useTunnelProfileStore();
 const { isDark, themeMode, themePalette, activeCustomUiColors, cornerStyle, setThemeMode, setThemePalette, previewThemePalette, clearThemePalettePreview, setCustomUiColors, resetCustomUiColors, setCornerStyle } = useTheme();
 const { previewUiFontFamily, clearUiFontFamilyPreview } = useUiFontFamilyPreview();
+const APPEARANCE_POINTER_PREVIEW_DELAY_MS = 80;
+const themePaletteOptionPreview = createDelayedPreview<AppThemePalette>(previewThemePalette, APPEARANCE_POINTER_PREVIEW_DELAY_MS);
+const uiFontOptionPreview = createDelayedPreview<string>(previewUiFontFamily, APPEARANCE_POINTER_PREVIEW_DELAY_MS);
+const localeOptionPreview = createDelayedPreview<Locale>((value) => void previewLocale(value), APPEARANCE_POINTER_PREVIEW_DELAY_MS);
 
 function updateCustomUiColor(key: keyof AppCustomUiColors, value: string) {
   setCustomUiColors({ ...activeCustomUiColors.value, [key]: value });
 }
 
 function onThemePaletteSelect(value: unknown) {
-  if (typeof value === "string") setThemePalette(value as AppThemePalette);
+  if (typeof value !== "string") return;
+  themePaletteOptionPreview.cancel();
+  setThemePalette(value as AppThemePalette);
 }
 
 function onThemePaletteOpenChange(open: boolean) {
-  if (!open) clearThemePalettePreview();
+  if (!open) clearThemePaletteOptionPreview();
+}
+
+function scheduleThemePalettePreview(value: AppThemePalette) {
+  themePaletteOptionPreview.schedule(value);
+}
+
+function previewThemePaletteOption(value: AppThemePalette) {
+  themePaletteOptionPreview.runNow(value);
+}
+
+function clearThemePaletteOptionPreview() {
+  themePaletteOptionPreview.cancel();
+  clearThemePalettePreview();
+}
+
+function scheduleUiFontOptionPreview(value: string) {
+  uiFontOptionPreview.schedule(value);
 }
 
 function previewUiFontOption(value: string | undefined) {
-  if (value) previewUiFontFamily(value);
+  if (value) uiFontOptionPreview.runNow(value);
 }
 
 function restoreUiFontFamilyPreview() {
+  uiFontOptionPreview.cancel();
   previewUiFontFamily(editUiFontFamily.value);
+}
+
+function clearUiFontOptionPreview() {
+  uiFontOptionPreview.cancel();
+  clearUiFontFamilyPreview();
 }
 
 function onUiFontFamilyOpenChange(open: boolean) {
@@ -334,10 +364,15 @@ function onUiFontFamilyOpenChange(open: boolean) {
 }
 
 function previewLocaleOption(locale: Locale) {
-  void previewLocale(locale);
+  localeOptionPreview.runNow(locale);
+}
+
+function scheduleLocaleOptionPreview(locale: Locale) {
+  localeOptionPreview.schedule(locale);
 }
 
 function restoreLocaleOptionPreview() {
+  localeOptionPreview.cancel();
   void restoreLocalePreview();
 }
 
@@ -1857,8 +1892,8 @@ watch(
       editSidebarTablePageSize.value = settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
     } else {
       historyRetention.discard();
-      clearThemePalettePreview();
-      clearUiFontFamilyPreview();
+      clearThemePaletteOptionPreview();
+      clearUiFontOptionPreview();
       restoreLocaleOptionPreview();
     }
   },
@@ -1869,8 +1904,8 @@ watch(
   () => settingsStore.settingsPageActive,
   (active) => {
     if (isSettingsPage.value && !active) {
-      clearThemePalettePreview();
-      clearUiFontFamilyPreview();
+      clearThemePaletteOptionPreview();
+      clearUiFontOptionPreview();
       restoreLocaleOptionPreview();
     }
   },
@@ -2590,7 +2625,7 @@ function onTableFontFamilyChange(v: any) {
 function onUiFontFamilyChange(v: any) {
   if (typeof v === "string") {
     editUiFontFamily.value = v;
-    previewUiFontFamily(v);
+    uiFontOptionPreview.runNow(v);
   }
 }
 
@@ -2656,7 +2691,9 @@ function onDeleteConnectionTabHandlingModeChange(v: any) {
 }
 
 function onLocaleChange(v: any) {
-  if (typeof v === "string") void setLocale(v as Locale);
+  if (typeof v !== "string") return;
+  localeOptionPreview.cancel();
+  void setLocale(v as Locale);
 }
 
 function onUiScaleChange(value: unknown) {
@@ -4476,8 +4513,8 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  clearThemePalettePreview();
-  clearUiFontFamilyPreview();
+  clearThemePaletteOptionPreview();
+  clearUiFontOptionPreview();
   restoreLocaleOptionPreview();
   cleanupTableColumnTemplatePointerDrag();
   cleanupTruncationObservers();
@@ -6555,7 +6592,7 @@ onUnmounted(() => {
                       </SelectValue>
                     </SelectTrigger>
                     <SelectContent class="w-[150px]" @pointerleave="restoreLocaleOptionPreview">
-                      <SelectItem v-for="locale in LOCALE_OPTIONS" :key="locale.value" :value="locale.value" @pointerenter="previewLocaleOption(locale.value)" @focus="previewLocaleOption(locale.value)">
+                      <SelectItem v-for="locale in LOCALE_OPTIONS" :key="locale.value" :value="locale.value" @pointerenter="scheduleLocaleOptionPreview(locale.value)" @focus="previewLocaleOption(locale.value)">
                         <div class="flex items-center gap-1">
                           <span class="inline-flex h-5 w-6 shrink-0 items-center justify-center text-sm font-medium leading-none">
                             {{ locale.flag }}
@@ -6587,8 +6624,8 @@ onUnmounted(() => {
                             </span>
                           </SelectValue>
                         </SelectTrigger>
-                        <SelectContent @pointerleave="clearThemePalettePreview">
-                          <SelectItem v-for="option in appThemePaletteOptions" :key="option.value" :value="option.value" @pointerenter="previewThemePalette(option.value)" @focus="previewThemePalette(option.value)">
+                        <SelectContent @pointerleave="clearThemePaletteOptionPreview">
+                          <SelectItem v-for="option in appThemePaletteOptions" :key="option.value" :value="option.value" @pointerenter="scheduleThemePalettePreview(option.value)" @focus="previewThemePaletteOption(option.value)">
                             <div class="flex items-center gap-2">
                               <span class="h-3 w-3 rounded-full border border-border shadow-xs" :style="{ background: option.previewColor }" />
                               {{ option.label }}
@@ -6661,7 +6698,7 @@ onUnmounted(() => {
                     :content-style="{ fontFamily: editUiFontFamily || DEFAULT_UI_FONT_FAMILY }"
                     @update:model-value="onUiFontFamilyChange"
                     @update:open="onUiFontFamilyOpenChange"
-                    @option-hover="previewUiFontOption"
+                    @option-hover="scheduleUiFontOptionPreview"
                     @option-highlight="previewUiFontOption"
                     @option-leave="restoreUiFontFamilyPreview"
                   >

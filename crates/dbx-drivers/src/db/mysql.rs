@@ -1484,6 +1484,11 @@ fn mysql_group_concat_setup_fallback_mode(setup_mode: MySqlSetupMode, error: &st
         || lower.contains("syntax error")
         || lower.contains("not supported");
     let setup_value_rejected = lower.contains("error 1231") && lower.contains("can't be set to");
+    // Gaea tries to parse the built-in floor expression as an integer literal.
+    let gaea_setup_expression_rejected = lower.contains("error 1105 (hy000)")
+        && compact.contains(&format!(
+            "strconv.parseint:parsing\"cast(greatest(@@session.group_concat_max_len,{MYSQL_GROUP_CONCAT_MAX_LEN})asunsigned)\":invalidsyntax"
+        ));
     // SphinxQL / Manticore reject the built-in `group_concat_max_len` setup with a
     // boolean-typed 1064 error. The quoted token after `near` depends on the exact
     // statement text, so accept any boolean rejection from SphinxQL that mentions
@@ -1501,6 +1506,7 @@ fn mysql_group_concat_setup_fallback_mode(setup_mode: MySqlSetupMode, error: &st
     let floor_statement_rejected = lower.contains("group_concat_max_len")
         || compact.contains(&format!("..._len,{MYSQL_GROUP_CONCAT_MAX_LEN})asunsigned)"));
     if (floor_statement_rejected && (setup_query_rejected || setup_value_rejected))
+        || gaea_setup_expression_rejected
         || sphinxql_setup_query_rejected
         || gateway_session_variable_rejected
     {
@@ -5872,11 +5878,15 @@ fn prefers_text_protocol_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
 pub fn is_result_set_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
     // MySQL 的表维护语句虽然不是 SELECT，但服务器会返回包含表名和执行结果的表格。
     // 如果把它们当成普通写入语句，后续 drop_result 会直接丢弃这些返回行。
+    //
+    // `EXECUTE` 同理：它执行的是运行时才确定的动态语句，`PREPARE` 的是查询时服务器已经
+    // 把结果集发回来了，当成普通写入语句处理就会把这些行丢掉（#10005）。而且 MySQL 不
+    // 允许在预处理协议里执行 `EXECUTE`（ERROR 1295），所以它必须走文本协议。
     starts_with_executable_sql_keyword_for_database(
         sql,
         &[
             "SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH", "CALL", "CHECKSUM", "ANALYZE", "CHECK", "OPTIMIZE",
-            "REPAIR",
+            "REPAIR", "EXECUTE",
         ],
         DatabaseType::Mysql,
     ) || mysql_statement_returns_rows(sql)
@@ -6950,6 +6960,20 @@ mod tests {
 
         assert!(is_result_set_query("CALL proc_test1()", dialect));
         assert!(prefers_text_protocol_query("CALL proc_test1()", dialect));
+    }
+
+    #[test]
+    fn mysql_execute_statements_are_treated_as_text_result_sets_per_issue_10005() {
+        let dialect = MySqlQueryDialect::default();
+
+        // `EXECUTE` runs a dynamic statement whose result set the server already sent, and it
+        // is rejected by the prepared-statement protocol, so it must take the text-protocol
+        // result-set path instead of the write path that drops rows.
+        for sql in ["EXECUTE stmt", "execute stmt;", "-- run dynamic sql\nEXECUTE stmt", "EXECUTE IMMEDIATE 'SELECT 1'"]
+        {
+            assert!(is_result_set_query(sql, dialect), "{sql}");
+            assert!(prefers_text_protocol_query(sql, dialect), "{sql}");
+        }
     }
 
     #[test]
@@ -8333,6 +8357,30 @@ mod tests {
             mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error),
             Some(MySqlSetupMode::Compatible)
         );
+    }
+
+    #[test]
+    fn mysql_group_concat_gaea_parse_int_error_retries_without_session_variable() {
+        let error = "MySQL connection failed: Server error: `ERROR 1105 (HY000): strconv.ParseInt: parsing \"cast(greatest(@@session.group_concat_max_len, 1048576) as unsigned)\": invalid syntax'";
+
+        assert_eq!(
+            mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error),
+            Some(MySqlSetupMode::Compatible)
+        );
+        assert_eq!(mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Compatible, error), None);
+    }
+
+    #[test]
+    fn mysql_group_concat_gaea_parse_int_retry_requires_builtin_expression() {
+        for error in [
+            "Server error: `ERROR 1105 (HY000): strconv.ParseInt: parsing \"cast(greatest(@@session.group_concat_max_len, 2097152) as unsigned)\": invalid syntax'",
+            "Server error: `ERROR 1105 (HY000): strconv.ParseInt: parsing \"cast(greatest(@@session.sql_mode, 1048576) as unsigned)\": invalid syntax'",
+            "Server error: `ERROR 1105 (HY000): strconv.ParseInt: parsing \"cast(greatest(@@session.group_concat_max_len, 1048576) as unsigned)\": invalid value'",
+            "Server error: `ERROR 1105 (HY000): strconv.ParseInt: parsing \"1048576\": invalid syntax'",
+            "Server error: `ERROR 1231 (HY000): strconv.ParseInt: parsing \"cast(greatest(@@session.group_concat_max_len, 1048576) as unsigned)\": invalid syntax'",
+        ] {
+            assert_eq!(mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error), None, "{error}");
+        }
     }
 
     #[test]

@@ -1160,6 +1160,7 @@ export interface AiChatMessage {
 }
 
 export interface AiConversation {
+  pluginContext?: import("@/lib/ai/aiPluginConversation").AiPluginContext;
   id: string;
   title: string;
   connectionName: string;
@@ -1333,6 +1334,10 @@ export async function replaceNacosSessionCredential(connectionId: string, userna
 
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
   return invokeBackend("check_connection_health", { connectionId });
+}
+
+export async function prewarmConnection(connectionId: string, database?: string, catalog?: string, clientSessionId?: string): Promise<void> {
+  return invokeBackend("prewarm_connection", { connectionId, database, catalog, clientSessionId });
 }
 
 export async function connectionIdentifierQuote(connectionId: string, database?: string): Promise<string | undefined> {
@@ -2462,7 +2467,8 @@ export async function sendPluginBinary(pluginId: string, channel: string, dataBa
 }
 
 export interface PluginLocalFileHandle {
-  handleId: number;
+  /** Opaque uuid string from the Rust registry — never a number (JS doubles lose precision above 2^53). */
+  handleId: string;
   name: string;
   size: number;
   contentType: string;
@@ -2484,15 +2490,15 @@ export async function openPluginLocalFile(pluginId: string, path: string, write:
   return invoke("plugin_file_open", { pluginId, path, write });
 }
 
-export async function readPluginLocalFileChunk(pluginId: string, handleId: number, offset: number, length?: number): Promise<PluginLocalFileChunk> {
+export async function readPluginLocalFileChunk(pluginId: string, handleId: string, offset: number, length?: number): Promise<PluginLocalFileChunk> {
   return invoke("plugin_file_read", { pluginId, handleId, offset, length });
 }
 
-export async function writePluginLocalFileChunk(pluginId: string, handleId: number, offset: number, dataBase64: string): Promise<PluginLocalFileWriteResult> {
+export async function writePluginLocalFileChunk(pluginId: string, handleId: string, offset: number, dataBase64: string): Promise<PluginLocalFileWriteResult> {
   return invoke("plugin_file_write", { pluginId, handleId, offset, dataBase64 });
 }
 
-export async function closePluginLocalFile(pluginId: string, handleId: number): Promise<void> {
+export async function closePluginLocalFile(pluginId: string, handleId: string): Promise<void> {
   return invoke("plugin_file_close", { pluginId, handleId });
 }
 
