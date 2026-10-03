@@ -180,4 +180,22 @@ describe("ContentArea result-view context", () => {
       }),
     );
   });
+
+  it("passes the active tab schema so plugin re-runs resolve unqualified names", async () => {
+    const openPluginWorkbench = await mountContentArea(
+      queryTab({
+        schema: "public",
+        lastExecutedSql: "SELECT * FROM users",
+        result: result("SELECT * FROM users"),
+      }),
+    );
+
+    expect(openPluginWorkbench).toHaveBeenCalledWith(
+      "com.example.chart",
+      "result.chart",
+      expect.objectContaining({
+        context: expect.objectContaining({ schema: "public" }),
+      }),
+    );
+  });
 });

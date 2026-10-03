@@ -1389,6 +1389,9 @@ function openPluginResultView(pluginId: string, contributionId: string, label: s
     context: {
       connectionId: props.activeTab.connectionId || "",
       database: props.activeTab.database || "",
+      // The plugin re-runs `sql` through `host.queryData`, whose backend sets
+      // search_path from this; without it unqualified table names miss.
+      schema: props.activeTab.schema || "",
       sql: resultSqlForGrid(props.activeTab),
       result: { columns: result.columns, rows: cappedRows, truncated: result.rows.length > cappedRows.length },
     },
