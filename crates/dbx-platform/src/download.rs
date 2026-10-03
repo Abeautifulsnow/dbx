@@ -123,9 +123,38 @@ enum ClassifyError {
     /// Transient, and the buffered bytes no longer line up with the resource
     /// (416 after a ranged request): discard them before the next attempt.
     StaleResume(reqwest::StatusCode),
+    /// The server returned a partial response that cannot safely be appended
+    /// to the buffered representation.
+    InvalidContentRange,
 }
 
-fn classify_response(status: reqwest::StatusCode, resume_from: u64) -> Result<ResumePlan, ClassifyError> {
+fn complete_content_range_total(headers: &reqwest::header::HeaderMap, expected_start: u64) -> Option<u64> {
+    headers
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("bytes "))
+        .and_then(|value| value.split_once('/'))
+        .and_then(|(range, total)| {
+            let (start, end) = range.split_once('-')?;
+            Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?, total.parse::<u64>().ok()?))
+        })
+        .and_then(|(start, end, total)| (start == expected_start && end.checked_add(1) == Some(total)).then_some(total))
+}
+
+fn has_complete_content_range(headers: &reqwest::header::HeaderMap, expected_start: u64) -> bool {
+    complete_content_range_total(headers, expected_start).is_some()
+}
+
+fn strong_etag(headers: &reqwest::header::HeaderMap) -> Option<reqwest::header::HeaderValue> {
+    let etag = headers.get(reqwest::header::ETAG)?.clone();
+    (!etag.to_str().ok()?.starts_with("W/")).then_some(etag)
+}
+
+fn classify_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    resume_from: u64,
+) -> Result<ResumePlan, ClassifyError> {
     if resume_from > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
         return Err(ClassifyError::StaleResume(status));
     }
@@ -140,6 +169,11 @@ fn classify_response(status: reqwest::StatusCode, resume_from: u64) -> Result<Re
         // Server ignored the Range header and restarted the body at zero.
         return Ok(ResumePlan::Restart);
     }
+    if status == reqwest::StatusCode::PARTIAL_CONTENT
+        && (resume_from == 0 || !has_complete_content_range(headers, resume_from))
+    {
+        return Err(ClassifyError::InvalidContentRange);
+    }
     Ok(ResumePlan::Append)
 }
 
@@ -147,12 +181,13 @@ fn classify_response(status: reqwest::StatusCode, resume_from: u64) -> Result<Re
 /// failures that kill a single-connection download: connect/send errors,
 /// mid-body drops ("error decoding response body"), 5xx and 408/429 statuses.
 ///
-/// Bytes received before a mid-body drop are reused: the next attempt sends a
-/// Range request from the received offset; a server that answers 206 appends,
-/// one that answers plain 200 restarts cleanly, and a 416 discards the partial
-/// bytes and retries without a Range header. Resume correctness is guarded
-/// by callers that verify a checksum or signature over the finished bytes —
-/// every current caller does.
+/// Bytes received before a mid-body drop are reused only when the initial
+/// response includes a strong ETag. The next attempt sends a conditional Range
+/// request from the received offset; a server that answers 206 with the
+/// matching complete Content-Range appends, one that answers plain 200 restarts
+/// cleanly, and a 416 discards the partial bytes and retries without a Range
+/// header. Requests force identity encoding so the Range offsets and buffered
+/// bytes always refer to the same representation.
 ///
 /// Error copy matches the previous single-attempt behavior (`Failed to
 /// download/read {label} from {url}: …`) so UI strings stay stable; the last
@@ -167,12 +202,15 @@ pub async fn resilient_download_bytes(
 ) -> Result<Vec<u8>, String> {
     let attempts = attempts.max(1);
     let mut bytes: Vec<u8> = Vec::new();
+    let mut resume_validator = None;
     let mut last_error = String::new();
     for attempt in 1..=attempts {
         if attempt > 1 {
             tokio::time::sleep(retry_delay(attempt)).await;
         }
-        match download_attempt(client, &url, label, max_bytes, &mut bytes, &mut on_progress).await {
+        match download_attempt(client, &url, label, max_bytes, &mut bytes, &mut resume_validator, &mut on_progress)
+            .await
+        {
             Ok(()) => return Ok(bytes),
             Err(DownloadAttemptError::Fatal(error)) => return Err(error),
             Err(DownloadAttemptError::Retryable(error)) => {
@@ -189,29 +227,51 @@ async fn download_attempt(
     label: &str,
     max_bytes: usize,
     bytes: &mut Vec<u8>,
+    resume_validator: &mut Option<reqwest::header::HeaderValue>,
     on_progress: &mut impl FnMut(u64, Option<u64>),
 ) -> Result<(), DownloadAttemptError> {
     use futures::StreamExt;
 
+    // Without a strong validator, a later Range response could belong to a
+    // newer representation at the same URL. Restart rather than risk mixing
+    // the old prefix with new bytes.
+    if !bytes.is_empty() && resume_validator.is_none() {
+        bytes.clear();
+    }
     let resume_from = bytes.len() as u64;
-    let mut request = client.get(url.clone());
+    let mut request = client.get(url.clone()).header(reqwest::header::ACCEPT_ENCODING, "identity");
     if resume_from > 0 {
         request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
+        request = request.header(
+            reqwest::header::IF_RANGE,
+            resume_validator.as_ref().expect("partial bytes have a validator").clone(),
+        );
     }
     let response = request
         .send()
         .await
         .map_err(|error| DownloadAttemptError::Retryable(format!("Failed to download {label} from {url}: {error}")))?;
     let status_error = |status: reqwest::StatusCode| format!("Failed to download {label} from {url}: HTTP {status}");
-    match classify_response(response.status(), resume_from) {
+    match classify_response(response.status(), response.headers(), resume_from) {
         Ok(ResumePlan::Append) => {}
-        Ok(ResumePlan::Restart) => bytes.clear(),
+        Ok(ResumePlan::Restart) => {
+            bytes.clear();
+            *resume_validator = strong_etag(response.headers());
+        }
         // The buffered bytes no longer line up with the resource: drop them so
         // the next attempt re-requests without a Range header. Never read the
         // 416 body — it is an error document, not content.
         Err(ClassifyError::StaleResume(status)) => {
             bytes.clear();
+            *resume_validator = None;
             return Err(DownloadAttemptError::Retryable(status_error(status)));
+        }
+        Err(ClassifyError::InvalidContentRange) => {
+            bytes.clear();
+            *resume_validator = None;
+            return Err(DownloadAttemptError::Retryable(format!(
+                "Failed to download {label} from {url}: invalid Content-Range for resumed response"
+            )));
         }
         Err(ClassifyError::RetryableStatus(status)) => {
             return Err(DownloadAttemptError::Retryable(status_error(status)));
@@ -220,9 +280,15 @@ async fn download_attempt(
             return Err(DownloadAttemptError::Fatal(status_error(status)));
         }
     }
+    if resume_from == 0 {
+        *resume_validator = strong_etag(response.headers());
+    }
     if response.content_length().is_some_and(|length| bytes.len() as u64 + length > max_bytes as u64) {
         return Err(DownloadAttemptError::Fatal(format!("{label} exceeds {max_bytes} bytes")));
     }
+    let expected_total = (response.status() == reqwest::StatusCode::PARTIAL_CONTENT)
+        .then(|| complete_content_range_total(response.headers(), resume_from))
+        .flatten();
     let total = response.content_length().map(|length| bytes.len() as u64 + length);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -234,17 +300,47 @@ async fn download_attempt(
         bytes.extend_from_slice(&chunk);
         on_progress(bytes.len() as u64, total);
     }
+    if expected_total.is_some_and(|total| bytes.len() as u64 != total) {
+        return Err(DownloadAttemptError::Retryable(format!(
+            "Failed to read {label} from {url}: incomplete Content-Range body"
+        )));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_response, retry_delay, ClassifyError, ResumePlan};
-    use super::{download_candidate_urls, DownloadSource};
+    use super::{classify_response, has_complete_content_range, retry_delay, strong_etag, ClassifyError, ResumePlan};
+    use super::{download_candidate_urls, resilient_download_bytes, DownloadSource};
+    use reqwest::header::{HeaderMap, HeaderValue, CONTENT_RANGE, ETAG};
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::str::FromStr;
+    use std::thread;
     use std::time::Duration;
 
     fn status(code: u16) -> reqwest::StatusCode {
         reqwest::StatusCode::from_u16(code).unwrap()
+    }
+
+    fn headers(entries: &[(&reqwest::header::HeaderName, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in entries {
+            headers.insert((*name).clone(), HeaderValue::from_str(value).unwrap());
+        }
+        headers
+    }
+
+    fn read_request_headers(stream: &mut std::net::TcpStream) -> String {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "client closed connection before sending headers");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        String::from_utf8(request).unwrap()
     }
 
     #[test]
@@ -277,38 +373,111 @@ mod tests {
 
     #[test]
     fn classify_appends_fresh_and_partial_content_responses() {
-        assert!(matches!(classify_response(status(200), 0), Ok(ResumePlan::Append)));
-        assert!(matches!(classify_response(status(206), 0), Ok(ResumePlan::Append)));
-        assert!(matches!(classify_response(status(206), 1024), Ok(ResumePlan::Append)));
+        assert!(matches!(classify_response(status(200), &HeaderMap::new(), 0), Ok(ResumePlan::Append)));
+        let partial = headers(&[(&CONTENT_RANGE, "bytes 1024-4095/4096")]);
+        assert!(matches!(classify_response(status(206), &partial, 1024), Ok(ResumePlan::Append)));
     }
 
     #[test]
     fn classify_restarts_when_server_ignores_range() {
-        assert!(matches!(classify_response(status(200), 1024), Ok(ResumePlan::Restart)));
+        assert!(matches!(classify_response(status(200), &HeaderMap::new(), 1024), Ok(ResumePlan::Restart)));
     }
 
     #[test]
     fn classify_fails_unsatisfiable_range_as_stale_resume() {
         // 416 is an error status: the attempt must fail (with the buffered
         // bytes dropped by the caller) instead of reading the error body.
-        assert!(matches!(classify_response(status(416), 1024), Err(ClassifyError::StaleResume(_))));
+        assert!(matches!(classify_response(status(416), &HeaderMap::new(), 1024), Err(ClassifyError::StaleResume(_))));
         // Without a resume offset a 416 is just a deterministic client error.
-        assert!(matches!(classify_response(status(416), 0), Err(ClassifyError::FatalStatus(_))));
+        assert!(matches!(classify_response(status(416), &HeaderMap::new(), 0), Err(ClassifyError::FatalStatus(_))));
     }
 
     #[test]
     fn classify_fails_deterministic_client_errors_without_retry() {
-        assert!(matches!(classify_response(status(404), 0), Err(ClassifyError::FatalStatus(_))));
-        assert!(matches!(classify_response(status(403), 0), Err(ClassifyError::FatalStatus(_))));
+        assert!(matches!(classify_response(status(404), &HeaderMap::new(), 0), Err(ClassifyError::FatalStatus(_))));
+        assert!(matches!(classify_response(status(403), &HeaderMap::new(), 0), Err(ClassifyError::FatalStatus(_))));
     }
 
     #[test]
     fn classify_retries_transient_statuses() {
-        assert!(matches!(classify_response(status(408), 0), Err(ClassifyError::RetryableStatus(_))));
-        assert!(matches!(classify_response(status(429), 0), Err(ClassifyError::RetryableStatus(_))));
-        assert!(matches!(classify_response(status(500), 0), Err(ClassifyError::RetryableStatus(_))));
-        assert!(matches!(classify_response(status(502), 0), Err(ClassifyError::RetryableStatus(_))));
-        assert!(matches!(classify_response(status(503), 0), Err(ClassifyError::RetryableStatus(_))));
+        assert!(matches!(classify_response(status(408), &HeaderMap::new(), 0), Err(ClassifyError::RetryableStatus(_))));
+        assert!(matches!(classify_response(status(429), &HeaderMap::new(), 0), Err(ClassifyError::RetryableStatus(_))));
+        assert!(matches!(classify_response(status(500), &HeaderMap::new(), 0), Err(ClassifyError::RetryableStatus(_))));
+        assert!(matches!(classify_response(status(502), &HeaderMap::new(), 0), Err(ClassifyError::RetryableStatus(_))));
+        assert!(matches!(classify_response(status(503), &HeaderMap::new(), 0), Err(ClassifyError::RetryableStatus(_))));
+    }
+
+    #[test]
+    fn rejects_partial_responses_that_cannot_be_safely_appended() {
+        let wrong_start = headers(&[(&CONTENT_RANGE, "bytes 0-1023/4096")]);
+        assert!(!has_complete_content_range(&wrong_start, 1024));
+        assert!(matches!(classify_response(status(206), &wrong_start, 1024), Err(ClassifyError::InvalidContentRange)));
+
+        let initial_partial = headers(&[(&CONTENT_RANGE, "bytes 0-1023/4096")]);
+        assert!(matches!(classify_response(status(206), &initial_partial, 0), Err(ClassifyError::InvalidContentRange)));
+
+        let incomplete_suffix = headers(&[(&CONTENT_RANGE, "bytes 1024-2047/4096")]);
+        assert!(matches!(
+            classify_response(status(206), &incomplete_suffix, 1024),
+            Err(ClassifyError::InvalidContentRange)
+        ));
+    }
+
+    #[test]
+    fn only_strong_etags_enable_resume() {
+        let strong = headers(&[(&ETAG, "\"release-1\"")]);
+        assert_eq!(strong_etag(&strong).as_ref().map(HeaderValue::as_bytes), Some(b"\"release-1\"".as_slice()));
+
+        let weak = headers(&[(&ETAG, "W/\"release-1\"")]);
+        assert!(strong_etag(&weak).is_none());
+    }
+
+    #[test]
+    fn resumes_only_when_the_etag_matches_the_partial_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut initial, _) = listener.accept().unwrap();
+            let initial_request = read_request_headers(&mut initial).to_ascii_lowercase();
+            assert!(!initial_request.contains("range:"));
+            assert!(initial_request.contains("accept-encoding: identity"), "{initial_request}");
+            initial
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nETag: \"release-1\"\r\nConnection: close\r\n\r\nold-",
+                )
+                .unwrap();
+            initial.shutdown(Shutdown::Both).unwrap();
+
+            let (mut resumed, _) = listener.accept().unwrap();
+            let resumed_request = read_request_headers(&mut resumed).to_ascii_lowercase();
+            assert!(resumed_request.contains("range: bytes=4-"), "{resumed_request}");
+            assert!(resumed_request.contains("if-range: \"release-1\""), "{resumed_request}");
+            assert!(resumed_request.contains("accept-encoding: identity"), "{resumed_request}");
+            // The resource changed after the interrupted first response. A
+            // compliant server ignores Range for a mismatched If-Range and
+            // sends the new full representation.
+            resumed
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nETag: \"release-2\"\r\nConnection: close\r\n\r\nnew-body",
+                )
+                .unwrap();
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let client = reqwest::Client::new();
+        let downloaded = runtime
+            .block_on(resilient_download_bytes(
+                &client,
+                format!("http://{address}/artifact").parse().unwrap(),
+                "test artifact",
+                1024,
+                2,
+                |_, _| {},
+            ))
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(downloaded, b"new-body");
     }
 
     #[test]
