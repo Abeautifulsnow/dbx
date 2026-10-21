@@ -3077,6 +3077,7 @@ export interface GlobalSearchRequest {
   useRegex?: boolean;
   wholeWord?: boolean;
   limit?: number;
+  respectIgnoreRules?: boolean;
 }
 
 export interface GlobalSearchMatch {

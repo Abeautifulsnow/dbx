@@ -1405,6 +1405,12 @@ export interface GlobalSearchRequest {
   useRegex?: boolean;
   wholeWord?: boolean;
   limit?: number;
+  /**
+   * Whether the backend walker skips hidden paths and honors ignore files.
+   * Omit (or `true`) for the default Quick Open behavior; pass `false` to search
+   * exactly the files a raw directory listing shows (SQL file panel).
+   */
+  respectIgnoreRules?: boolean;
 }
 
 export interface GlobalSearchMatch {

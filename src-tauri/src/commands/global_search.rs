@@ -50,6 +50,13 @@ pub struct GlobalSearchRequest {
     pub whole_word: Option<bool>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Whether the walker skips hidden paths and honors ignore files
+    /// (`.gitignore`, `.ignore`, git global/exclude). Defaults to `true`, which
+    /// is the Quick Open behavior. The SQL file panel passes `false` so content
+    /// results cover exactly the files its tree lists (raw `read_dir`, which
+    /// does not filter hidden or ignored files).
+    #[serde(default)]
+    pub respect_ignore_rules: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -155,7 +162,21 @@ fn search_root(request: &GlobalSearchRequest, root: &str) -> Vec<GlobalSearchMat
 
     let mut results = Vec::new();
     let mut builder = WalkBuilder::new(root);
-    builder.hidden(true).git_ignore(true).git_global(true).git_exclude(true).follow_links(false);
+    // `WalkBuilder`'s ignore options all default to `true`; flipping them off is
+    // what makes the walk enumerate the same set of files that a plain
+    // `read_dir` scan (used by the SQL file tree) would see.
+    let respect_ignore_rules = request.respect_ignore_rules.unwrap_or(true);
+    builder
+        .hidden(respect_ignore_rules)
+        .ignore(respect_ignore_rules)
+        // `parents` reads ignore files from ancestor directories; leaving it on
+        // would keep honoring rules the caller asked to ignore (and do pointless
+        // parent traversal), so it follows the same flag.
+        .parents(respect_ignore_rules)
+        .git_ignore(respect_ignore_rules)
+        .git_global(respect_ignore_rules)
+        .git_exclude(respect_ignore_rules)
+        .follow_links(false);
     builder.filter_entry(|entry| {
         if entry.depth() == 0 {
             return true;
@@ -271,6 +292,7 @@ mod tests {
             use_regex: None,
             whole_word: None,
             limit: None,
+            respect_ignore_rules: None,
         }
     }
 
@@ -375,6 +397,62 @@ mod tests {
         let results = global_search(r).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].path.ends_with("main.sql"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Creates a root containing a visible file, a hidden directory with a
+    /// file, and a `.gitignore`d file. `.git` is materialized because the
+    /// walker requires a repository for `.gitignore` rules to apply.
+    fn ignore_rules_fixture(label: &str) -> PathBuf {
+        let root = temp_dir(label);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.sql\n").unwrap();
+        std::fs::write(root.join("visible.sql"), "SELECT needle;\n").unwrap();
+        std::fs::write(root.join("ignored.sql"), "SELECT needle;\n").unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join(".hidden").join("nested.sql"), "SELECT needle;\n").unwrap();
+        root
+    }
+
+    fn matched_file_names(results: &[GlobalSearchMatch]) -> Vec<String> {
+        let mut names: Vec<String> = results.iter().map(|m| m.file_name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn default_respects_hidden_and_gitignore_rules() {
+        let root = ignore_rules_fixture("ignore-default");
+        let r = req(&[root.to_str().unwrap()], "needle");
+        assert_eq!(r.respect_ignore_rules, None);
+        let results = global_search(r).await.unwrap();
+        assert_eq!(matched_file_names(&results), vec!["visible.sql".to_string()]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn respect_ignore_rules_false_walks_hidden_and_ignored_files() {
+        let root = ignore_rules_fixture("ignore-off");
+        let mut r = req(&[root.to_str().unwrap()], "needle");
+        r.respect_ignore_rules = Some(false);
+        let results = global_search(r).await.unwrap();
+        assert_eq!(
+            matched_file_names(&results),
+            vec!["ignored.sql".to_string(), "nested.sql".to_string(), "visible.sql".to_string()]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn respect_ignore_rules_false_still_skips_pruned_directories() {
+        let root = temp_dir("ignore-pruned");
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("node_modules").join("dep.sql"), "SELECT needle;\n").unwrap();
+        std::fs::write(root.join("main.sql"), "SELECT needle;\n").unwrap();
+        let mut r = req(&[root.to_str().unwrap()], "needle");
+        r.respect_ignore_rules = Some(false);
+        let results = global_search(r).await.unwrap();
+        assert_eq!(matched_file_names(&results), vec!["main.sql".to_string()]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
