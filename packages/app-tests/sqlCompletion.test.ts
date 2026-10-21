@@ -3532,6 +3532,36 @@ test("referenced-table columns rank above keywords (#801)", () => {
   }
 });
 
+test("referenced-table columns rank above sequences in WHERE clause (#12927)", () => {
+  for (const databaseType of ["dameng", "oracle"] as const) {
+    const sql = "select * from xx where col";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [{ name: "xx", type: "table" }],
+      columnsByTable: new Map([["xx", [{ name: "col_value", table: "xx" }]]]),
+      objects: [{ name: "col_seq", type: "sequence" }],
+      databaseType,
+    });
+
+    const columnIdx = items.findIndex((item) => item.type === "column" && item.label === "col_value");
+    const sequenceIdx = items.findIndex((item) => item.type === "sequence" && item.label === "col_seq");
+
+    assert.ok(columnIdx >= 0, `column col_value should be suggested for ${databaseType}`);
+    assert.ok(sequenceIdx >= 0, `sequence col_seq should be suggested for ${databaseType}`);
+    assert.ok(columnIdx < sequenceIdx, `column col_value (index ${columnIdx}) should sort before sequence col_seq (index ${sequenceIdx}) for ${databaseType}`);
+
+    // In contexts where columns are not expected, sequence still appears and retains priority
+    const noTableSql = "select col";
+    const noTableItems = buildSqlCompletionItems(noTableSql, noTableSql.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      objects: [{ name: "col_seq", type: "sequence" }],
+      databaseType,
+    });
+    const noTableSeqIdx = noTableItems.findIndex((item) => item.type === "sequence" && item.label === "col_seq");
+    assert.equal(noTableSeqIdx, 0, `sequence col_seq should rank first when columns are not expected for ${databaseType}`);
+  }
+});
+
 // --- Schema name completion ---
 
 test("suggests schema names alongside tables in FROM context", () => {
@@ -4722,6 +4752,95 @@ test("table completions preserve identifier case by default (#11400)", () => {
   const userItem = items.find((item) => item.label === "USERS");
   assert.ok(userItem, "should keep original uppercase label");
   assert.equal(userItem?.apply, "USERS", "should apply original table name");
+});
+
+test("MySQL table completions preserve catalog case under identifierCase lower (#12938)", () => {
+  const mysqlTables = [{ name: "SETTLE_MZ", schema: "tmp_fj", type: "table" as const }];
+  const items = buildSqlCompletionItems("select * from s", "select * from s".length, {
+    tables: mysqlTables,
+    columnsByTable: new Map(),
+    databaseType: "mysql",
+    currentSchema: "tmp_fj",
+    identifierCase: "lower",
+    autoAliasTables: false,
+  });
+  const tableItem = items.find((item) => item.label === "SETTLE_MZ");
+  assert.ok(tableItem, "should provide table item with original uppercase label");
+  assert.equal(tableItem?.apply, "SETTLE_MZ", "should preserve original table casing in MySQL");
+});
+
+test("MySQL schema-qualified table completions preserve catalog case (#12938)", () => {
+  const mysqlTables = [
+    { name: "SETTLE_MZ", schema: "tmp_fj", type: "table" as const },
+    { name: "SETTLE_MZ", schema: "other_schema", type: "table" as const },
+  ];
+  const items = buildSqlCompletionItems("select * from s", "select * from s".length, {
+    tables: mysqlTables,
+    columnsByTable: new Map(),
+    databaseType: "mysql",
+    currentSchema: "other_schema",
+    identifierCase: "lower",
+    autoAliasTables: false,
+  });
+  const settleItem = items.find((item) => item.apply === "tmp_fj.SETTLE_MZ");
+  assert.ok(settleItem, "should qualify tmp_fj.SETTLE_MZ preserving original table case");
+});
+
+test("PostgreSQL mixed-case table completions preserve case and quotes under identifierCase (#12938)", () => {
+  const pgTables = [{ name: "Users", schema: "public", type: "table" as const }];
+  const itemsLower = buildSqlCompletionItems("select * from u", "select * from u".length, {
+    tables: pgTables,
+    columnsByTable: new Map(),
+    databaseType: "postgres",
+    currentSchema: "public",
+    identifierCase: "lower",
+    autoAliasTables: false,
+  });
+  const userItemLower = itemsLower.find((item) => item.label === "Users");
+  assert.ok(userItemLower, "should keep original mixed-case label");
+  assert.equal(userItemLower?.apply, '"Users"', "should keep double quotes and original case for mixed-case Postgres table");
+
+  const itemsUpper = buildSqlCompletionItems("select * from u", "select * from u".length, {
+    tables: pgTables,
+    columnsByTable: new Map(),
+    databaseType: "postgres",
+    currentSchema: "public",
+    identifierCase: "upper",
+    autoAliasTables: false,
+  });
+  const userItemUpper = itemsUpper.find((item) => item.label === "Users");
+  assert.ok(userItemUpper, "should keep original mixed-case label");
+  assert.equal(userItemUpper?.apply, '"Users"', "should not emit unquoted users or quoted USERS for mixed-case Postgres table");
+});
+
+test("SQL Server table completions preserve catalog case under identifierCase (#12938)", () => {
+  const sqlserverTables = [{ name: "SETTLE_MZ", schema: "dbo", type: "table" as const }];
+  const items = buildSqlCompletionItems("select * from s", "select * from s".length, {
+    tables: sqlserverTables,
+    columnsByTable: new Map(),
+    databaseType: "sqlserver",
+    currentSchema: "dbo",
+    identifierCase: "lower",
+    autoAliasTables: false,
+  });
+  const tableItem = items.find((item) => item.label === "SETTLE_MZ");
+  assert.ok(tableItem, "should keep original table label in SQL Server");
+  assert.equal(tableItem?.apply, "SETTLE_MZ", "should preserve original table casing in SQL Server");
+});
+
+test("Oracle mixed-case table completions preserve case and quotes under identifierCase (#12938)", () => {
+  const oracleTables = [{ name: "Users", schema: "SCOTT", type: "table" as const }];
+  const items = buildSqlCompletionItems("select * from u", "select * from u".length, {
+    tables: oracleTables,
+    columnsByTable: new Map(),
+    databaseType: "oracle",
+    currentSchema: "SCOTT",
+    identifierCase: "lower",
+    autoAliasTables: false,
+  });
+  const userItem = items.find((item) => item.label === "Users");
+  assert.ok(userItem, "should keep original mixed-case label in Oracle");
+  assert.equal(userItem?.apply, '"Users"', "should keep double quotes and original case for mixed-case Oracle table");
 });
 
 test("schema-qualified table completions follow identifierCase (#11400)", () => {
