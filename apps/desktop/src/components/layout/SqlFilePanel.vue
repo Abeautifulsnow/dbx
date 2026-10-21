@@ -93,22 +93,36 @@ function clearContentSearch() {
   contentSearchPending.value = false;
 }
 
-/** Extensions visible in the panel right now, derived from the loaded entries. */
-function visibleSqlFileExtensions(): string[] {
+/**
+ * Walks the loaded tree once and derives what the content search needs: the
+ * extensions to filter on and how deep the backend walk may go.
+ *
+ * Depth is measured against the tree itself rather than a constant: the tree is
+ * shown from `folders[].entries`, so a hit below its deepest file could never
+ * render. `WalkBuilder` counts the root as depth 0, while a direct child of a
+ * root is tree depth 0 — hence `deepestTreeDepth + 1`. Deriving it from the
+ * data means the panel's depth can never drift from the scanner's own contract
+ * (a duplicated `MAX_SCAN_DEPTH` would).
+ */
+function visibleSqlFileSearchScope(): { extensions: string[]; maxDepth: number } {
   const extensions = new Set<string>();
-  const visit = (items: SqlFileEntry[]) => {
+  let deepestFileDepth = -1;
+  const visit = (items: SqlFileEntry[], depth: number) => {
     for (const item of items) {
       if (item.is_dir) {
-        visit(item.children);
+        visit(item.children, depth + 1);
         continue;
       }
+      if (depth > deepestFileDepth) deepestFileDepth = depth;
       const dot = item.name.lastIndexOf(".");
       // A dotless name has no extension; only dotted names contribute a filter.
       if (dot > 0 && dot < item.name.length - 1) extensions.add(item.name.slice(dot + 1).toLowerCase());
     }
   };
-  for (const folder of folders.value) visit(folder.entries);
-  return [...extensions];
+  for (const folder of folders.value) visit(folder.entries, 0);
+  // Roots are all walked with a single depth, so use the deepest one. The tree
+  // is already depth-capped by the scanner, which keeps this bounded.
+  return { extensions: [...extensions], maxDepth: Math.max(deepestFileDepth + 1, 1) };
 }
 
 async function runContentSearch(query: string) {
@@ -133,7 +147,7 @@ async function runContentSearch(query: string) {
     return;
   }
   const generation = ++contentSearchGeneration;
-  const extensions = visibleSqlFileExtensions();
+  const { extensions, maxDepth } = visibleSqlFileSearchScope();
   // Nothing loaded yet (folders still scanning): a search without the panel's
   // extension set would walk unrelated files, so wait for the next reload.
   if (extensions.length === 0) {
@@ -143,7 +157,7 @@ async function runContentSearch(query: string) {
   }
   contentSearching.value = true;
   try {
-    const result = await searchSqlFileContents({ roots, query, extensions });
+    const result = await searchSqlFileContents({ roots, query, extensions, maxDepth });
     // Discard the answer if a newer query started meanwhile, or if the box no
     // longer shows this query — otherwise old hits would widen the tree.
     if (generation !== contentSearchGeneration || query !== searchQuery.value) return;

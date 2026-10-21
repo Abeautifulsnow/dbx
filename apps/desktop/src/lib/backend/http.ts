@@ -3078,6 +3078,8 @@ export interface GlobalSearchRequest {
   wholeWord?: boolean;
   limit?: number;
   respectIgnoreRules?: boolean;
+  /** Max traversal depth (`WalkBuilder` semantics: root = 0, its entries = 1). */
+  maxDepth?: number;
 }
 
 export interface GlobalSearchMatch {

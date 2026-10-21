@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GlobalSearchMatch } from "@/lib/backend/api";
 
 const mocks = vi.hoisted(() => ({
-  globalSearch: vi.fn(async (_request: { roots: string[]; query: string; extensions?: string[]; limit?: number; respectIgnoreRules?: boolean }): Promise<GlobalSearchMatch[]> => []),
+  globalSearch: vi.fn(async (_request: { roots: string[]; query: string; extensions?: string[]; limit?: number; respectIgnoreRules?: boolean; maxDepth?: number }): Promise<GlobalSearchMatch[]> => []),
 }));
 
 vi.mock("@/lib/backend/api", () => ({
@@ -36,7 +36,14 @@ describe("searchSqlFileContents", () => {
       extensions: ["sql", "ddl"],
       limit: SQL_FILE_CONTENT_SEARCH_RESULT_LIMIT,
       respectIgnoreRules: false,
+      maxDepth: undefined,
     });
+  });
+
+  it("forwards maxDepth so the walk cannot go deeper than the caller's tree", async () => {
+    await searchSqlFileContents({ roots: ["/sql"], query: "users", extensions: ["sql"], maxDepth: 3 });
+
+    expect(mocks.globalSearch).toHaveBeenCalledWith(expect.objectContaining({ maxDepth: 3 }));
   });
 
   it("skips the request for an empty query or when no roots are configured", async () => {

@@ -1411,6 +1411,12 @@ export interface GlobalSearchRequest {
    * exactly the files a raw directory listing shows (SQL file panel).
    */
   respectIgnoreRules?: boolean;
+  /**
+   * Maximum traversal depth using `WalkBuilder` semantics: the root itself is
+   * depth 0 and its direct entries are depth 1. Omit for an unbounded walk
+   * (Quick Open behavior).
+   */
+  maxDepth?: number;
 }
 
 export interface GlobalSearchMatch {

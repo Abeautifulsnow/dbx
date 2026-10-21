@@ -57,6 +57,13 @@ pub struct GlobalSearchRequest {
     /// does not filter hidden or ignored files).
     #[serde(default)]
     pub respect_ignore_rules: Option<bool>,
+    /// Maximum traversal depth, using `WalkBuilder` semantics: the root itself
+    /// is depth 0, entries directly inside it are depth 1. `None` (the default)
+    /// leaves the walk unbounded, which is the Quick Open behavior. The SQL file
+    /// panel derives this from its loaded tree so the walk can never descend
+    /// deeper than the panel is able to display.
+    #[serde(default)]
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -177,6 +184,9 @@ fn search_root(request: &GlobalSearchRequest, root: &str) -> Vec<GlobalSearchMat
         .git_global(respect_ignore_rules)
         .git_exclude(respect_ignore_rules)
         .follow_links(false);
+    // Depth 0 is the root itself, so callers measure "levels below the root".
+    // `None` keeps the historical unbounded walk (Quick Open).
+    builder.max_depth(request.max_depth);
     builder.filter_entry(|entry| {
         if entry.depth() == 0 {
             return true;
@@ -293,6 +303,7 @@ mod tests {
             whole_word: None,
             limit: None,
             respect_ignore_rules: None,
+            max_depth: None,
         }
     }
 
@@ -453,6 +464,35 @@ mod tests {
         r.respect_ignore_rules = Some(false);
         let results = global_search(r).await.unwrap();
         assert_eq!(matched_file_names(&results), vec!["main.sql".to_string()]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `root/top.sql` is depth 1, `root/a/b/deep.sql` is depth 3.
+    #[tokio::test]
+    async fn max_depth_bounds_the_walk() {
+        let root = temp_dir("max-depth");
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        std::fs::write(root.join("top.sql"), "SELECT needle;\n").unwrap();
+        std::fs::write(root.join("a").join("b").join("deep.sql"), "SELECT needle;\n").unwrap();
+
+        let mut shallow = req(&[root.to_str().unwrap()], "needle");
+        shallow.max_depth = Some(1);
+        assert_eq!(matched_file_names(&global_search(shallow).await.unwrap()), vec!["top.sql".to_string()]);
+
+        let mut exact = req(&[root.to_str().unwrap()], "needle");
+        exact.max_depth = Some(3);
+        assert_eq!(
+            matched_file_names(&global_search(exact).await.unwrap()),
+            vec!["deep.sql".to_string(), "top.sql".to_string()]
+        );
+
+        // `None` keeps the walk unbounded (Quick Open behavior unchanged).
+        let unlimited = req(&[root.to_str().unwrap()], "needle");
+        assert_eq!(unlimited.max_depth, None);
+        assert_eq!(
+            matched_file_names(&global_search(unlimited).await.unwrap()),
+            vec!["deep.sql".to_string(), "top.sql".to_string()]
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

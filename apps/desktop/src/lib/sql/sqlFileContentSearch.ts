@@ -34,6 +34,12 @@ export interface SearchSqlFileContentsOptions {
   /** Extensions without the leading dot, e.g. `["sql", "ddl"]`. */
   extensions?: string[];
   limit?: number;
+  /**
+   * Max traversal depth in `WalkBuilder` terms (root = 0, its entries = 1).
+   * Callers that render results from a bounded tree pass the tree's own depth so
+   * the walk cannot produce hits they are unable to display.
+   */
+  maxDepth?: number;
 }
 
 interface MutableGroup {
@@ -114,6 +120,7 @@ export async function searchSqlFileContents(options: SearchSqlFileContentsOption
     extensions,
     limit,
     respectIgnoreRules: false,
+    maxDepth: options.maxDepth,
   });
   return groupMatches(matches, query, limit);
 }

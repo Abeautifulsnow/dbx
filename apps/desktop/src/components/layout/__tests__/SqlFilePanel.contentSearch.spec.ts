@@ -119,8 +119,10 @@ describe("SqlFilePanel content search", () => {
     // Content results must not be mistaken for "no results".
     expect(host.querySelector("[data-sql-file-empty-search]")).toBeNull();
 
-    // The backend is asked for the panel's file set, ignore rules disabled.
-    expect(mocks.globalSearch).toHaveBeenCalledWith(expect.objectContaining({ roots: ["/sql"], query: "needle", extensions: ["sql"], respectIgnoreRules: false }));
+    // The backend is asked for the panel's file set, ignore rules disabled, and
+    // only as deep as the tree itself: fixture files sit at tree depth 1
+    // (queries/01_find_user.sql, alpha.sql…), i.e. WalkBuilder depth 2.
+    expect(mocks.globalSearch).toHaveBeenCalledWith(expect.objectContaining({ roots: ["/sql"], query: "needle", extensions: ["sql"], respectIgnoreRules: false, maxDepth: 2 }));
   });
 
   it("opens the file at the hit line and column when a snippet is clicked", async () => {
