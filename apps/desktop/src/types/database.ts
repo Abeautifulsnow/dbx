@@ -320,6 +320,11 @@ export interface SshTunnelConfig {
   use_ssh_agent?: boolean;
   ssh_agent_sock_path?: string;
   /**
+   * SHA-256 fingerprint (`SHA256:...`) of the one SSH agent identity to use.
+   * Empty means every identity the agent reports is tried, in order.
+   */
+  ssh_agent_key_fingerprint?: string;
+  /**
    * UI-facing choice of login method. Drives which credential inputs the
    * connection dialog shows; the backend still probes "none" then falls
    * back to key > password > agent based on which fields are non-empty,
@@ -348,6 +353,12 @@ export interface SshTunnelConfig {
    * and `enabled` are kept).
    */
   profile_id?: string;
+}
+
+export interface SshAgentIdentity {
+  fingerprint: string;
+  algorithm: string;
+  comment: string;
 }
 
 export interface SshConfigHostEntry {
@@ -2100,6 +2111,12 @@ export interface TabUiState {
   resultPaneOpen?: boolean;
   /** Tracks whether the active output view was auto-switched to "messages" by live server output during execution. */
   autoSwitchedToMessagesDuringExecution?: boolean;
+  /**
+   * Execution id whose batch run already auto-switched the output view to the
+   * summary. Keying the switch by run keeps it to once per execution, so a user
+   * who picks another view mid-run stays there.
+   */
+  batchSummaryExecutionId?: string;
   /** Small JSON-compatible snapshots owned by special-page components. */
   page?: Record<string, TabPageUiState>;
 }

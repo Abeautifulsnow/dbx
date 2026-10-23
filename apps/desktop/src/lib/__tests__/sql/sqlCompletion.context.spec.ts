@@ -634,6 +634,45 @@ describe("PostgreSQL sequence literal completion", () => {
     );
   });
 
+  it("ranks tables and columns ahead of sequences for matching prefixes (#12266)", () => {
+    const columnsByTable = new Map([["ORDERS", [{ name: "order_id", table: "ORDERS" }]]]);
+    const items = buildSqlCompletionItems("SELECT ord FROM ORDERS", "SELECT ord".length, {
+      tables: [{ name: "ORDERS" }],
+      objects: [{ name: "ORDER_SEQ", schema: "APP", type: "sequence" }],
+      columnsByTable,
+      databaseType: "oracle",
+      dialect: "oracle",
+    });
+
+    const columnIndex = items.findIndex((item) => item.label === "order_id" && item.type === "column");
+    const sequenceIndex = items.findIndex((item) => item.label === "ORDER_SEQ" && item.type === "sequence");
+    expect(columnIndex).toBeGreaterThanOrEqual(0);
+    expect(sequenceIndex).toBeGreaterThanOrEqual(0);
+    expect(columnIndex).toBeLessThan(sequenceIndex);
+  });
+
+  it("suppresses sequence suggestions and pseudo-columns when sequenceCompletionEnabled is false (#12266)", () => {
+    const items = buildSqlCompletionItems("SELECT ord", "SELECT ord".length, {
+      tables: [],
+      objects: [{ name: "ORDER_SEQ", schema: "APP", type: "sequence" }],
+      columnsByTable: new Map(),
+      databaseType: "oracle",
+      dialect: "oracle",
+      sequenceCompletionEnabled: false,
+    });
+    expect(items.some((item) => item.label === "ORDER_SEQ")).toBe(false);
+
+    const pseudoItems = buildSqlCompletionItems("SELECT ORDER_SEQ.", "SELECT ORDER_SEQ.".length, {
+      tables: [],
+      objects: [{ name: "ORDER_SEQ", schema: "APP", type: "sequence" }],
+      columnsByTable: new Map(),
+      databaseType: "oracle",
+      dialect: "oracle",
+      sequenceCompletionEnabled: false,
+    });
+    expect(pseudoItems.some((item) => item.label === "NEXTVAL" || item.label === "CURRVAL")).toBe(false);
+  });
+
   it("suggests Dameng sequences like Oracle sequences", () => {
     const unqualifiedItems = buildSqlCompletionItems("SELECT ord", "SELECT ord".length, {
       tables: [],
@@ -2758,5 +2797,60 @@ describe("quoted identifier completion filtering (issue #12008)", () => {
     ["", "test_"],
   ])("leaves %s (prefix %s) to CodeMirror's own matcher", (query, prefix) => {
     expect(quotedCompletionFilterPrefix(query, prefix)).toBeUndefined();
+  });
+});
+
+describe("Spanner keyword completion (issue #13129)", () => {
+  it.each([
+    "CREATE CHANGE STREAM",
+    "CREATE SEARCH INDEX",
+    "CREATE VECTOR INDEX",
+    "CREATE PROPERTY GRAPH",
+    "INTERLEAVE IN PARENT",
+    "STORING",
+    "PENDING_COMMIT_TIMESTAMP",
+    "GENERATE_UUID",
+    // Ported from the overlapping #13138 (row-deletion policies, DML exits,
+    // scalar types, sequence options) so one list carries the full dialect.
+    "ROW DELETION POLICY",
+    "THEN RETURN",
+    "INSERT OR UPDATE",
+    "SQL SECURITY INVOKER",
+    "BIT_REVERSED_POSITIVE",
+    "INT64",
+  ])("offers %s", (label) => {
+    const sql = "CREATE ";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "spanner",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.some((item) => item.label === label)).toBe(true);
+  });
+
+  it("keeps BigQuery-only syntax out of the Spanner keyword list", () => {
+    const sql = "SELECT * ";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "spanner",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+
+    // TABLESAMPLE and FOR SYSTEM_TIME AS OF are BigQuery syntax; Spanner reads
+    // staleness through the API, not SQL.
+    expect(items.some((item) => item.label === "TABLESAMPLE")).toBe(false);
+    expect(items.some((item) => item.label === "FOR SYSTEM_TIME AS OF")).toBe(false);
+  });
+
+  it("keeps Spanner-only DDL out of the PostgreSQL keyword list", () => {
+    const sql = "CREATE ";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "postgres",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.some((item) => item.label === "CREATE CHANGE STREAM")).toBe(false);
   });
 });

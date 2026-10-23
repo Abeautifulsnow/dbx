@@ -111,6 +111,7 @@ import type {
   SavedSqlLibrary,
   SshConfigHostEntry,
   LocalSshKey,
+  SshAgentIdentity,
   TunnelProfile,
   TransactionLog,
   ExternalSqlFileVersion,
@@ -318,6 +319,7 @@ export interface DriverRuntimeSummary {
 
 export interface DesktopSettings {
   show_tray_icon: boolean;
+  linux_floating_frame_enabled?: boolean;
   icon_theme: "default" | "black";
   quit_on_close: boolean;
   close_action_prompted: boolean;
@@ -2894,6 +2896,10 @@ export async function testTunnelProfile(profile: TunnelProfile): Promise<string>
   return invoke("test_tunnel_profile", { profile });
 }
 
+export async function listSshAgentIdentities(sshAgentSockPath: string): Promise<SshAgentIdentity[]> {
+  return invoke("list_ssh_agent_identities", { sshAgentSockPath });
+}
+
 export async function resolveSshPrompt(resolution: SshPromptResolution): Promise<void> {
   await invoke("resolve_ssh_prompt", { resolution });
 }
@@ -3494,6 +3500,11 @@ export async function discardDownloadedUpdate(cacheId: string): Promise<void> {
 
 export async function installDownloadedUpdate(cacheId: string, expectedVersion: string): Promise<void> {
   return invoke("install_downloaded_update", { cacheId, expectedVersion });
+}
+
+export async function relaunchApp(): Promise<void> {
+  // macOS relaunches through LaunchServices so the new process keeps its local-network grant.
+  return invoke("relaunch_app");
 }
 
 export async function getAppVersion(): Promise<string> {

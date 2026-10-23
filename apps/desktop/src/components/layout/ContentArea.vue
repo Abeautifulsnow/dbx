@@ -30,6 +30,7 @@ import {
   Search,
   TableProperties,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Inbox,
   RefreshCcw,
@@ -84,6 +85,7 @@ import ObjectDependenciesPanel from "@/components/objects/ObjectDependenciesPane
 import { objectDependencyTarget, isObjectDependencySection, type ObjectDependencyTarget, type ObjectDetailsSection } from "@/lib/database/objectDependencyDetails";
 import DataGridFreezeFirstColumnControl from "@/components/grid/DataGridFreezeFirstColumnControl.vue";
 import DataGridStatusSqlControl from "@/components/grid/DataGridStatusSqlControl.vue";
+import type { DataGridSqlPreview } from "@/components/grid/dataGridSqlPreview";
 import DataGridCopyFormatControl from "@/components/grid/DataGridCopyFormatControl.vue";
 import DataGridFontFamilyControl from "@/components/grid/DataGridFontFamilyControl.vue";
 import DataGridColumnWidthModeControl from "@/components/grid/DataGridColumnWidthModeControl.vue";
@@ -112,6 +114,7 @@ function preloadDataGridComponent() {
 
 const QueryEditor = defineAsyncComponent({ loader: () => import("@/components/editor/QueryEditor.vue"), loadingComponent: QueryLoadingState, delay: 0 });
 const DataGrid = defineAsyncComponent(loadDataGridComponent);
+const DataGridSqlPreviewDialog = defineAsyncComponent(() => import("@/components/grid/DataGridSqlPreviewDialog.vue"));
 const QueryResultTransferDialog = defineAsyncComponent(() => import("@/components/transfer/QueryResultTransferDialog.vue"));
 const RedisKeyBrowser = defineAsyncComponent(() => import("@/components/redis/RedisKeyBrowser.vue"));
 const RedisQueryConsoleOutput = defineAsyncComponent(() => import("@/components/redis/RedisQueryConsoleOutput.vue"));
@@ -367,7 +370,14 @@ const dataGridViewOptionsOpen = ref(false);
 // real overflow; tiers then drop button labels and move secondary actions
 // into the overflow menu instead of crushing the chips away.
 const dataToolbarRef = ref<HTMLElement | null>(null);
-const { tier: dataToolbarTier } = useToolbarOverflow(dataToolbarRef, [() => props.activeTab.id, () => !!props.activeTab.result]);
+const { tier: dataToolbarTier } = useToolbarOverflow(dataToolbarRef, [
+  () => props.activeTab.id,
+  () => !!props.activeTab.result,
+  // The grid exposes these only after the table result mounts; the toolbar's
+  // action set grows at that point, so the row must be re-measured.
+  () => !!dataGridRef.value?.canOpenTableStructureEditor,
+  () => !!dataGridRef.value?.goToColumnToolbarCapability?.visible,
+]);
 const dataToolbarCompact = computed(() => dataToolbarTier.value >= 1);
 const showDataColumnsChip = computed(() => dataToolbarTier.value < 2);
 const dataGridRenderMode = computed(() => settingsStore.editorSettings.dataGridRenderMode);
@@ -429,6 +439,41 @@ function viewObjectDependencySql(context: ObjectDependencyTarget, sql: string) {
 const canOpenTableImport = computed(() => supportsTableImport(activeEffectiveDatabaseType.value));
 const activeVectorConnection = computed(() => connectionStore.getConfig(props.activeTab.connectionId) ?? props.activeConnection);
 const activeDataTabExecutionDatabase = computed(() => dataTabExecutionDatabase(props.activeConnection, props.activeTab.database, activeDataTabTableMeta.value?.catalog));
+const tableSqlPreview = ref<{
+  preview: DataGridSqlPreview;
+  connectionId: string;
+  database: string;
+  schema?: string;
+  catalog?: string;
+} | null>(null);
+
+function viewTableSql(preview: DataGridSqlPreview) {
+  const tab = props.activeTab;
+  if (tab.mode !== "data") return;
+  const meta = activeDataTabTableMeta.value;
+  tableSqlPreview.value = {
+    preview,
+    connectionId: tab.connectionId,
+    // Query tabs need the logical database inside the catalog, not the pool's internal database.
+    database: tab.database,
+    schema: meta?.schema ?? tab.schema,
+    catalog: meta?.catalog ?? tab.catalog,
+  };
+}
+
+function openTableSqlInNewQuery(sql: string) {
+  const snapshot = tableSqlPreview.value;
+  if (!snapshot?.connectionId || !sql.trim()) return;
+  tableSqlPreview.value = null;
+  queryStore.createTab(snapshot.connectionId, snapshot.database, undefined, "query", snapshot.schema, sql, snapshot.catalog, { forceNew: true, schemaQualifiesSql: true });
+}
+
+watch(
+  () => props.activeTab.id,
+  () => {
+    tableSqlPreview.value = null;
+  },
+);
 const activeSqlStatementParameterOptions = computed(() =>
   sqlStatementParameterOptionsForCompatibility(activeEffectiveDatabaseType.value, activeEffectiveDatabaseType.value === "opengauss" ? connectionStore.databaseCompatibilityMode(activeResultConnectionId.value, activeResultDatabase.value) : undefined),
 );
@@ -1156,12 +1201,22 @@ watch(
 );
 
 watch(
-  () => [props.activeTab.id, props.activeTab.result, props.activeTab.results, props.activeTab.isExecuting, props.activeOutputView] as const,
+  () => [props.activeTab.id, props.activeTab.result, props.activeTab.results, props.activeTab.isExecuting, props.activeTab.batchSqlExecution, props.activeOutputView] as const,
   () => {
     // The output view belongs to the shared result surface. An editor-only
     // surface (a background group's editor) must never redirect the global
     // view when its own tab finishes executing.
     if (props.editorOnly) return;
+    // Show statement-by-statement progress only when summary is the configured
+    // default; otherwise this watcher would override the execution entry point's
+    // result-grid selection. Record the switch per run so a user's subsequent
+    // manual view selection survives progress updates.
+    const batchExecution = props.activeTab.batchSqlExecution;
+    if (settingsStore.editorSettings.multiStatementDefaultView === "summary" && batchExecution && batchExecution.finishedAt === undefined && batchExecution.total > 1 && props.activeOutputView === "result" && props.activeTab.uiState?.batchSummaryExecutionId !== batchExecution.executionId) {
+      queryStore.updateTabUiState(props.activeTab.id, { activeOutputView: "summary", batchSummaryExecutionId: batchExecution.executionId });
+      emit("update:activeOutputView", props.activeTab.id, "summary");
+      return;
+    }
     if (props.activeTab.isExecuting) return;
     if (props.activeOutputView === "graph" && !canShowGraphOutput.value) {
       emit("update:activeOutputView", props.activeTab.id, "result");
@@ -1817,6 +1872,10 @@ function requestQueryEditorExecute() {
   return queryEditorRef.value?.requestExecute();
 }
 
+function requestQueryEditorExecuteAll() {
+  return queryEditorRef.value?.requestExecuteAll();
+}
+
 function captureQueryEditorExecutionSnapshot() {
   if (!sourceSectionActive.value) return;
   return queryEditorRef.value?.captureExecutionSnapshot();
@@ -1987,6 +2046,7 @@ defineExpose({
   refreshQueryEditorCompletionCache,
   handleModRTarget,
   requestQueryEditorExecute,
+  requestQueryEditorExecuteAll,
   captureQueryEditorExecutionSnapshot,
   requestQueryEditorExecuteInNewResultTab,
   requestQueryEditorPreviewChanges,
@@ -2128,7 +2188,7 @@ defineExpose({
           </div>
         </Pane>
         <Pane v-if="(resultsPaneOpen || resultOnly) && !editorOnly" class="min-h-0" :size="resultOnly ? 100 : resultsPaneSize" :min-size="resultOnly ? 100 : 20">
-          <div data-query-result-surface class="h-full flex flex-col border border-transparent" :style="activeResultColor ? { borderColor: activeResultColor } : undefined">
+          <div data-query-result-surface class="h-full flex flex-col">
             <!--
               The shared result surface (resultOnly) is always mounted regardless of
               whether the active tab has run a query yet, and this toolbar is the only
@@ -2649,12 +2709,12 @@ defineExpose({
             />
 
             <div v-else-if="activeOutputView === 'summary'" class="flex flex-1 min-h-0 min-w-0 overflow-auto bg-background">
-              <div v-if="summaryItems.length === 0" class="flex h-full items-center justify-center text-sm text-muted-foreground">
+              <div v-if="summaryItems.length === 0" class="flex flex-1 h-full min-w-0 items-center justify-center text-sm text-muted-foreground">
                 <Loader2 v-if="activeTab.isExecuting" class="mr-2 h-4 w-4 animate-spin" />
                 <template v-if="activeTab.isExecuting">{{ t("executionSummary.executing") }}</template>
                 <template v-else>{{ t("executionSummary.empty") }}</template>
               </div>
-              <div v-else class="flex min-h-full min-w-[46rem] flex-col">
+              <div v-else class="flex flex-1 min-h-full min-w-[46rem] flex-col">
                 <div v-if="batchExecutionProgress" class="z-10 shrink-0 border-b bg-background/95 px-3 py-2 backdrop-blur">
                   <div class="mb-1.5 flex items-center gap-3 text-xs">
                     <span class="font-medium">{{ activeTab.isExecuting ? t("executionSummary.executing") : t("executionSummary.finished") }}</span>
@@ -2955,37 +3015,44 @@ defineExpose({
     <template v-else-if="activeTab.mode === 'data'">
       <div class="flex-1 min-h-0 flex flex-col">
         <div ref="dataToolbarRef" class="h-9 shrink-0 border-b bg-background/80 px-3 flex items-center gap-2 text-xs overflow-hidden">
-          <!-- No fixed max-w cap on these chips: they must flex (truncate)
-               so long names only clip when the header row itself runs out
-               (#7880). The min-w floor keeps scrollWidth reporting real
-               overflow so the measured tiers condense the row before the
-               chips collapse. -->
-          <button
-            v-if="activeConnection?.name?.trim()"
-            type="button"
-            data-data-header-connection
-            class="inline-flex min-w-12 items-center truncate rounded border border-border bg-muted/30 px-2 py-0.5 text-muted-foreground cursor-pointer hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none"
-            :title="activeConnection.name"
-            :disabled="!activeTab.connectionId"
-            @click="queryStore.openDatabaseBrowser(activeTab.connectionId)"
-          >
-            {{ activeConnection.name }}
-          </button>
-          <span class="inline-flex min-w-12 items-center truncate rounded border border-border bg-muted/50 px-2 py-0.5 font-medium" :title="activeDataTabTableMeta?.tableName || activeTab.title">
-            {{ activeDataTabTableMeta?.tableName || activeTab.title }}
-          </span>
-          <button
-            type="button"
-            data-data-header-database
-            class="inline-flex min-w-12 items-center truncate rounded border border-border bg-muted/30 px-2 py-0.5 text-muted-foreground cursor-pointer hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none"
-            :title="[activeDataTabTableMeta?.schema, databaseDisplayNameForTab(activeTab.connectionId, activeTab.database, t)].filter(Boolean).join('@')"
-            :disabled="!activeTab.connectionId || !activeTab.database"
-            @click="queryStore.openObjectBrowser(activeTab.connectionId, activeTab.database, activeDataTabTableMeta?.schema, activeDataTabTableMeta?.catalog)"
-          >
-            <template v-if="activeDataTabTableMeta?.schema">{{ activeDataTabTableMeta.schema }}@</template>{{ databaseDisplayNameForTab(activeTab.connectionId, activeTab.database, t) }}
-          </button>
-          <span v-if="showDataColumnsChip && activeDataTabTableMeta" class="inline-flex shrink-0 items-center rounded border border-border bg-muted/30 px-2 py-0.5 font-medium text-muted-foreground tabular-nums"> {{ activeDataTabTableMeta.columns.length }} {{ t("tree.columns") }} </span>
-          <span class="ml-auto" />
+          <!-- Context breadcrumb. The connection and database segments are
+               capped so a long connection name can never eat half the row;
+               the table name gets the remaining room and is the only filled
+               segment, which keeps the hierarchy obvious at a glance. -->
+          <div class="flex min-w-[18rem] flex-1 items-center gap-1 overflow-hidden">
+            <button
+              v-if="activeConnection?.name?.trim()"
+              type="button"
+              data-data-header-connection
+              class="inline-flex max-w-[13rem] shrink items-center gap-1 rounded text-muted-foreground cursor-pointer hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none"
+              :class="dataToolbarCompact ? 'w-5 justify-center px-0.5' : 'min-w-[3.5rem] px-1 py-0.5'"
+              :title="activeConnection.name"
+              :aria-label="activeConnection.name"
+              :disabled="!activeTab.connectionId"
+              @click="queryStore.openDatabaseBrowser(activeTab.connectionId)"
+            >
+              <Database class="h-3 w-3 shrink-0 opacity-70" aria-hidden="true" />
+              <span v-if="!dataToolbarCompact" class="truncate">{{ activeConnection.name }}</span>
+            </button>
+            <span v-if="activeConnection?.name?.trim()" class="shrink-0 text-muted-foreground/40" aria-hidden="true">/</span>
+            <button
+              type="button"
+              data-data-header-database
+              class="inline-flex min-w-[2.5rem] max-w-[12rem] shrink items-center rounded px-1 py-0.5 text-muted-foreground cursor-pointer hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none"
+              :title="[activeDataTabTableMeta?.schema, databaseDisplayNameForTab(activeTab.connectionId, activeTab.database, t)].filter(Boolean).join('@')"
+              :disabled="!activeTab.connectionId || !activeTab.database"
+              @click="queryStore.openObjectBrowser(activeTab.connectionId, activeTab.database, activeDataTabTableMeta?.schema, activeDataTabTableMeta?.catalog)"
+            >
+              <span class="truncate"
+                ><template v-if="activeDataTabTableMeta?.schema">{{ activeDataTabTableMeta.schema }}@</template>{{ databaseDisplayNameForTab(activeTab.connectionId, activeTab.database, t) }}</span
+              >
+            </button>
+            <ChevronRight class="h-3 w-3 shrink-0 text-muted-foreground/40" aria-hidden="true" />
+            <span class="inline-flex min-w-[6rem] items-center rounded-md bg-muted/60 px-2 py-0.5 font-medium text-foreground" :title="activeDataTabTableMeta?.tableName || activeTab.title">
+              <span class="truncate">{{ activeDataTabTableMeta?.tableName || activeTab.title }}</span>
+            </span>
+            <span v-if="showDataColumnsChip && activeDataTabTableMeta" class="shrink-0 whitespace-nowrap text-muted-foreground tabular-nums">{{ activeDataTabTableMeta.columns.length }} {{ t("tree.columns") }}</span>
+          </div>
           <LightTooltip v-if="dataGridRef?.canOpenTableStructureEditor" :text="t('contextMenu.editStructure')" side="bottom" nowrap>
             <Button data-edit-table-structure variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" :aria-label="t('contextMenu.editStructure')" @click="dataGridRef?.openTableStructureEditor('columns')">
               <PencilRuler class="h-3.5 w-3.5" />
@@ -3329,6 +3396,7 @@ defineExpose({
           :editable="!activeTab.tableMetaPending && (isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType) || !!influxDbV1DeleteSaveHandler)"
           :custom-save-handler="influxDbV1DeleteSaveHandler"
           context="table-data"
+          @view-sql="viewTableSql"
           :initial-where-input="activeTab.whereInput"
           :database-type="activeEffectiveDatabaseType"
           :connection-id="activeTab.connectionId"
@@ -3711,6 +3779,7 @@ defineExpose({
       <DamengRoleAdmin :key="activeTab.id" :connection="activeConnection" />
     </template>
 
+    <DataGridSqlPreviewDialog v-if="tableSqlPreview" :preview="tableSqlPreview.preview" :can-open-query="!!tableSqlPreview.connectionId" @close="tableSqlPreview = null" @open-query="openTableSqlInNewQuery" />
     <Dialog v-model:open="resultRunRenameOpen">
       <DialogContent class="sm:max-w-[400px]">
         <DialogHeader>

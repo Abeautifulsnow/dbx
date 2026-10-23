@@ -140,6 +140,7 @@ import {
   shouldIncludeSyntheticRowId,
   showsKeylessEditWarning,
 } from "@/lib/table/tableEditing";
+import { rowIdLocatorUnsupported } from "@/lib/table/tableRowIdSupport";
 import { buildDataGridConditionalUpdateSql, buildDataGridContextFilterCondition, buildDataGridCountSql, buildHiveTablePropertiesSql, type DataGridContextFilterMode } from "@/lib/dataGrid/dataGridSql";
 import { sumGridCountValues } from "@/lib/dataGrid/dataGridCountValue";
 import {
@@ -291,6 +292,7 @@ import { createRowLowerTextCache } from "@/lib/dataGrid/dataGridRowLowerText";
 import { dataGridPreviewLabelKey, dataGridSaveActionMode, dataGridSaveToolbarState } from "@/lib/dataGrid/dataGridSaveUi";
 import { buildDataGridSavedRowRefreshPlan, dataGridSavedRowRefreshPatches, executeDataGridSavedRowRefreshQuery } from "@/lib/dataGrid/dataGridSavedRowRefresh";
 import type { QueryEditabilityReason } from "@/lib/sql/sqlAnalysis";
+import type { DataGridSqlPreview } from "./dataGridSqlPreview";
 import { sqlWithoutCommentsForCopy } from "@/lib/sql/sqlWithoutCommentsForCopy";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { EDITOR_FONT_FAMILY_CSS_VAR } from "@/lib/editor/editorThemes";
@@ -479,8 +481,20 @@ const largeValueResolutionVersion = ref(0);
 const tableDataFullTextMode = ref(false);
 const tableDataFullTextLoading = ref(false);
 const tableDataPreviewNoticeDismissed = ref(false);
+// Dismissing the banner only silences it for the current result, so every new
+// table or page brought it back. The "don't show again" action persists here
+// and leaves a compact icon that still loads the full text on demand (#12906).
+const TABLE_DATA_PREVIEW_NOTICE_HIDDEN_KEY = "dbx-table-data-preview-notice-hidden";
+function readTableDataPreviewNoticeHidden(): boolean {
+  try {
+    return localStorage.getItem(TABLE_DATA_PREVIEW_NOTICE_HIDDEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+const tableDataPreviewNoticeHidden = ref(readTableDataPreviewNoticeHidden());
 const tableDataPreviewTruncated = computed(() => !!props.tableMeta && (props.result.large_value_cells?.length ?? 0) > 0);
-const showTableDataPreviewNotice = computed(() => tableDataPreviewTruncated.value && !tableDataFullTextMode.value && !tableDataPreviewNoticeDismissed.value);
+const showTableDataPreviewNotice = computed(() => tableDataPreviewTruncated.value && !tableDataFullTextMode.value && !tableDataPreviewNoticeHidden.value && !tableDataPreviewNoticeDismissed.value);
 const tableDataFullTextEnabled = computed(() => !!props.tableMeta && tableDataFullTextMode.value);
 const multiRowTranspose = computed(() => settingsStore.editorSettings.dataGridMultiRowTranspose);
 const hideNullColumns = computed(() => settingsStore.editorSettings.dataGridHideNullColumns);
@@ -709,6 +723,7 @@ function logDataGridTiming(message: string, payload?: Record<string, unknown>) {
 }
 
 const emit = defineEmits<{
+  viewSql: [preview: DataGridSqlPreview];
   reload: [sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number, intent?: DataGridReloadIntent];
   paginate: [offset: number, limit: number, whereInput?: string, orderBy?: string, appendResult?: boolean];
   sort: [column: string, columnIndex: number, direction: "asc" | "desc" | null, whereInput?: string, mode?: DataGridSortMode, effectiveOrderBy?: string];
@@ -2799,7 +2814,7 @@ function columnWidthDisplayValue(value: CellValue, columnIndex: number): CellVal
   return showWhitespaceEnabled.value && typeof display === "string" ? gridCellDisplayValue(display, flatteningMultiLineEnabled.value, true) : display;
 }
 
-const { initColumnWidths, growColumnWidthsToFitSamples, onResizeStart, autoFitColumn, autoFitAllColumns, renderedColumnWidths, totalWidth, columnVars, getIsResizing } = useDataGridColumnResize({
+const { initColumnWidths, growColumnWidthsToFitSamples, onResizeStart, autoFitColumn, autoFitAllColumns, resetColumnWidths, hasUserSizedColumns, renderedColumnWidths, totalWidth, columnVars, getIsResizing } = useDataGridColumnResize({
   columns: visibleColumns,
   sourceRows: computed(() => props.result.rows),
   columnIndexes: visibleColumnIndexes,
@@ -4526,7 +4541,7 @@ async function refreshSavedRows(request: { dirtyRows: ReadonlyMap<number, Readon
     ...largeValuePreviewOptions,
     whereInput: identityConditions.join(" OR "),
     limit: planResult.plan.sourceIndexes.length + 1,
-    includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
+    includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType) && !(props.connectionId && rowIdLocatorUnsupported(props.connectionId)),
   });
   const refreshed = await executeDataGridSavedRowRefreshQuery(api, {
     connectionId,
@@ -5969,6 +5984,19 @@ async function loadCurrentPageFullText() {
 
 function dismissTableDataPreviewNotice() {
   tableDataPreviewNoticeDismissed.value = true;
+}
+
+/// Persistently silences the banner across tables and pages. The toolbar action
+/// row keeps "load the full text for this page" reachable without leaving an
+/// empty banner line behind.
+function hideTableDataPreviewNoticeForGood() {
+  tableDataPreviewNoticeHidden.value = true;
+  try {
+    localStorage.setItem(TABLE_DATA_PREVIEW_NOTICE_HIDDEN_KEY, "1");
+  } catch {
+    // Storage can be unavailable (private mode, quota); the banner then simply
+    // comes back on the next start instead of failing the click.
+  }
 }
 
 const exportContextCell = computed(() => {
@@ -7699,7 +7727,7 @@ async function applyOrderBySearch(_value?: string, structuredOrderByOverride?: s
       injectDefaultTimeSeriesWhere: true,
       limit: pageSize.value,
       whereInput: currentWhereInput(),
-      includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
+      includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType) && !(props.connectionId && rowIdLocatorUnsupported(props.connectionId)),
     });
     markConditionInputsApplied();
     await props.onExecuteSql(sql);
@@ -7742,7 +7770,7 @@ async function applyWhereFilter() {
       limit: pageSize.value,
       injectDefaultTimeSeriesWhere: true,
       whereInput,
-      includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
+      includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType) && !(props.connectionId && rowIdLocatorUnsupported(props.connectionId)),
     });
     markConditionInputsApplied();
     await props.onExecuteSql(sql);
@@ -12586,6 +12614,19 @@ function onRowContext(rowId: number, rowIndex: number) {
 
 const sqlOneLiner = computed(() => userFacingSql.value.replace(/\s+/g, " ").trim());
 
+function viewStatusSql() {
+  if (props.context !== "table-data") {
+    void copyUserFacingSql();
+    return;
+  }
+  emit("viewSql", {
+    sql: userFacingSql.value,
+    actualSql: actualExecutionSql.value,
+    isCurrentPage: !!props.result.sqlPage,
+    probeLimit: props.result.sqlPage?.probe ? props.result.sqlPage.executedLimit : undefined,
+  });
+}
+
 async function copyUserFacingSql() {
   if (userFacingSql.value) await copyText(userFacingSql.value);
 }
@@ -13894,6 +13935,8 @@ defineExpose({
   moveDisplayableColumn,
   resetColumnOrder,
   autoFitAllColumns,
+  resetColumnWidths,
+  hasUserSizedColumns,
   nullColumnsHidden,
   allNullColumnCount,
   canToggleAllNullColumns,
@@ -14301,6 +14344,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
       frozenColumnCount: frozenColumnCount.value,
       contextVisibleColIdx: contextHeaderVisibleColIdx.value ?? undefined,
       hasColumnSelection: hasColumnSelection.value,
+      hasUserSizedColumns: hasUserSizedColumns.value,
       selectedColumnCount,
       visibleColumnCount: visibleColumnCount.value,
       hiddenColumnCount: hiddenColumnCount.value,
@@ -14331,6 +14375,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
         hideSelectedColumns: t("grid.hideSelectedColumns", { count: selectedColumnCount }),
         hideIdenticalColumns: identicalColumnCount > 0 ? t("grid.hideIdenticalColumnsCount", { count: identicalColumnCount }) : t("grid.hideIdenticalColumns"),
         showAllColumnsMenu: t("grid.showAllColumnsMenu"),
+        clearRememberedColumnWidths: t("grid.clearRememberedColumnWidths"),
       },
       icons: {
         copy: Copy,
@@ -14339,6 +14384,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
         ascending: ArrowUp,
         descending: ArrowDown,
         clearSort: Eraser,
+        clearRememberedColumnWidths: RotateCcw,
       },
       actions: {
         copyName: copyHeaderColumnOrSelected,
@@ -14348,6 +14394,10 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
         copyAlterSql: copyAlterColumnSql,
         copyMetadata: copyContextColumnMetadata,
         sort: applyContextSort,
+        clearRememberedColumnWidths: () => {
+          resetColumnWidths();
+          clearCellSelection();
+        },
         freezeToColumn: () => {
           const idx = contextHeaderVisibleColIdx.value;
           if (idx !== null && idx >= 0) {
@@ -14679,6 +14729,20 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
             @wheel="onDataGridTopbarFixedActionWheel"
           >
             <template #leading>
+              <!-- Once the banner is silenced for good, the full-text entry moves
+                   into the existing action row rather than keeping an empty
+                   banner line of its own. -->
+              <Tooltip v-if="tableDataPreviewTruncated && tableDataPreviewNoticeHidden && !tableDataFullTextMode">
+                <TooltipTrigger as-child>
+                  <Button variant="ghost" size="sm" :disabled="tableDataFullTextLoading" class="data-grid-topbar-action-button h-5 shrink-0 text-xs px-1.5" @click="loadCurrentPageFullText">
+                    <Info class="data-grid-topbar-action-icon w-3 h-3 text-amber-600 dark:text-amber-400" />
+                    <span class="data-grid-topbar-action-label" :class="{ 'data-grid-topbar-action-label--compact': compactDataGridToolbarActions }">{{ t("grid.tableDataPreviewLoadPageShort") }}</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" class="max-w-none">
+                  <p class="whitespace-nowrap">{{ t("grid.tableDataPreviewLoadPageShortTitle") }}</p>
+                </TooltipContent>
+              </Tooltip>
               <slot v-if="hasResultToolbarActionsSlot" name="result-toolbar-actions" :compact="compactDataGridToolbarActions" />
               <DataGridVirtualRowIdentifier
                 v-if="showVirtualRowIdentifierControl"
@@ -14839,22 +14903,30 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
           @copy-sql="copySortSqlPreview"
           @apply="applyStructuredSortRules"
         />
-        <!-- Large table preview notice: explicit opt-in instead of guessing from column width (#12289). -->
+        <!-- Large table preview notice: explicit opt-in instead of guessing from column width (#12289).
+             Once "don't show again" is used the banner disappears and the full-text entry moves into the
+             toolbar action row, so no extra line is kept just for an icon (#12906). -->
         <div v-if="showTableDataPreviewNotice" data-grid-preview-notice class="shrink-0 px-3 py-1.5 bg-amber-500/10 border-b border-amber-500/20 text-xs text-amber-700 dark:text-amber-300 flex flex-wrap items-center gap-x-2 gap-y-1">
           <Info class="h-3.5 w-3.5 shrink-0" />
           <span>{{ t("grid.tableDataPreviewNotice") }}</span>
           <button type="button" class="font-medium underline underline-offset-2 decoration-dotted hover:text-amber-900 disabled:opacity-50 dark:hover:text-amber-100" :disabled="tableDataFullTextLoading" @click="loadCurrentPageFullText">
             {{ tableDataFullTextLoading ? t("grid.tableDataPreviewLoading") : t("grid.tableDataPreviewLoadPage") }}
           </button>
-          <button
-            type="button"
-            class="ml-auto shrink-0 rounded p-0.5 text-amber-600/70 hover:bg-amber-500/10 hover:text-amber-800 dark:text-amber-400/70 dark:hover:text-amber-200"
-            :title="t('grid.tableDataPreviewDismiss')"
-            :aria-label="t('grid.tableDataPreviewDismiss')"
-            @click="dismissTableDataPreviewNotice"
-          >
-            <X class="h-3.5 w-3.5" />
-          </button>
+          <div class="ml-auto flex shrink-0 items-center gap-1.5">
+            <button type="button" class="font-medium underline underline-offset-2 decoration-dotted hover:text-amber-900 dark:hover:text-amber-100" @click="hideTableDataPreviewNoticeForGood">
+              {{ t("grid.tableDataPreviewDontShowAgain") }}
+            </button>
+            <span class="h-3 w-px shrink-0 bg-amber-500/30 dark:bg-amber-400/30" aria-hidden="true" />
+            <button
+              type="button"
+              class="shrink-0 rounded p-0.5 text-amber-600/70 hover:bg-amber-500/10 hover:text-amber-800 dark:text-amber-400/70 dark:hover:text-amber-200"
+              :title="t('grid.tableDataPreviewDismiss')"
+              :aria-label="t('grid.tableDataPreviewDismiss')"
+              @click="dismissTableDataPreviewNotice"
+            >
+              <X class="h-3.5 w-3.5" />
+            </button>
+          </div>
         </div>
 
         <!-- Truncation warning banner -->
@@ -16591,14 +16663,14 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
       <div v-if="selectedColumnInfo" data-grid-column-info class="min-w-0 max-w-full truncate select-text max-sm:absolute max-sm:left-3 max-sm:right-3 max-sm:top-1" :title="selectedColumnInfo">
         {{ selectedColumnInfo }}
       </div>
-      <div v-else-if="settingsStore.editorSettings.showDataGridStatusSql && sqlOneLiner" class="min-w-0 max-w-full justify-self-center">
+      <div v-else-if="settingsStore.editorSettings.showDataGridStatusSql && sqlOneLiner" class="flex min-w-0 max-w-full items-center gap-1 justify-self-center">
         <CustomContextMenu :items="statusSqlContextMenuItems" v-slot="{ onContextMenu }">
           <Tooltip>
             <TooltipTrigger as-child>
-              <span class="block min-w-0 max-w-full truncate opacity-60 cursor-pointer hover:opacity-100" data-result-sql @click="copyUserFacingSql" @contextmenu="onContextMenu">
+              <button type="button" class="block min-w-0 max-w-full truncate text-left opacity-60 cursor-pointer hover:opacity-100" data-result-sql :aria-label="t(context === 'table-data' ? 'grid.viewQuerySql' : 'grid.copyQuerySql')" @click="viewStatusSql" @contextmenu="onContextMenu">
                 <span v-if="result.sqlPage">{{ t("grid.currentPageSql") }}: </span>
                 {{ sqlOneLiner }}
-              </span>
+              </button>
             </TooltipTrigger>
             <TooltipContent side="top" class="max-w-md">
               <div v-if="result.sqlPage" class="mb-1 font-medium">{{ t("grid.currentPageSql") }}</div>
@@ -16611,6 +16683,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
             </TooltipContent>
           </Tooltip>
         </CustomContextMenu>
+        <Button v-if="context === 'table-data'" variant="ghost" size="icon" class="h-6 w-6 shrink-0" :aria-label="t('grid.copyQuerySql')" :title="t('grid.copyQuerySql')" @click="copyUserFacingSql"><Copy class="h-3 w-3" /></Button>
       </div>
       <span v-else class="min-w-0" />
 
