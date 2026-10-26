@@ -46,6 +46,9 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
     private ScheduledExecutorService maintenance;
     private boolean blobBindStatements;
+    private boolean nativeJobSessions;
+    private boolean nativeLegacyJobs;
+    private boolean exactMetadataIdentity;
 
     public MultiSessionJsonRpcServer(Supplier<? extends DatabaseAgent> agentFactory) {
         this(agentFactory, new JdbcConnectionPoolRegistry(), RuntimeLimits.defaults());
@@ -98,6 +101,24 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
         return server;
     }
 
+    public static MultiSessionJsonRpcServer withNativeJobSessions(Supplier<? extends DatabaseAgent> agentFactory) {
+        MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(agentFactory);
+        server.nativeJobSessions = true;
+        return server;
+    }
+
+    public static MultiSessionJsonRpcServer withNativeLegacyJobs(Supplier<? extends DatabaseAgent> agentFactory, boolean blobBindings) {
+        MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(agentFactory);
+        server.nativeLegacyJobs = true;
+        server.blobBindStatements = blobBindings;
+        return server;
+    }
+
+    public MultiSessionJsonRpcServer withExactMetadataIdentity() {
+        exactMetadataIdentity = true;
+        return this;
+    }
+
     public void run() {
         synchronized (outputLock) {
             protocolOutput.println("{\"ready\":true}");
@@ -146,7 +167,7 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
             Object result;
             if (AgentProtocol.METHOD_HANDSHAKE.equals(method)) {
                 result = sessionHandlerFactory == null
-                    ? AgentProtocol.multiSessionJdbcHandshakeResult(blobBindStatements)
+                    ? AgentProtocol.withExactMetadataIdentity(AgentProtocol.multiSessionJdbcHandshakeResult(blobBindStatements, nativeJobSessions, nativeLegacyJobs), exactMetadataIdentity)
                     : customHandshake();
             } else if (AgentProtocol.METHOD_OPEN_SESSION.equals(method)) {
                 result = openSession(requiredSessionId(params), params);

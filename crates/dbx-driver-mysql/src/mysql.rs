@@ -43,6 +43,12 @@ pub struct MySqlPool {
     inner: mysql_async::Pool,
     max_connections: usize,
     checkout_verifications: std::sync::Arc<MySqlCheckoutVerifications>,
+    /// Budget for checking a connection out of this pool.
+    ///
+    /// The connection-level "connect timeout" setting is threaded down to the
+    /// pool at creation time so that metadata, DDL, connection-info, cancel and
+    /// streaming paths do not fall back to a compile-time constant (#12908).
+    checkout_timeout: Duration,
 }
 
 impl MySqlPool {
@@ -51,11 +57,27 @@ impl MySqlPool {
         mysql_async::Opts: TryFrom<O>,
         <mysql_async::Opts as TryFrom<O>>::Error: std::error::Error,
     {
+        Self::new_with_checkout_timeout(opts, max_connections, super::connection_timeout())
+    }
+
+    /// Builds a pool whose checkout budget follows the connection settings
+    /// instead of the `CONNECTION_TIMEOUT_SECS` default.
+    pub fn new_with_checkout_timeout<O>(opts: O, max_connections: usize, checkout_timeout: Duration) -> Self
+    where
+        mysql_async::Opts: TryFrom<O>,
+        <mysql_async::Opts as TryFrom<O>>::Error: std::error::Error,
+    {
         Self {
             inner: mysql_async::Pool::new(opts),
             max_connections: max_connections.max(1),
             checkout_verifications: Default::default(),
+            checkout_timeout: checkout_timeout.max(Duration::from_secs(1)),
         }
+    }
+
+    /// How long a checkout may wait for a pooled (or newly created) connection.
+    pub fn checkout_timeout(&self) -> Duration {
+        self.checkout_timeout
     }
 
     /// Whether this is a tab-scoped client-session pool. These pools hold a
@@ -95,6 +117,13 @@ pub trait MySqlPoolAccess {
     /// Liveness evidence for pooled connections; `None` pings every checkout.
     fn checkout_verifications(&self) -> Option<&MySqlCheckoutVerifications> {
         None
+    }
+
+    /// Budget for checking a connection out of this pool. Pools created by dbx
+    /// carry the connection's configured timeout; bare `mysql_async` pools and
+    /// pools built without a configuration keep the legacy constant (#12908).
+    fn checkout_timeout(&self) -> Duration {
+        super::connection_timeout()
     }
 }
 
@@ -195,6 +224,10 @@ impl MySqlPoolAccess for MySqlPool {
 
     fn checkout_verifications(&self) -> Option<&MySqlCheckoutVerifications> {
         Some(&self.checkout_verifications)
+    }
+
+    fn checkout_timeout(&self) -> Duration {
+        self.checkout_timeout
     }
 }
 
@@ -1479,6 +1512,7 @@ async fn connect_with_ca_cert_pool_limit_idle_setup_database_with_mode(
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
     let mut retry_url = url.to_string();
     let mut retry_ca_cert_path = ca_cert_path;
+    let mut tls_error = None;
     let mut result = connect_pool_attempt(
         url,
         ca_cert_path,
@@ -1495,6 +1529,7 @@ async fn connect_with_ca_cert_pool_limit_idle_setup_database_with_mode(
     if result.as_ref().err().is_some_and(|error| mysql_error_should_retry_without_ssl(error)) {
         if let Some(fallback_url) = ssl_fallback_url(url) {
             log::info!("SSL handshake failed, retrying with ssl-mode=disabled");
+            tls_error = result.as_ref().err().cloned();
             retry_url = fallback_url;
             retry_ca_cert_path = None;
             result = connect_pool_attempt(
@@ -1514,7 +1549,7 @@ async fn connect_with_ca_cert_pool_limit_idle_setup_database_with_mode(
 
     if result.as_ref().err().is_some_and(|error| mysql_error_should_retry_with_legacy_eof(error)) {
         log::info!("MySQL proxy returned legacy EOF packets; retrying with CLIENT_DEPRECATE_EOF disabled");
-        return connect_pool_attempt(
+        result = connect_pool_attempt(
             &retry_url,
             retry_ca_cert_path,
             timeout,
@@ -1528,7 +1563,12 @@ async fn connect_with_ca_cert_pool_limit_idle_setup_database_with_mode(
         .await;
     }
 
-    result
+    result.map_err(|error| match tls_error {
+        // MySQL also uses 1045 for REQUIRE SSL accounts, so the final error
+        // alone can conceal why a Preferred connection could not use TLS.
+        Some(tls_error) => format!("MySQL TLS attempt failed: {tls_error}\n\nMySQL plaintext fallback failed: {error}"),
+        None => error,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1593,6 +1633,7 @@ async fn connect_pool_attempt_with_keepalive(
         ca_cert_path,
         max_connections,
         idle_timeout_secs,
+        timeout,
         setup_database,
         extra_setup_queries,
         setup_mode,
@@ -1731,6 +1772,7 @@ async fn verify_pool_connection_with_setup_fallback(
             ca_cert_path,
             max_connections,
             idle_timeout_secs,
+            timeout,
             setup_database,
             extra_setup_queries,
             setup_mode,
@@ -1773,6 +1815,7 @@ async fn verify_pool_connection_with_setup_fallback(
             ca_cert_path,
             max_connections,
             idle_timeout_secs,
+            timeout,
             setup_database,
             extra_setup_queries,
             mode,
@@ -2062,6 +2105,7 @@ fn create_pool(
     ca_cert_path: Option<&str>,
     max_connections: usize,
     idle_timeout_secs: Option<u64>,
+    checkout_timeout: Duration,
     setup_database: Option<&str>,
     extra_setup_queries: &[String],
     setup_mode: MySqlSetupMode,
@@ -2110,7 +2154,7 @@ fn create_pool(
         // to paths explicitly supplied by the user instead of enabling arbitrary reads.
         builder = builder.local_infile_handler(Some(mysql_async::WhiteListFsHandler::new(local_infile_paths)));
     }
-    Ok(MySqlPool::new(builder, max_connections))
+    Ok(MySqlPool::new_with_checkout_timeout(builder, max_connections, checkout_timeout))
 }
 
 fn mysql_async_tcp_host(host: &str) -> &str {
@@ -2694,6 +2738,7 @@ fn mysql_error_should_retry_without_ssl(error: &str) -> bool {
     error.contains("handshakefailure")
         || error.contains("handshake")
         || error.contains("tls connection")
+        || error.contains("serverdoesnotsupporttls12or13")
         || error.contains("server closed session")
         // Some older MySQL proxies report a failed preferred-TLS probe as a
         // protocol packet error instead of a TLS handshake error.
@@ -2718,6 +2763,7 @@ fn mysql_error_should_retry_with_text_protocol(error: &str) -> bool {
         || (lower.contains("1615") && lower.contains("re-prepared"))
         || lower.contains("com_stmt_prepare")
         || lower.contains("can't parse")
+        || lower.contains("1295")
         || lower.contains("buf doesn't have enough data")
         || lower.contains("prepared statement protocol")
         || lower.contains("this command is not supported in the prepared statement protocol yet")
@@ -3150,7 +3196,7 @@ const DATABASE_LIST_QUERY_PLAN: [(&str, bool); 2] =
     [(SHOW_DATABASES_SQL, true), (INFORMATION_SCHEMA_DATABASES_SQL, false)];
 
 pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
-    list_databases_with_timeout(pool, super::connection_timeout()).await
+    list_databases_with_timeout(pool, pool.checkout_timeout()).await
 }
 
 pub async fn list_databases_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<Vec<DatabaseInfo>, String> {
@@ -3165,7 +3211,7 @@ pub async fn list_databases_with_timeout(pool: &MySqlPool, timeout: Duration) ->
 }
 
 pub async fn list_database_metadata(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let result = match conn.query_iter(DATABASE_METADATA_SQL).await {
         Ok(result) => result,
         Err(error) => {
@@ -3211,7 +3257,7 @@ async fn list_databases_with_query(
 }
 
 pub async fn list_databases_show(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
-    list_databases_show_with_timeout(pool, super::connection_timeout()).await
+    list_databases_show_with_timeout(pool, pool.checkout_timeout()).await
 }
 
 pub async fn list_databases_show_with_timeout(
@@ -3266,7 +3312,7 @@ pub async fn list_tables_filtered(
     table_name_filter: Option<&TableNameFilter>,
 ) -> Result<Vec<TableInfo>, String> {
     let sql = list_tables_sql(database, filter, limit, offset, object_types, table_name_filter);
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let result = match conn.query_iter(&sql).await {
         Ok(result) => result,
         Err(err) => {
@@ -3442,7 +3488,7 @@ pub async fn completion_assistant_search(
         request.object_kinds.clone()
     };
     let pattern = mysql_completion_like_pattern(&request.mask, request.match_mode.as_ref());
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let mut candidates = Vec::new();
     let mut compatibility = MysqlCompletionCompatibility::default();
 
@@ -3764,7 +3810,7 @@ fn table_comment_sql(database: &str, table: &str) -> String {
 
 pub async fn get_table_comment(pool: &MySqlPool, database: &str, table: &str) -> Result<Option<String>, String> {
     let sql = table_comment_sql(database, table);
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(rows
@@ -3827,7 +3873,7 @@ async fn query_table_status_show(
 }
 
 async fn query_table_status_sql(pool: &MySqlPool, sql: &str) -> Result<HashMap<String, TableStatusMeta>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     query_table_status_sql_with_conn(&mut conn, sql).await
 }
 
@@ -3857,7 +3903,7 @@ async fn query_table_status_sql_with_conn(
 }
 
 pub async fn get_table_auto_increment(pool: &MySqlPool, database: &str, table: &str) -> Result<Option<String>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     // MySQL 8 caches SHOW TABLE STATUS statistics by default, including the
     // counter after ALTER TABLE. The version comment is a no-op on MySQL 5.7.
     enable_fresh_table_statistics(&mut conn, "reading AUTO_INCREMENT").await;
@@ -3929,7 +3975,7 @@ async fn list_logical_table_comments(
     let Some(sql) = logical_table_comments_sql(database, table_names) else {
         return Ok(HashMap::new());
     };
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|error| error.to_string())?;
     let rows = result.collect_and_drop::<mysql_async::Row>().await.map_err(|error| error.to_string())?;
     Ok(rows
@@ -3961,7 +4007,7 @@ pub async fn list_logical_tables_show(pool: &MySqlPool, database: &str) -> Resul
     // Proxy logical names are authoritative here. Do not add SHOW TABLE STATUS: this hot
     // path must replace the information_schema lookup with one metadata request.
     let sql = logical_show_full_tables_sql(database);
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|error| error.to_string())?;
     let rows = result.collect_and_drop::<mysql_async::Row>().await.map_err(|error| error.to_string())?;
     Ok(table_infos_from_show_rows(&rows))
@@ -4003,7 +4049,7 @@ async fn list_table_names_show_filtered(
     filter: Option<&str>,
     exact_names: &[String],
 ) -> Result<Vec<TableInfo>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     list_table_names_show_filtered_with_conn(&mut conn, database, filter, exact_names).await
 }
 
@@ -4446,7 +4492,7 @@ pub async fn list_objects(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<PagedObjectList, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let wants_tables = wants_table_objects(object_types);
     let wants_routines = wants_routine_objects(object_types);
     let paging_applied = limit.is_some() && object_query_supports_paging(object_types);
@@ -4488,7 +4534,7 @@ pub async fn list_objects(
             if !wants_routines {
                 return Ok(PagedObjectList { objects, paging_applied });
             }
-            conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+            conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
         }
     }
 
@@ -4582,7 +4628,7 @@ pub async fn list_object_statistics(
          ORDER BY TABLE_NAME",
         quote_value(database),
     );
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     // The session-scoped statistics cache is what makes the tree keep showing
     // a stale row count for tables written after the first read (#9736).
     enable_fresh_table_statistics(&mut conn, "reading object statistics").await;
@@ -4699,13 +4745,13 @@ pub(super) fn table_infos_to_objects(
 }
 
 pub(super) async fn list_routine_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let rows = query_routine_rows(&mut conn, database, None, None, None).await?;
     Ok(rows.iter().map(|row| row_to_object(row, database)).collect())
 }
 
 pub async fn list_completion_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let mut objects = Vec::new();
 
     match query_routine_rows(&mut conn, database, None, None, None).await {
@@ -5247,7 +5293,7 @@ pub async fn get_conn_with_health_check<P>(pool: &P) -> Result<mysql_async::Conn
 where
     P: MySqlPoolAccess + ?Sized,
 {
-    get_conn_with_health_check_with_timeout(pool, super::connection_timeout()).await
+    get_conn_with_health_check_with_timeout(pool, pool.checkout_timeout()).await
 }
 
 pub async fn get_conn_with_health_check_with_timeout<P>(
@@ -5528,6 +5574,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
         return Ok(MySqlQueryResult::exact(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -5573,6 +5620,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
         return Ok(MySqlQueryResult::exact(QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns,
             spatial_values,
@@ -5670,6 +5718,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
         result: QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns,
             spatial_values,
@@ -5804,6 +5853,7 @@ async fn execute_result_sets_with_text_protocol_on_conn(
             result: QueryResult {
                 columns,
                 column_types,
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns,
                 spatial_values,
@@ -5832,6 +5882,7 @@ async fn execute_result_sets_with_text_protocol_on_conn(
         results.push(MySqlQueryResult::exact(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -6019,6 +6070,7 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
         result: QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns,
             spatial_values,
@@ -6270,7 +6322,7 @@ async fn stream_query_result_prepared(
 
 pub async fn kill_query(pool: &MySqlPool, connection_id: u32) -> Result<(), String> {
     let start = Instant::now();
-    let timeout = super::connection_timeout();
+    let timeout = pool.checkout_timeout();
     let mut conn = tokio::time::timeout(timeout, pool.get_conn())
         .await
         .map_err(|_| {
@@ -6297,9 +6349,18 @@ pub async fn kill_query(pool: &MySqlPool, connection_id: u32) -> Result<(), Stri
     Ok(())
 }
 
-pub async fn kill_query_with_opts(opts: mysql_async::Opts, connection_id: u32) -> Result<(), String> {
+/// Kills a query through a dedicated connection rebuilt from its `Opts`.
+///
+/// Cancel paths run while the original pool may be busy, so this opens a new
+/// physical connection. `timeout` is the caller's infrastructure budget (the
+/// connection's configured connect/checkout timeout), not the old compile-time
+/// 5 s: on a slow link a hardcoded budget turns cancellation into a failure.
+pub async fn kill_query_with_opts(
+    opts: mysql_async::Opts,
+    connection_id: u32,
+    timeout: Duration,
+) -> Result<(), String> {
     let start = Instant::now();
-    let timeout = super::connection_timeout();
     let mut conn = tokio::time::timeout(timeout, mysql_async::Conn::new(opts))
         .await
         .map_err(|_| {
@@ -6361,6 +6422,7 @@ pub async fn execute_transaction_statement_on_conn(
         QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -6397,6 +6459,7 @@ pub async fn execute_transaction_statement_on_conn(
         QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns,
             spatial_values,
@@ -6550,6 +6613,7 @@ async fn execute_query_on_conn_with_limits_progress_resolved(
                             return Ok(MySqlQueryResult::exact(QueryResult {
                                 columns: vec![],
                                 column_types: Vec::new(),
+                                deferred_large_value_cells: Vec::new(),
                                 column_sortables: vec![],
                                 spatial_columns: vec![],
                                 spatial_values: vec![],
@@ -6589,6 +6653,7 @@ async fn execute_query_on_conn_with_limits_progress_resolved(
         Ok(MySqlQueryResult::exact(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -6723,6 +6788,7 @@ pub async fn execute_non_result_batch_on_conn(
         let current_result = QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -7083,7 +7149,7 @@ fn mysql_statistics_expression_is_unsupported(error: &mysql_async::Error) -> boo
 }
 
 pub async fn list_indexes(pool: &MySqlPool, database: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let expression_sql = mysql_list_indexes_sql(database, table, true);
     let legacy_sql = mysql_list_indexes_sql(database, table, false);
     let (result, include_expression) = match conn.query_iter(&expression_sql).await {
@@ -7107,6 +7173,7 @@ pub async fn list_indexes(pool: &MySqlPool, database: &str, table: &str) -> Resu
                 let index_position = indexes.len();
                 index_positions.insert(name.clone(), index_position);
                 indexes.push(IndexInfo {
+                    owner: None,
                     key_directions: Vec::new(),
                     visibility: None,
                     key_metadata_complete: false,
@@ -7167,7 +7234,7 @@ pub async fn list_foreign_keys(pool: &MySqlPool, database: &str, table: &str) ->
         quote_value(database),
         quote_value(table),
     );
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let column_result = conn.query_iter(&column_sql).await.map_err(|e| e.to_string())?;
     let column_rows: Vec<mysql_async::Row> = column_result.collect_and_drop().await.map_err(|e| e.to_string())?;
     if column_rows.is_empty() {
@@ -7228,7 +7295,7 @@ pub async fn list_foreign_keys_for_database(
          ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION",
         quote_value(database),
     );
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let column_result = conn.query_iter(&column_sql).await.map_err(|e| e.to_string())?;
     let column_rows: Vec<mysql_async::Row> = column_result.collect_and_drop().await.map_err(|e| e.to_string())?;
     if column_rows.is_empty() {
@@ -7280,7 +7347,7 @@ pub async fn list_triggers(pool: &MySqlPool, database: &str, table: &str) -> Res
         quote_value(database),
         quote_value(table),
     );
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 
@@ -7297,6 +7364,7 @@ pub async fn list_triggers(pool: &MySqlPool, database: &str, table: &str) -> Res
             valid: None,
             comment: None,
             created_at: None,
+            oracle_metadata: None,
             statement: Some(get_str_by_name(row, "ACTION_STATEMENT")).filter(|value| !value.is_empty()),
         })
         .collect())
@@ -9146,6 +9214,17 @@ mod tests {
     }
 
     #[test]
+    fn mysql_binary_string_preserves_canonical_hex_for_ascii_uuid() {
+        let binary_column = mysql_test_column(ColumnType::MYSQL_TYPE_STRING, 63, ColumnFlags::BINARY_FLAG, 36);
+        let uuid_bytes = b"01a057bf-2bbd-70a6-b3c3-56eb409a0f95".to_vec();
+
+        assert_eq!(
+            mysql_bytes_to_json(uuid_bytes, &binary_column),
+            serde_json::json!("0x30316130353762662d326262642d373061362d623363332d353665623430396130663935")
+        );
+    }
+
+    #[test]
     fn mysql_binary_values_preserve_all_bytes_as_hex() {
         let binary_column = mysql_test_column(ColumnType::MYSQL_TYPE_STRING, 63, ColumnFlags::BINARY_FLAG, 8);
         let varbinary_column = mysql_test_column(ColumnType::MYSQL_TYPE_VAR_STRING, 63, ColumnFlags::BINARY_FLAG, 8);
@@ -9405,6 +9484,179 @@ mod tests {
     }
 
     #[test]
+    fn mysql_tls_legacy_version_error_retries_only_when_tls_is_optional() {
+        let error = "MySQL connection failed: Input/output error: Input/output error: \
+                     peer is incompatible: ServerDoesNotSupportTls12Or13";
+        assert!(mysql_error_should_retry_without_ssl(error));
+        for mode in ["required", "verify_ca", "verify_identity"] {
+            assert_eq!(ssl_fallback_url(&format!("mysql://host/db?ssl-mode={mode}")), None);
+        }
+        assert_eq!(ssl_fallback_url("mysql://host/db?ssl-mode=disabled"), None);
+        assert_eq!(ssl_fallback_url("mysql://host/db?ssl-cert=client.pem&ssl-key=client.key"), None);
+    }
+
+    #[derive(Clone, Copy)]
+    enum MysqlTlsTestReply {
+        LegacyTls,
+        AccessDenied,
+        LegacyEof,
+        Accept,
+    }
+
+    async fn mysql_tls_test_packet(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut header = [0; 4];
+        socket.read_exact(&mut header).await.unwrap();
+        let length = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+        assert!(length < 65536);
+        let mut payload = vec![0; length];
+        socket.read_exact(&mut payload).await.unwrap();
+        payload
+    }
+
+    async fn mysql_tls_test_write(socket: &mut tokio::net::TcpStream, seq: u8, payload: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let length = (payload.len() as u32).to_le_bytes();
+        socket.write_all(&[length[0], length[1], length[2], seq]).await.unwrap();
+        socket.write_all(payload).await.unwrap();
+    }
+
+    async fn mysql_tls_test_server(
+        listener: tokio::net::TcpListener,
+        replies: Vec<MysqlTlsTestReply>,
+    ) -> Vec<mysql_async::consts::CapabilityFlags> {
+        use mysql_async::consts::CapabilityFlags as Caps;
+        use mysql_common::proto::MySerialize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut attempts = Vec::new();
+        for reply in replies {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let greeting = mysql_common::packets::HandshakePacket::new(
+                10,
+                &b"5.6.24-test"[..],
+                1,
+                *b"12345678",
+                Some(&b"abcdefghijkl\0"[..]),
+                Caps::CLIENT_PROTOCOL_41
+                    | Caps::CLIENT_SECURE_CONNECTION
+                    | Caps::CLIENT_PLUGIN_AUTH
+                    | Caps::CLIENT_SSL
+                    | Caps::CLIENT_DEPRECATE_EOF,
+                33,
+                StatusFlags::SERVER_STATUS_AUTOCOMMIT,
+                Some(&b"mysql_native_password"[..]),
+            );
+            let mut payload = Vec::new();
+            greeting.serialize(&mut payload);
+            mysql_tls_test_write(&mut socket, 0, &payload).await;
+            let request = mysql_tls_test_packet(&mut socket).await;
+            let capabilities = Caps::from_bits_truncate(u32::from_le_bytes(request[..4].try_into().unwrap()));
+            attempts.push(capabilities);
+
+            match reply {
+                MysqlTlsTestReply::LegacyTls => {
+                    assert!(capabilities.contains(Caps::CLIENT_SSL));
+                    assert_eq!(request.len(), 32);
+                    let mut header = [0; 5];
+                    socket.read_exact(&mut header).await.unwrap();
+                    let mut client_hello = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+                    socket.read_exact(&mut client_hello).await.unwrap();
+                    // A complete TLS 1.0 ServerHello makes the real rustls connector
+                    // report ServerDoesNotSupportTls12Or13 before authentication.
+                    let mut hello = vec![0x16, 3, 1, 0, 44, 2, 0, 0, 40, 3, 1];
+                    hello.extend_from_slice(&[0; 32]);
+                    hello.extend_from_slice(&[0, 0xc0, 0x2f, 0, 0, 0]);
+                    socket.write_all(&hello).await.unwrap();
+                }
+                MysqlTlsTestReply::AccessDenied => {
+                    assert!(!capabilities.contains(Caps::CLIENT_SSL));
+                    let mut error = vec![0xff, 0x15, 0x04];
+                    error.extend_from_slice(b"#28000Access denied for user 'test'@'localhost' (using password: YES)");
+                    mysql_tls_test_write(&mut socket, 2, &error).await;
+                }
+                MysqlTlsTestReply::LegacyEof => {
+                    assert!(!capabilities.contains(Caps::CLIENT_SSL));
+                    assert!(capabilities.contains(Caps::CLIENT_DEPRECATE_EOF));
+                    mysql_tls_test_write(&mut socket, 3, &[0, 0, 0, 2, 0, 0, 0]).await;
+                }
+                MysqlTlsTestReply::Accept => {
+                    assert!(!capabilities.contains(Caps::CLIENT_SSL));
+                    mysql_tls_test_write(&mut socket, 2, &[0, 0, 0, 2, 0, 0, 0]).await;
+                    loop {
+                        let command = mysql_tls_test_packet(&mut socket).await;
+                        if command[0] == 1 {
+                            break;
+                        }
+                        mysql_tls_test_write(&mut socket, 1, &[0, 0, 0, 2, 0, 0, 0]).await;
+                    }
+                }
+            }
+        }
+        attempts
+    }
+
+    async fn mysql_tls_test_connect(
+        replies: Vec<MysqlTlsTestReply>,
+        mode: &str,
+    ) -> (Result<MySqlPool, String>, tokio::task::JoinSet<Vec<mysql_async::consts::CapabilityFlags>>) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(mysql_tls_test_server(listener, replies));
+        let url = format!("mysql://test:secret@127.0.0.1:{port}/?ssl-mode={mode}&max_allowed_packet=65536&wait_timeout=60&sessionVariables=group_concat_max_len%3D1024");
+        let result = connect_with_ca_cert_and_pool_limit(&url, None, Duration::from_secs(2), 1).await;
+        (result, servers)
+    }
+
+    #[tokio::test]
+    async fn mysql_tls_preferred_retains_legacy_tls_and_plaintext_errors() {
+        let (result, mut servers) =
+            mysql_tls_test_connect(vec![MysqlTlsTestReply::LegacyTls, MysqlTlsTestReply::AccessDenied], "preferred")
+                .await;
+        let error = result.unwrap_err();
+        assert!(error.contains("ServerDoesNotSupportTls12Or13"), "{error}");
+        assert!(error.contains("1045 (28000)"), "{error}");
+        assert_eq!(servers.join_next().await.unwrap().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mysql_tls_preferred_returns_a_working_plaintext_pool() {
+        let (result, mut servers) =
+            mysql_tls_test_connect(vec![MysqlTlsTestReply::LegacyTls, MysqlTlsTestReply::Accept], "preferred").await;
+        let pool = result.unwrap();
+        verify_pool_connection(&pool, Duration::from_secs(2)).await.unwrap();
+        pool.disconnect().await.unwrap();
+        assert_eq!(servers.join_next().await.unwrap().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mysql_tls_preferred_retains_original_error_after_legacy_eof_retry() {
+        let (result, mut servers) = mysql_tls_test_connect(
+            vec![MysqlTlsTestReply::LegacyTls, MysqlTlsTestReply::LegacyEof, MysqlTlsTestReply::AccessDenied],
+            "preferred",
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(error.contains("ServerDoesNotSupportTls12Or13"), "{error}");
+        assert!(error.contains("1045 (28000)"), "{error}");
+        let attempts = servers.join_next().await.unwrap().unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert!(!attempts[2].contains(mysql_async::consts::CapabilityFlags::CLIENT_DEPRECATE_EOF));
+    }
+
+    #[tokio::test]
+    async fn mysql_tls_strict_modes_never_retry_in_plaintext() {
+        for mode in ["required", "verify_ca", "verify_identity"] {
+            let (result, mut servers) = mysql_tls_test_connect(vec![MysqlTlsTestReply::LegacyTls], mode).await;
+            let error = result.unwrap_err();
+            assert!(error.contains("ServerDoesNotSupportTls12Or13"), "{mode}: {error}");
+            assert_eq!(servers.join_next().await.unwrap().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn mysql_server_without_ssl_capability_retries_without_ssl() {
         let error =
             "MySQL connection failed: Driver error: `Client asked for SSL but server does not have this capability'";
@@ -9552,6 +9804,13 @@ mod tests {
     #[test]
     fn mysql_unsupported_prepare_command_can_retry_with_text_protocol() {
         let error = "ERROR PX000 (3000): [a2jupsonbbv6zai1gomo5whu36ndqy] Unsupported command: COM_STMT_PREPARE";
+
+        assert!(mysql_error_should_retry_with_text_protocol(error));
+    }
+
+    #[test]
+    fn mysql_navicat_unsupported_prepare_error_can_retry_with_text_protocol() {
+        let error = "Server error: ERROR 1295 (HY000): Prepared statements are not supported by Navicat HTTP tunnels";
 
         assert!(mysql_error_should_retry_with_text_protocol(error));
     }
@@ -10413,6 +10672,65 @@ mod tests {
         let default = connection_timeout();
         let url = "mysql://host:3306/db";
         assert_eq!(crate::db::parse_connect_timeout(url), default);
+    }
+
+    /// #12908: metadata, DDL, connection-info, cancel and streaming paths used to
+    /// check connections out with the compile-time `CONNECTION_TIMEOUT_SECS`
+    /// (5 s) even when the connection was configured with a larger budget. The
+    /// pool now carries the configured value, so the timeout reported by a
+    /// checkout failure follows the connection settings.
+    #[test]
+    fn create_pool_carries_the_configured_checkout_timeout() {
+        let pool = create_pool(
+            "mysql://root@127.0.0.1:3306/app",
+            None,
+            2,
+            None,
+            Duration::from_secs(300),
+            None,
+            &[],
+            MySqlSetupMode::Standard,
+            MySqlEofMode::Legacy,
+            MySqlTcpKeepaliveMode::Enabled,
+        )
+        .expect("pool");
+
+        assert_eq!(pool.checkout_timeout(), Duration::from_secs(300));
+        assert_ne!(pool.checkout_timeout(), connection_timeout());
+        assert_eq!(
+            super::super::PoolCheckoutError::Timeout {
+                database: "MySQL",
+                stage: MysqlCheckoutStage::Wait,
+                timeout: pool.checkout_timeout(),
+            }
+            .to_string(),
+            "MySQL connection pool checkout timed out [stage=wait, timeout_ms=300000]"
+        );
+    }
+
+    #[test]
+    fn create_pool_keeps_the_legacy_default_when_the_caller_does_not_override_it() {
+        let pool = MySqlPool::new(mysql_async::OptsBuilder::default(), 2);
+        assert_eq!(pool.checkout_timeout(), connection_timeout());
+    }
+
+    #[test]
+    fn create_pool_clamps_a_zero_checkout_timeout_to_one_second() {
+        let pool = create_pool(
+            "mysql://root@127.0.0.1:3306/app",
+            None,
+            2,
+            None,
+            Duration::from_secs(0),
+            None,
+            &[],
+            MySqlSetupMode::Standard,
+            MySqlEofMode::Legacy,
+            MySqlTcpKeepaliveMode::Enabled,
+        )
+        .expect("pool");
+
+        assert_eq!(pool.checkout_timeout(), Duration::from_secs(1));
     }
 
     #[test]

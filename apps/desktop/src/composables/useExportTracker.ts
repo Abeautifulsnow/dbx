@@ -4,9 +4,11 @@ import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
 import { uuid } from "@/lib/common/utils";
 import { formatQueryDuration } from "@/lib/format/duration";
 import { autoRevealExportedPathIfConfigured } from "@/lib/export/exportPath";
+import { releaseManualExport, submitManualExport, type ManualExportMode } from "@/lib/export/manualExportQueue";
+import { acceptOraclePackageTransferApproval, acceptOraclePackageTransferPreflight, acceptOracleRoutineDeploymentOperation, type OracleRoutineDeployment } from "@/lib/schema/oracleRoutineDeploy";
 
 export type BackgroundTaskKind = "table-export" | "database-export" | "data-dictionary" | "sql-file" | "data-transfer" | "data-generation" | "multi-db-execution" | "schema-diff" | "data-compare";
-export type BackgroundTaskStatus = "Running" | "Writing" | "Cancelling" | "Done" | "Error" | "Cancelled";
+export type BackgroundTaskStatus = "Queued" | "Unknown" | "Running" | "Writing" | "Cancelling" | "Done" | "Error" | "Cancelled";
 export type DatabaseExportSource = "manual" | "scheduled";
 
 export interface DataTransferFailure {
@@ -66,6 +68,7 @@ export interface ExportTask {
   targetTables?: string[];
   transferFailures?: DataTransferFailure[];
   transferFailuresOmitted?: number;
+  oracleRoutineDeployment?: OracleRoutineDeployment;
   sqlFileFailures?: SqlFileFailure[];
   sqlFileFailuresOmitted?: number;
   multiDbSourceTabId?: string;
@@ -167,6 +170,7 @@ interface SqlFileFailureState {
 
 const taskMap = reactive<Map<string, ExportTask>>(new Map());
 const activeTransferRuns = new Set<string>();
+const packageTransferConfirmations = new WeakMap<ExportTask, api.OraclePackageTransferRequest>();
 const taskCancelHandlers = new Map<string, () => void | Promise<void>>();
 const transferFailureStates = new Map<string, TransferFailureState>();
 const sqlFileFailureStates = new Map<string, SqlFileFailureState>();
@@ -398,9 +402,42 @@ function findActiveOverlappingTransfer(request: api.TransferRequest): string[] {
 export function useExportTracker() {
   const tasks = computed(() => Array.from(taskMap.values()));
 
-  const activeCount = computed(() => tasks.value.filter((t) => t.status === "Running" || t.status === "Writing" || t.status === "Cancelling").length);
+  const activeCount = computed(() => tasks.value.filter((t) => t.status === "Queued" || t.status === "Unknown" || t.status === "Running" || t.status === "Writing" || t.status === "Cancelling").length);
 
   const hasActive = computed(() => activeCount.value > 0);
+
+  function submitExportTask(task: ExportTask, mode: ManualExportMode, run: () => Promise<"settled" | "unknown">, onStateChange?: (task: ExportTask) => void) {
+    let handle: ReturnType<typeof submitManualExport>;
+    const cancelQueued = () => {
+      handle.cancelQueued();
+    };
+    handle = submitManualExport({
+      id: task.exportId,
+      mode,
+      run,
+      onStateChange(state, error) {
+        if (state === "queued") {
+          task.status = "Queued";
+          task.startedAt = undefined;
+          taskCancelHandlers.set(task.exportId, cancelQueued);
+        } else if (state === "running") {
+          if (taskCancelHandlers.get(task.exportId) === cancelQueued) taskCancelHandlers.delete(task.exportId);
+          task.status = "Running";
+          task.startedAt = Date.now();
+        } else if (state === "cancelled") {
+          task.status = "Cancelled";
+          task.finishedAt = Date.now();
+          taskCancelHandlers.delete(task.exportId);
+        } else if (state === "unknown") {
+          task.status = "Unknown";
+          task.finishedAt = undefined;
+          if (error !== undefined) task.errorMessage = error instanceof Error ? error.message : String(error);
+        }
+        onStateChange?.(task);
+      },
+    });
+    return handle;
+  }
 
   function addTask(tableName: string, format: string, filePath: string, exportId?: string): ExportTask {
     const id = exportId ?? uuid();
@@ -622,6 +659,8 @@ export function useExportTracker() {
       onStarted?: () => void;
       onDone?: () => void | Promise<void>;
       onOpen?: () => void;
+      onRemove?: () => void;
+      oracleRoutineDeployment?: OracleRoutineDeployment;
       formatOverlapError?: (tables: string[]) => string;
     } = {},
   ): ExportTask {
@@ -635,6 +674,10 @@ export function useExportTracker() {
     task.targetSchema = request.targetSchema;
     task.targetTables = request.tables.map((table) => targetTableName(table, request.targetTableNameCase));
     if (activeTransferRuns.has(request.transferId)) return task;
+    task.onRemove = options.onRemove;
+    task.oracleRoutineDeployment = options.oracleRoutineDeployment;
+    if (request.oraclePackages?.pendingTables) packageTransferConfirmations.set(task, JSON.parse(JSON.stringify(request.oraclePackages)));
+    else packageTransferConfirmations.delete(task);
 
     const overlappingTables = findActiveOverlappingTransfer(request);
     if (overlappingTables.length > 0) {
@@ -646,6 +689,7 @@ export function useExportTracker() {
     }
 
     activeTransferRuns.add(request.transferId);
+    if (task.oracleRoutineDeployment) task.oracleRoutineDeployment.executing = true;
     let terminalStatus: api.TransferProgress["status"] | null = null;
     let startAcknowledged = false;
     const acknowledgeStart = () => {
@@ -681,6 +725,10 @@ export function useExportTracker() {
           terminal: true,
         });
       } finally {
+        if (task.oracleRoutineDeployment) {
+          task.oracleRoutineDeployment.executing = false;
+          if (task.oracleRoutineDeployment.plan) task.oracleRoutineDeployment.plan.ready = false;
+        }
         activeTransferRuns.delete(request.transferId);
       }
     })();
@@ -757,7 +805,17 @@ export function useExportTracker() {
 
   function updateDataTransferTask(transferId: string, progress: api.TransferProgress) {
     const task = taskMap.get(transferId);
-    if (!task) return;
+    if (!task || progress.transferId !== transferId) return;
+    const pendingConfirmation = packageTransferConfirmations.get(task);
+    if (progress.oraclePackagePreflight && !progress.oraclePackageApproval && !progress.oracleRoutineOperation && pendingConfirmation && task.oracleRoutineDeployment) {
+      acceptOraclePackageTransferPreflight(task.oracleRoutineDeployment, pendingConfirmation, progress.oraclePackagePreflight);
+    }
+    if (progress.oraclePackageApproval && !progress.oraclePackagePreflight && !progress.oracleRoutineOperation && pendingConfirmation && task.oracleRoutineDeployment) {
+      void acceptOraclePackageTransferApproval(task.oracleRoutineDeployment, pendingConfirmation, progress.oraclePackageApproval);
+    }
+    if (progress.oracleRoutineOperation && task.oracleRoutineDeployment) {
+      acceptOracleRoutineDeploymentOperation(task.oracleRoutineDeployment, progress.oracleRoutineOperation);
+    }
     if (progress.transferFailuresOmitted !== undefined) {
       const state = getTransferFailureState(task);
       state.replayOmittedCount = Math.max(state.replayOmittedCount, progress.transferFailuresOmitted);
@@ -774,7 +832,8 @@ export function useExportTracker() {
     task.tableIndex = progress.tableIndex;
     task.totalTables = progress.totalTables;
     task.currentTable = progress.table || task.currentTable;
-    if (progress.table || progress.rowsTransferred > 0 || task.rowsExported === 0) {
+    const packageEvent = progress.oraclePackageApproval || progress.oraclePackagePreflight || progress.oracleRoutineOperation;
+    if (!packageEvent && (progress.table || progress.rowsTransferred > 0 || task.rowsExported === 0)) {
       task.rowsExported = progress.rowsTransferred;
     }
     task.totalRows = progress.totalRows ?? task.totalRows;
@@ -822,6 +881,7 @@ export function useExportTracker() {
 
   function removeTask(exportId: string) {
     const task = taskMap.get(exportId);
+    if (task?.status === "Unknown") releaseManualExport(exportId);
     if (task && (task.status === "Done" || task.status === "Error" || task.status === "Cancelled")) cleanupFinishedTask(task);
     taskMap.delete(exportId);
     taskCancelHandlers.delete(exportId);
@@ -852,6 +912,7 @@ export function useExportTracker() {
   async function cancelTask(exportId: string) {
     const task = taskMap.get(exportId);
     if (task?.canCancel === false) return;
+    if (task && (task.kind === "table-export" || task.kind === "database-export") && (task.status === "Done" || task.status === "Error" || task.status === "Cancelled" || task.status === "Unknown" || task.status === "Cancelling")) return;
     try {
       const customHandler = taskCancelHandlers.get(exportId);
       if (customHandler) {
@@ -875,6 +936,7 @@ export function useExportTracker() {
     tasks,
     activeCount,
     hasActive,
+    submitExportTask,
     addTask,
     addDatabaseExportTask,
     addDataDictionaryTask,

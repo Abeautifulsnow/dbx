@@ -183,8 +183,7 @@ async function applyDriverStoreDir(kind: DriverStoreDirKind, newDir: string | nu
     };
     toast(t("driverStore.driverStoreDirSuccess", { target }));
     // Restart the app to use the new paths
-    const { relaunch } = await import("@tauri-apps/plugin-process");
-    relaunch();
+    await api.relaunchApp();
   } catch (e: any) {
     toast(t("driverStore.driverStoreDirMigrationFailed", { error: backendError(e) }), 5000);
   } finally {
@@ -658,7 +657,7 @@ async function openOfflineExportDialog() {
   }
 }
 
-async function exportOfflinePackage(driverKeys: string[]) {
+async function exportOfflinePackage(driverKeys: string[], includeJres = true) {
   if (isWeb || agentExportImportBlocked.value || driverKeys.length === 0) return;
   const platform = offlineExportPreview.value?.platform ?? "current-platform";
   await runAgentOfflineExportAction({
@@ -674,6 +673,7 @@ async function exportOfflinePackage(driverKeys: string[]) {
         filters: [{ name: "ZIP", extensions: ["zip"] }],
       });
     },
+    includeJres,
     exportPackage: api.exportAgentsOffline,
     onSuccess: ({ destination, result }) => {
       offlineExportDialogOpen.value = false;

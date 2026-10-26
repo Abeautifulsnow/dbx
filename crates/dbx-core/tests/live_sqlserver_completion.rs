@@ -113,6 +113,7 @@ fn live_sqlserver_import_mapping(source: &str, target: &str) -> TableImportColum
         source_column: source.to_string(),
         target_column: target.to_string(),
         target_data_type: None,
+        generator: None,
     }
 }
 
@@ -1421,6 +1422,7 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
         create_table: true,
         drop_target_before_create: false,
         drop_target_confirmed: false,
+        oracle_packages: None,
         content: dbx_core::transfer::TransferContent::default(),
         objects: Some(Vec::new()),
         mode: dbx_core::transfer::TransferMode::Append,

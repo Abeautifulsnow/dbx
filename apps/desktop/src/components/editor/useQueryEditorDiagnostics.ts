@@ -15,7 +15,7 @@ import { buildSqlSemanticModel } from "@/lib/sql/semantic/model";
 import { mergeSqlSemanticReferenceAnalysis } from "@/lib/sql/semantic/references";
 import { sqlServerUseDatabaseBeforeCursor } from "@/lib/sql/sqlCompletionLookupTarget";
 import { lineColumnToOffset, sqlErrorDecorationRange as resolveSqlErrorDecorationRange, sqlErrorSqlMatchesEditor } from "@/lib/sql/sqlDiagnostics";
-import { scalarPositionToUtf16Offset, sqlErrorEditorOffset } from "@/lib/sql/errorPosition";
+import { sqlErrorEditorRange } from "@/lib/sql/errorPosition";
 import { analyzeMysqlRoutineSyntax, supportsMysqlRoutineSyntaxDiagnostics } from "@/lib/sql/mysqlRoutineSyntaxDiagnostics";
 import { buildOracleSyntaxDiagnostics } from "@/lib/sql/oracleSyntaxDiagnostics";
 import { buildSqlServerRoutineSyntaxDiagnostics } from "@/lib/sql/sqlServerRoutineSyntaxDiagnostics";
@@ -70,6 +70,7 @@ interface QueryEditorDiagnosticsOptions {
   sqlDriverProfile: ComputedRef<string | undefined>;
   sqlStatementParameterOptions: () => SqlParameterOptions;
   sqlBehaviorDialect: () => QueryEditorProps["dialect"];
+  sqlSyntaxDialect?: () => QueryEditorProps["syntaxDialect"];
   queryEditorSelectionLanguage: () => "sql" | "text";
   semanticCompletionEnabled: boolean;
   maxCompletionTables: number;
@@ -95,16 +96,12 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
     if (!props.executionError) return [];
     if (props.executionErrorResult?.sourceStatement) {
       const sql = currentState.doc.toString();
-      const mapped = sqlErrorEditorOffset({ editorSql: sql, result: props.executionErrorResult, resultIndex: props.executionErrorResult.statement_index, databaseType: props.databaseType, parameterOptions: sqlStatementParameterOptions() });
-      if (!mapped || mapped.offset >= sql.length) return [];
-      const source = props.executionErrorResult.sourceStatement;
-      const sourceRange = source ? resolveSqlErrorDecorationRange(source, props.executionError) : null;
-      const sourceOffset = source ? scalarPositionToUtf16Offset(source, mapped.line, mapped.column) : undefined;
-      const width = sourceRange && sourceRange.from === sourceOffset ? sourceRange.to - sourceRange.from : (sql.codePointAt(mapped.offset) ?? 0) > 0xffff ? 2 : 1;
-      return [{ from: mapped.offset, to: Math.min(sql.length, mapped.offset + width), message: props.executionError }];
+      const mapped = sqlErrorEditorRange({ editorSql: sql, result: props.executionErrorResult, resultIndex: props.executionErrorResult.statement_index, databaseType: props.databaseType, parameterOptions: sqlStatementParameterOptions() });
+      if (!mapped || mapped.from >= sql.length) return [];
+      return [{ ...mapped, message: props.executionError }];
     }
     if (!props.executionErrorSql || !sqlErrorSqlMatchesEditor(currentState.doc.toString(), props.executionErrorSql)) return [];
-    const range = resolveSqlErrorDecorationRange(currentState.doc.toString(), props.executionError);
+    const range = resolveSqlErrorDecorationRange(currentState.doc.toString(), props.executionError, props.databaseType);
     if (!range) return [];
     return [
       {
@@ -441,7 +438,7 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
           sqlReferenceAnalysisDialectFor({
             databaseType: props.databaseType,
             identifierQuote: connectionStore.connectionIdentifierQuote(props.connectionId),
-            fallbackDialect: props.formatDialect ?? props.dialect ?? "generic",
+            fallbackDialect: props.databaseType === "kingbase" ? (options.sqlSyntaxDialect?.() ?? sqlBehaviorDialect() ?? "postgres") : (props.formatDialect ?? props.dialect ?? "generic"),
           }),
         );
         if (runId !== semanticDiagnosticRunId) return;
@@ -583,7 +580,7 @@ export function useQueryEditorDiagnostics(options: QueryEditorDiagnosticsOptions
           sqlReferenceAnalysisDialectFor({
             databaseType: props.databaseType,
             identifierQuote: connectionStore.connectionIdentifierQuote(props.connectionId),
-            fallbackDialect: props.formatDialect ?? props.dialect ?? "generic",
+            fallbackDialect: props.databaseType === "kingbase" ? (options.sqlSyntaxDialect?.() ?? sqlBehaviorDialect() ?? "postgres") : (props.formatDialect ?? props.dialect ?? "generic"),
           }),
         );
         if (currentView.state.doc !== doc) return [];

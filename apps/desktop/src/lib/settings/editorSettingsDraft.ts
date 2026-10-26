@@ -10,6 +10,7 @@ import { normalizeTableHoverLookupMode } from "@/lib/editor/hoverTableLookup";
 import { normalizeRedisKeyTemplates } from "@/lib/redis/redisKeyTemplates";
 import { normalizeCsvNullMode } from "@/lib/export/csvNullMode";
 import { normalizeAiSqlApplyTargetMode } from "@/lib/ai/aiSqlTargetTab";
+import { normalizeConnectTimeoutSecs, normalizeQueryTimeoutSecs } from "@/lib/connection/timeoutLimits";
 
 export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "fontFamily",
@@ -29,11 +30,13 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "showLineNumbers",
   "showCurrentStatementFrame",
   "showInsertValueHints",
+  "showConnectionGroupPath",
   "autoAliasTables",
   "tableCompletionSchemaQualification",
   "insertSpaceAfterCompletion",
   "sqlServerSpaceConfirmsCompletion",
   "functionCompletionIncludeParams",
+  "sequenceCompletionEnabled",
   "snippetTriggerKey",
   "sortCompletionColumnsAlphabetically",
   "selectFirstCompletionOnOpen",
@@ -57,9 +60,11 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "tabLayout",
   "tabPlacement",
   "colorizeConnectionTabs",
+  "colorizeConnectionTabsScope",
   "tabGroupMode",
   "tabSortMode",
   "tabMaxWidth",
+  "tabGroupRows",
   "showColumnCommentsInHeader",
   "dataGridColumnCommentsInInfoArea",
   "showColumnTypesInHeader",
@@ -121,8 +126,10 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "disconnectTabHandlingMode",
   "deleteConnectionTabHandlingMode",
   "rememberConnectionDatabaseOnDelete",
+  "deepLinkConnectionConfirmMode",
   "dataTabReuseMode",
   "openDataTabsNextToActive",
+  "openTablesInDetachedWindow",
   "prefillNewQueryWithSelect",
   "openQueryOnConnectionOpen",
   "generateSqlIncludeDatabaseName",
@@ -140,6 +147,7 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "sidebarObjectInfoMode",
   "sidebarAllowHorizontalScroll",
   "sidebarShowTooltips",
+  "sidebarShowUserAdmin",
   "sidebarIndent",
   "sidebarFontSize",
   "sidebarDensity",
@@ -175,6 +183,8 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "excludedCompletionItems",
   "defaultTransactionMode",
   "keepExplicitTransactionInAutoCommit",
+  "globalConnectTimeoutSecs",
+  "globalQueryTimeoutSecs",
 ] as const satisfies readonly (keyof EditorSettings)[];
 
 export type EditorSettingsDraftKey = (typeof EDITOR_SETTINGS_DRAFT_KEYS)[number];
@@ -208,6 +218,11 @@ function normalizedDraftValue(key: EditorSettingsDraftKey, value: unknown): unkn
   if (key === "snippetTriggerKey") return value === "space" || value === "both" ? value : "tab";
   if (key === "webLogoPosition") return value === "right" || value === "hidden" ? value : "left";
   if (key === "aiSqlApplyTargetMode") return normalizeAiSqlApplyTargetMode(value);
+  if (key === "colorizeConnectionTabsScope") return value === "active" ? "active" : "all";
+  // 全局连接/查询超时与连接编辑对话框「全局」档共用同一落盘口径（1~300 / 0~3600，0=不限），
+  // 草稿比较与回填都走同一 normalize，避免输入框残留越界值导致面板卡在“未保存”。
+  if (key === "globalConnectTimeoutSecs") return normalizeConnectTimeoutSecs(value);
+  if (key === "globalQueryTimeoutSecs") return normalizeQueryTimeoutSecs(value);
   return value;
 }
 

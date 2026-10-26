@@ -23,9 +23,11 @@ import com.dbx.agent.JdbcExecutor;
 import com.dbx.agent.JdbcIdentifiers;
 import com.dbx.agent.MultiSessionJsonRpcServer;
 import com.dbx.agent.MetadataListConstraints;
+import com.dbx.agent.MetadataReadOptions;
 import com.dbx.agent.ObjectInfo;
 import com.dbx.agent.ObjectSource;
 import com.dbx.agent.OracleObjectPrivilege;
+import com.dbx.agent.OracleTriggerReader;
 import com.dbx.agent.PartitionInfo;
 import com.dbx.agent.QueryPageOptions;
 import com.dbx.agent.QueryPageResult;
@@ -103,6 +105,9 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
 
     @Override
     public boolean supportsBlobBindStatements() { return true; }
+
+    @Override
+    public boolean supportsNativeLegacyJobs() { return true; }
 
     @Override
     public QueryResult executeBlobBoundStatements(List<String> previews, List<BlobBoundStatement> statements,
@@ -671,27 +676,43 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
     }
 
     @Override
+    public boolean supportsExactMetadataIdentity() { return true; }
+
+    @Override
     public List<ObjectInfo> listObjects(String schema, MetadataListConstraints constraints) {
         return queryObjects(schema, MetadataListConstraints.orNone(constraints));
     }
 
+    @Override
+    public List<ObjectInfo> listObjects(String schema, MetadataListConstraints constraints, MetadataReadOptions options) {
+        return queryObjects(schema, MetadataListConstraints.orNone(constraints), options != null && options.exact());
+    }
+
     private List<ObjectInfo> queryObjects(String schema, MetadataListConstraints constraints) {
+        return queryObjects(schema, constraints, false);
+    }
+
+    private List<ObjectInfo> queryObjects(String schema, MetadataListConstraints constraints, boolean exact) {
         return unchecked(() -> {
-            String owner = normalizeSchema(schema);
-            List<String> objectTypes = oceanBaseObjectTypes(constraints);
+            if (exact && (schema == null || schema.isEmpty())) throw new IllegalArgumentException("Exact metadata requires an owner");
+            String owner = exact ? schema : normalizeSchema(schema);
+            List<String> objectTypes = oceanBaseObjectTypes(constraints, exact);
             if (objectTypes.isEmpty()) {
                 return List.of();
             }
             String baseSql = """
-                SELECT o.OBJECT_NAME, o.OBJECT_TYPE, c.COMMENTS
+                SELECT o.OBJECT_NAME, o.OBJECT_TYPE, c.COMMENTS,
+                    i.TABLE_OWNER AS PARENT_SCHEMA, i.TABLE_NAME AS PARENT_NAME
                 FROM ALL_OBJECTS o
                 LEFT JOIN ALL_TAB_COMMENTS c ON c.OWNER = o.OWNER AND c.TABLE_NAME = o.OBJECT_NAME
                     AND o.OBJECT_TYPE IN ('TABLE', 'VIEW')
+                LEFT JOIN ALL_INDEXES i ON o.OBJECT_TYPE = 'INDEX'
+                    AND i.OWNER = o.OWNER AND i.INDEX_NAME = o.OBJECT_NAME
                 WHERE o.OWNER = ? AND o.OBJECT_TYPE IN (%s)
                 """.stripIndent().trim();
             MetadataSql query = oceanBaseMetadataSql(
                 String.format(baseSql, placeholders(objectTypes.size())),
-                "OBJECT_NAME, OBJECT_TYPE, COMMENTS",
+                "OBJECT_NAME, OBJECT_TYPE, COMMENTS, PARENT_SCHEMA, PARENT_NAME",
                 "OBJECT_NAME",
                 """
                 ORDER BY CASE OBJECT_TYPE
@@ -716,12 +737,21 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
                 try (ResultSet rs = stmt.executeQuery()) {
                     while (rs.next()) {
                         String objectType = rs.getString(2);
-                        result.add(new ObjectInfo(rs.getString(1),
-                            objectType.replace(' ', '_'), owner, rs.getString(3)));
+                        ObjectInfo object = new ObjectInfo(rs.getString(1),
+                            objectType.replace(' ', '_'), owner, rs.getString(3));
+                        if ("INDEX".equals(objectType)) {
+                            object.setParent_schema(rs.getString(4));
+                            object.setParent_name(rs.getString(5));
+                        }
+                        result.add(object);
                     }
                 }
             }
-            return constraints.withoutPaging().filterObjects(result);
+            List<ObjectInfo> objects = constraints.withoutPaging().filterObjects(result);
+            if (exact && objects.stream().anyMatch(object -> "TRIGGER".equals(object.getObject_type()))) {
+                new OracleTriggerReader(requireConnection(), "oceanbase-oracle").enrichObjects(objects, owner);
+            }
+            return objects;
         });
     }
 
@@ -1291,8 +1321,9 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
         return result;
     }
 
-    private static List<String> oceanBaseObjectTypes(MetadataListConstraints constraints) {
-        List<String> supported = List.of("TABLE", "VIEW", "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "SEQUENCE", "SYNONYM", "TYPE", "TYPE BODY");
+    private static List<String> oceanBaseObjectTypes(MetadataListConstraints constraints, boolean exact) {
+        List<String> supported = new ArrayList<>(List.of("TABLE", "VIEW", "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "SEQUENCE", "SYNONYM", "TYPE", "TYPE BODY", "INDEX"));
+        if (exact) supported.add("TRIGGER");
         if (!constraints.hasObjectTypes()) {
             return supported;
         }
@@ -1307,12 +1338,21 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
 
     @Override
     public ObjectSource getObjectSource(String schema, String name, String objectType) {
+        return getObjectSource(schema, name, objectType, false);
+    }
+
+    @Override
+    public ObjectSource getObjectSourceWithOrigin(String schema, String name, String objectType) {
+        return getObjectSource(schema, name, objectType, true);
+    }
+
+    private ObjectSource getObjectSource(String schema, String name, String objectType, boolean exactMetadataKind) {
         return unchecked(() -> {
             String owner = normalizeSchema(schema);
             String objectName = normalizeObjectName(name);
             String normalizedType = normalizeObjectSourceType(objectType);
             if (prefersDictionarySource(normalizedType)) {
-                return getDictionaryFirstObjectSource(owner, objectName, normalizedType);
+                return getDictionaryFirstObjectSource(owner, objectName, normalizedType, exactMetadataKind);
             }
             String source;
             SQLException metadataError = null;
@@ -1343,8 +1383,17 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
         });
     }
 
-    private ObjectSource getDictionaryFirstObjectSource(String owner, String name, String objectType) throws SQLException {
+    @Override
+    public ObjectSource getObjectSource(String schema, String name, String objectType, MetadataReadOptions options) {
+        if (options == null || !options.exact() || !"TRIGGER".equals(normalizeObjectSourceType(objectType))) {
+            return getObjectSource(schema, name, objectType);
+        }
+        return unchecked(() -> new OracleTriggerReader(requireConnection(), "oceanbase-oracle").getObjectSource(schema, name));
+    }
+
+    private ObjectSource getDictionaryFirstObjectSource(String owner, String name, String objectType, boolean exactMetadataKind) throws SQLException {
         String source;
+        String origin = "oceanbase-dictionary";
         SQLException dictionaryError = null;
         try {
             source = queryDictionarySource(owner, name, objectType);
@@ -1355,7 +1404,9 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
 
         if (source == null || source.trim().isEmpty()) {
             try {
-                source = queryDbmsMetadataSource(owner, name, objectType);
+                source = queryDbmsMetadataSource(owner, name,
+                    exactMetadataKind && "PACKAGE".equals(objectType) ? "PACKAGE_SPEC" : objectType);
+                origin = "oracle-metadata";
             } catch (SQLException metadataError) {
                 if (dictionaryError != null) {
                     dictionaryError.addSuppressed(metadataError);
@@ -1364,7 +1415,15 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
                 throw metadataError;
             }
         }
-        return new ObjectSource(name, objectType, owner, source == null ? "" : source);
+        if ("TYPE".equals(objectType) || "TYPE_BODY".equals(objectType)) {
+            if (source == null || source.trim().isEmpty()) {
+                throw new SQLException("No complete source available for " + owner + "." + name + " (" + objectType + ")");
+            }
+            return new ObjectSource(name, objectType, owner, source, false);
+        }
+        ObjectSource result = new ObjectSource(name, objectType, owner, source == null ? "" : source);
+        result.setSourceOrigin(origin);
+        return result;
     }
 
     private String queryDbmsMetadataSource(String owner, String name, String objectType) throws SQLException {
@@ -1942,7 +2001,7 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
             String tableName = normalizeObjectName(table);
             String sql = """
                 SELECT i.INDEX_NAME, ic.COLUMN_NAME, ic.COLUMN_POSITION, i.UNIQUENESS,
-                    c.CONSTRAINT_TYPE, i.INDEX_TYPE, i.PARTITIONED, i.VISIBILITY, ic.DESCEND, ie.COLUMN_EXPRESSION
+                    c.CONSTRAINT_TYPE, i.INDEX_TYPE, i.PARTITIONED, i.VISIBILITY, ic.DESCEND, ie.COLUMN_EXPRESSION, i.OWNER AS INDEX_OWNER
                 FROM ALL_INDEXES i
                 JOIN ALL_IND_COLUMNS ic
                     ON i.INDEX_NAME = ic.INDEX_NAME
@@ -1959,29 +2018,33 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
                     ON i.INDEX_NAME = c.INDEX_NAME
                     AND i.TABLE_OWNER = c.OWNER
                     AND i.TABLE_NAME = c.TABLE_NAME
+                    AND i.OWNER = c.INDEX_OWNER
                     AND c.CONSTRAINT_TYPE = 'P'
                 WHERE i.TABLE_OWNER = ? AND i.TABLE_NAME = ?
-                ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION
+                ORDER BY i.OWNER, i.INDEX_NAME, ic.COLUMN_POSITION
                 """.stripIndent().trim();
 
-            Map<String, IndexInfo> indexesByName = new LinkedHashMap<>();
+            Map<List<String>, IndexInfo> indexesByName = new LinkedHashMap<>();
             try (var stmt = requireConnection().prepareStatement(sql)) {
                 stmt.setString(1, owner);
                 stmt.setString(2, tableName);
                 try (ResultSet rs = stmt.executeQuery()) {
                     while (rs.next()) {
                         String indexName = rs.getString("INDEX_NAME");
-                        IndexInfo index = indexesByName.get(indexName);
+                        String indexOwner = rs.getString("INDEX_OWNER");
+                        var identity = java.util.Arrays.asList(indexOwner, indexName);
+                        IndexInfo index = indexesByName.get(identity);
                         if (index == null) {
                             IndexInfo item = new IndexInfo(indexName, new ArrayList<>(),
                                 "UNIQUE".equalsIgnoreCase(rs.getString("UNIQUENESS")),
                                 "P".equalsIgnoreCase(rs.getString("CONSTRAINT_TYPE")),
                                 null, rs.getString("INDEX_TYPE"), null, null);
                             item.setKey_is_expression(new ArrayList<>());
+                            item.setOwner(indexOwner);
                             item.setKey_directions(new ArrayList<>());
                             item.setKey_metadata_complete(true);
                             item.setVisibility(rs.getString("VISIBILITY"));
-                            indexesByName.put(indexName, item);
+                            indexesByName.put(identity, item);
                             index = item;
                         }
                         String column = rs.getString("COLUMN_NAME");
@@ -2290,6 +2353,12 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
     }
 
     @Override
+    public List<TriggerInfo> listTriggers(String schema, String table, MetadataReadOptions options) {
+        if (options == null || !options.exact()) return listTriggers(schema, table);
+        return unchecked(() -> new OracleTriggerReader(requireConnection(), "oceanbase-oracle").listTriggers(schema, table));
+    }
+
+    @Override
     public String setSchemaSQL(String schema) {
         if (schema == null || schema.isBlank()) {
             return "";
@@ -2433,6 +2502,6 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
     }
 
     public static void main(String[] args) {
-        MultiSessionJsonRpcServer.withBlobBindings(OceanBaseOracleAgent::new).run();
+        MultiSessionJsonRpcServer.withNativeLegacyJobs(OceanBaseOracleAgent::new, true).withExactMetadataIdentity().run();
     }
 }

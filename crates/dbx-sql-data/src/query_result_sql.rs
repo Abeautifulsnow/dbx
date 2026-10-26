@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
-use dbx_sql_core::sql_risk::{prove_read_only_for_database, ReadProof};
 use serde::{Deserialize, Serialize};
 
 use crate::models::connection::DatabaseType;
@@ -60,8 +59,8 @@ pub struct QueryPaginationExecutionPlanOptions {
 #[serde(rename_all = "camelCase")]
 pub struct QueryPaginationExecutionPlan {
     pub sql_to_execute: String,
-    /// Optional native MySQL page with one extra row. Only offered for queries
-    /// accepted by the strict read-only proof; callers must trim the probe row.
+    /// Legacy optional MySQL lookahead, retained for wire compatibility.
+    /// New plans leave this unset to avoid scanning beyond the requested page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_probe_sql: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -215,18 +214,21 @@ pub fn build_query_pagination_execution_plan(
         return plan;
     }
 
-    if options.database_type == Some(DatabaseType::OceanbaseOracle)
-        && (!rownum_wrapper_projection_is_safe(&options.sql) || has_top_level_rownum(&options.sql))
-    {
-        if options.use_agent_cursor {
-            plan.page_limit = Some(options.pagination.limit.max(1));
-            plan.page_offset = Some(options.pagination.offset);
-            plan.use_agent_result_session = true;
-        } else if options.pagination.offset > 0 {
-            plan.pagination_error = Some("This query requires an Agent result session for offset pagination".into());
-            plan.sql_to_execute.clear();
+    if let Some(db_type) = options.database_type {
+        if matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+            && rownum_wrapper_is_unsupported(&options.sql, db_type)
+        {
+            if options.use_agent_cursor {
+                plan.page_limit = Some(options.pagination.limit.max(1));
+                plan.page_offset = Some(options.pagination.offset);
+                plan.use_agent_result_session = true;
+            } else if options.pagination.offset > 0 {
+                plan.pagination_error =
+                    Some("This query requires an Agent result session for offset pagination".into());
+                plan.sql_to_execute.clear();
+            }
+            return plan;
         }
-        return plan;
     }
 
     if sql_server_cte {
@@ -243,9 +245,13 @@ pub fn build_query_pagination_execution_plan(
     // callers should add ORDER BY when that matters.
     // Kingbase keeps the cursor for unordered queries to preserve its behavior.
     let prefer_server_pagination = match options.database_type {
-        Some(DatabaseType::Goldendb | DatabaseType::Highgo | DatabaseType::OceanbaseOracle | DatabaseType::Xugu) => {
-            true
-        }
+        Some(
+            DatabaseType::Goldendb
+            | DatabaseType::Highgo
+            | DatabaseType::OceanbaseOracle
+            | DatabaseType::Oracle
+            | DatabaseType::Xugu,
+        ) => true,
         Some(DatabaseType::Kingbase) => kingbase_server_pagination_is_stable(&options.query_base_sql),
         _ => false,
     };
@@ -276,34 +282,10 @@ pub fn build_query_pagination_execution_plan(
         plan.page_sql = page_sql;
         plan.page_limit = Some(options.pagination.limit);
         plan.page_offset = Some(options.pagination.offset);
-        // A SELECT can mutate session state or invoke a user function. Do not
-        // evaluate an extra row unless both the original and rewritten query
-        // satisfy the same strict proof used for manual-transaction reads.
-        if options.database_type == Some(DatabaseType::Mysql)
-            && !options.use_agent_cursor
-            && options.pagination.limit > 0
-            && prove_read_only_for_database(&options.sql, DatabaseType::Mysql) == ReadProof::ProvenReadOnly
-            && (options.sql == options.query_base_sql
-                || prove_read_only_for_database(&options.query_base_sql, DatabaseType::Mysql)
-                    == ReadProof::ProvenReadOnly)
-        {
-            if let Some(probe_limit) =
-                options.pagination.limit.checked_add(1).filter(|limit| *limit <= i32::MAX as usize)
-            {
-                let probe = build_paginated_query_sql(PaginatedQuerySqlOptions {
-                    original_sql: options.sql.clone(),
-                    database_type: options.database_type,
-                    limit: probe_limit,
-                    offset: options.pagination.offset,
-                });
-                if probe.ok {
-                    plan.page_probe_sql = probe.sql.map(|sql| match execution_hint {
-                        Some(hint) => inject_execution_hint(&sql, hint),
-                        None => sql,
-                    });
-                }
-            }
-        }
+        // Do not request an extra row to prove that another page exists.
+        // Finding one more match in a filtered query can scan the entire
+        // remaining input even when the requested page is ready (#13211).
+        // A full page with unknown total keeps the frontend's next-page option.
         if options.pagination.offset > 0
             && pagination_strategy(options.database_type, PaginationContext::UserQuery)
                 == TablePaginationStrategy::Rownum
@@ -390,10 +372,12 @@ pub fn build_paginated_query_sql(options: PaginatedQuerySqlOptions) -> QuerySqlB
             ok(add_fetch_first_limit(&statement, safe_limit, safe_offset))
         }
         TablePaginationStrategy::Rownum => {
-            if options.database_type == Some(DatabaseType::OceanbaseOracle)
-                && !rownum_wrapper_projection_is_safe(&statement)
-            {
-                return err("unsupported");
+            if let Some(db_type) = options.database_type {
+                if matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+                    && rownum_wrapper_is_unsupported(&statement, db_type)
+                {
+                    return err("unsupported");
+                }
             }
             ok(add_rownum_limit(&statement, safe_limit, safe_offset))
         }
@@ -537,10 +521,14 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
         } else {
             ("", statement.as_str())
         };
-    if statement.trim_start().to_ascii_uppercase().starts_with("WITH") {
-        return err("with");
-    }
-    if !statement.trim_start().to_ascii_uppercase().starts_with("SELECT") {
+    // SQL Server and other engines reject WITH inside a derived table, so a CTE
+    // query is sorted by appending ORDER BY <position> to its main query.
+    let is_cte = statement.trim_start().to_ascii_uppercase().starts_with("WITH");
+    if is_cte {
+        if !cte_main_statement_is_select(statement) || has_top_level_select_into(statement) {
+            return err("with");
+        }
+    } else if !statement.trim_start().to_ascii_uppercase().starts_with("SELECT") {
         return err("not_select");
     }
 
@@ -568,14 +556,16 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
         Some(DatabaseType::Mysql | DatabaseType::Goldendb) => has_duplicate_labels(str::eq_ignore_ascii_case),
         _ => false,
     };
-    if derived_table_rejects_duplicate_labels
+    if is_cte
+        || derived_table_rejects_duplicate_labels
         || (options.database_type == Some(DatabaseType::OceanbaseOracle)
             && !rownum_wrapper_projection_is_safe(statement))
     {
-        let parsed = if matches!(options.database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb)) {
-            Parser::parse_sql(&MySqlDialect {}, statement)
-        } else {
-            Parser::parse_sql(&GenericDialect {}, statement)
+        let parsed = match options.database_type {
+            Some(DatabaseType::Mysql | DatabaseType::Goldendb) => Parser::parse_sql(&MySqlDialect {}, statement),
+            Some(DatabaseType::SqlServer) => Parser::parse_sql(&MsSqlDialect {}, statement),
+            Some(DatabaseType::ClickHouse) => Parser::parse_sql(&ClickHouseDialect {}, statement),
+            _ => Parser::parse_sql(&GenericDialect {}, statement),
         };
         let Ok(statements) = parsed else {
             return err("unsupported");
@@ -2237,6 +2227,49 @@ fn references_sequence_pseudocolumn(statement: &Statement) -> bool {
     .is_break()
 }
 
+fn has_top_level_lock(sql: &str) -> bool {
+    let tokens = top_level_sql_tokens(sql);
+    tokens.iter().enumerate().any(|(index, token)| {
+        token.text == "FOR" && tokens.get(index + 1).is_some_and(|next| next.text == "UPDATE" || next.text == "SHARE")
+    })
+}
+
+fn oracle_rownum_wrapper_is_unsupported(statement: &str) -> bool {
+    if !rownum_wrapper_projection_is_safe(statement)
+        || has_top_level_rownum(statement)
+        || has_top_level_fetch_first(statement)
+        || has_top_level_offset_fetch_next(statement)
+        || has_top_level_limit(statement)
+        || has_top_level_lock(statement)
+    {
+        return true;
+    }
+    if let Ok(statements) = Parser::parse_sql(&GenericDialect {}, statement) {
+        if let [Statement::Query(query)] = statements.as_slice() {
+            if query.limit_clause.is_some()
+                || query.fetch.is_some()
+                || !query.locks.is_empty()
+                || query.for_clause.is_some()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn oceanbase_rownum_wrapper_is_unsupported(statement: &str) -> bool {
+    !rownum_wrapper_projection_is_safe(statement) || has_top_level_rownum(statement) || has_top_level_lock(statement)
+}
+
+fn rownum_wrapper_is_unsupported(statement: &str, database_type: DatabaseType) -> bool {
+    match database_type {
+        DatabaseType::Oracle => oracle_rownum_wrapper_is_unsupported(statement),
+        DatabaseType::OceanbaseOracle => oceanbase_rownum_wrapper_is_unsupported(statement),
+        _ => false,
+    }
+}
+
 fn add_rownum_limit(statement: &str, limit: usize, offset: usize) -> String {
     if has_top_level_rownum(statement) {
         return format!("{statement};");
@@ -2935,6 +2968,18 @@ mod tests {
         })
     }
 
+    fn oracle_plan(sql: &str, limit: usize, offset: usize, cursor: bool) -> QueryPaginationExecutionPlan {
+        build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.into(),
+            query_base_sql: sql.into(),
+            database_type: Some(DatabaseType::Oracle),
+            pagination: QueryPagination { limit, offset, session_id: None },
+            use_agent_cursor: cursor,
+            first_page_uses_actual_sql: true,
+            execution_hint: None,
+        })
+    }
+
     #[test]
     fn oceanbase_cursor_fallback_preserves_limits_and_rejects_unavailable_offsets() {
         for sql in [
@@ -3212,6 +3257,160 @@ mod tests {
                 let rewritten = super::build_paginated_query_sql(super::PaginatedQuerySqlOptions {
                     original_sql: sql.into(),
                     database_type: Some(super::DatabaseType::OceanbaseOracle),
+                    limit: 100,
+                    offset,
+                });
+                assert!(!rewritten.ok, "{sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_cursor_fallback_preserves_limits_and_rejects_unavailable_offsets() {
+        for sql in [
+            "SELECT a.name, a.* FROM people a ORDER BY a.id",
+            "SELECT name, name FROM people WHERE ROWNUM <= 9",
+            "SELECT name, name FROM people ORDER BY name FETCH FIRST 9 ROWS ONLY",
+            "SELECT * FROM people WHERE ROWNUM <= 9",
+            "SELECT * FROM (SELECT name, name FROM people) p",
+            "SELECT a.id AS label, a.name AS \"LABEL\" FROM people a",
+            "SELECT a.name || a.name, a.name || a.name FROM people a",
+            "SELECT a.id, b.id FROM people a JOIN people b ON a.id = b.id",
+            "SELECT id FROM people FOR UPDATE",
+            "SELECT id FROM people FOR UPDATE NOWAIT",
+            "SELECT id FROM people FOR UPDATE SKIP LOCKED",
+            "SELECT id FROM people WHERE ROWNUM <= 10",
+            "SELECT id FROM people FETCH FIRST 10 ROWS ONLY",
+        ] {
+            for limit in [0, 1, 100, i32::MAX as usize] {
+                for offset in [0, 1, 100, 500] {
+                    let plan = oracle_plan(sql, limit, offset, true);
+                    assert_eq!(plan.sql_to_execute, sql);
+                    assert!(plan.use_agent_result_session, "{sql}");
+                    assert_eq!(plan.page_limit, Some(limit.max(1)));
+                    assert_eq!(plan.page_offset, Some(offset));
+                    assert!(plan.pagination_error.is_none());
+                    let plan = oracle_plan(sql, limit, offset, false);
+                    assert!(!plan.use_agent_result_session);
+                    assert!(plan.page_sql.is_none());
+                    if offset == 0 {
+                        assert_eq!(plan.sql_to_execute, sql);
+                        assert!(plan.pagination_error.is_none());
+                    } else {
+                        assert!(plan.pagination_error.is_some());
+                        assert!(plan.sql_to_execute.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_sequence_pseudocolumns_keep_the_original_statement() {
+        for sql in [
+            "SELECT to_char(sysdate,'yyyymmdd')||seq_yaz001.nextval FROM DUAL",
+            "SELECT seq_yaz001.NEXTVAL AS id FROM DUAL",
+            "SELECT app.seq_yaz001.currval AS id FROM DUAL",
+            "SELECT \"SEQ_YAZ001\".\"NEXTVAL\" AS id FROM DUAL",
+            "SELECT NVL(seq_yaz001.nextval, 0) AS id FROM DUAL",
+        ] {
+            for limit in [1, 100] {
+                let plan = oracle_plan(sql, limit, 0, true);
+                assert_eq!(plan.sql_to_execute, sql);
+                assert!(plan.use_agent_result_session, "{sql}");
+                assert!(plan.page_sql.is_none());
+                assert_eq!(plan.page_limit, Some(limit));
+
+                let plan = oracle_plan(sql, limit, 0, false);
+                assert_eq!(plan.sql_to_execute, sql);
+                assert!(plan.page_sql.is_none());
+                assert!(plan.pagination_error.is_none());
+            }
+            let paginated = build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: sql.into(),
+                database_type: Some(DatabaseType::Oracle),
+                limit: 100,
+                offset: 100,
+            });
+            assert!(!paginated.ok, "{sql}");
+        }
+    }
+
+    #[test]
+    fn oracle_columns_named_like_pseudocolumns_keep_bounded_sql() {
+        for sql in ["SELECT t.\"nextval\" AS v FROM t", "SELECT nextval AS v FROM t"] {
+            let plan = oracle_plan(sql, 100, 0, true);
+            assert!(!plan.use_agent_result_session, "{sql}");
+            assert!(plan.sql_to_execute.contains("ROWNUM <= 100"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn oracle_safe_projections_keep_bounded_sql_at_every_offset() {
+        for sql in [
+            "SELECT a.id, a.name FROM people a",
+            "SELECT a.id AS left_id, b.id AS right_id FROM people a JOIN people b ON a.id=b.id",
+            "SELECT a.id AS label, a.name AS \"label\" FROM people a",
+            "SELECT name AS label, COUNT(*) AS n FROM people GROUP BY name",
+            "SELECT code, name FROM BD_MATERIAL",
+            "SELECT DISTINCT bm.code 物料编码, bm.name 物料名称, bs.name 仓库 FROM BD_MATERIAL bm INNER JOIN BD_MATERIALSTOCK bm2 ON bm.PK_MATERIAL = bm2.PK_MATERIAL",
+        ] {
+            for cursor in [false, true] {
+                for limit in [0, 1, 100, i32::MAX as usize] {
+                    for offset in [0, 100, 500] {
+                        let plan = oracle_plan(sql, limit, offset, cursor);
+                        assert!(!plan.use_agent_result_session, "{sql}");
+                        assert!(plan.pagination_error.is_none());
+                        assert!(plan.sql_to_execute.contains(sql));
+                        assert!(plan.sql_to_execute.contains(&format!("ROWNUM <= {}", offset + limit.max(1))));
+                        assert_eq!(plan.pagination_row_number_column.is_some(), offset > 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_unsafe_projection_uses_cursor_at_every_offset() {
+        for sql in [
+            "SELECT * FROM people",
+            "SELECT a.* FROM people a",
+            "SELECT ID, BUSINESS_ROWID AS \"rowid\" FROM DBX_LOB_NOPK ORDER BY ID",
+            "SELECT BUSINESS_ROWID AS ROWID FROM DBX_LOB_NOPK",
+            "SELECT BUSINESS_ROWID AS \"RoWiD\", ROWIDTOCHAR(ROWID) AS \"__DBX_PK_0\" FROM DBX_LOB_NOPK",
+            "SELECT t.\"rowid\" FROM DBX_LOB_NOPK t",
+            "SELECT a.name, a.* FROM people a ORDER BY a.id",
+            "SELECT a.name, a.name FROM people a",
+            "SELECT a.id, b.id FROM people a JOIN people b ON a.id = b.id",
+            "SELECT * FROM people a JOIN people b ON a.id = b.id",
+            "SELECT a.*, b.* FROM people a JOIN people b ON a.id = b.id",
+            "SELECT a.id AS label, a.name AS LABEL FROM people a",
+            "SELECT DISTINCT a.name, a.name FROM people a",
+            "SELECT a.name, a.name, COUNT(*) FROM people a GROUP BY a.name",
+            "WITH p AS (SELECT * FROM people) SELECT p.name, p.* FROM p",
+            "SELECT name, name FROM people UNION ALL SELECT name, name FROM people",
+            "SELECT id FROM people FOR UPDATE",
+            "SELECT id FROM people WHERE ROWNUM <= 10",
+            "SELECT id FROM people FETCH FIRST 10 ROWS ONLY",
+        ] {
+            for offset in [0, 100, 500] {
+                let plan = super::build_query_pagination_execution_plan(super::QueryPaginationExecutionPlanOptions {
+                    sql: sql.into(),
+                    query_base_sql: sql.into(),
+                    database_type: Some(super::DatabaseType::Oracle),
+                    pagination: super::QueryPagination { limit: 100, offset, session_id: None },
+                    use_agent_cursor: true,
+                    first_page_uses_actual_sql: true,
+                    execution_hint: None,
+                });
+                assert!(plan.use_agent_result_session, "{sql} offset {offset}");
+                assert_eq!(plan.sql_to_execute, sql);
+                assert_eq!(plan.page_offset, Some(offset));
+                assert!(plan.pagination_row_number_column.is_none());
+                assert!(plan.page_sql.is_none());
+                let rewritten = super::build_paginated_query_sql(super::PaginatedQuerySqlOptions {
+                    original_sql: sql.into(),
+                    database_type: Some(super::DatabaseType::Oracle),
                     limit: 100,
                     offset,
                 });
@@ -4841,7 +5040,7 @@ WHERE u.id = picked.id;
     }
 
     #[test]
-    fn oracle_pagination_skips_sql_clause() {
+    fn oracle_pagination_wraps_with_rownum() {
         let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
             original_sql: "SELECT id FROM users".to_string(),
             database_type: Some(DatabaseType::Oracle),
@@ -4849,7 +5048,44 @@ WHERE u.id = picked.id;
             offset: 0,
         });
 
-        assert_eq!(result.sql.unwrap(), "SELECT id FROM users;");
+        assert_eq!(result.sql.unwrap(), "SELECT * FROM (SELECT id FROM users) WHERE ROWNUM <= 100;");
+    }
+
+    #[test]
+    fn oracle_pagination_wraps_offset_with_rownum_bounds() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT id FROM users".to_string(),
+            database_type: Some(DatabaseType::Oracle),
+            limit: 100,
+            offset: 200,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM (SELECT id FROM users) dbx_inner WHERE ROWNUM <= 300) WHERE \"__dbx_row_num\" > 200;"
+        );
+    }
+
+    #[test]
+    fn oracle_pagination_rejects_unsafe_queries() {
+        for sql in [
+            "SELECT a.id, b.id FROM a JOIN b ON a.id = b.id",
+            "SELECT a.id, a.* FROM a",
+            "SELECT * FROM users",
+            "SELECT id FROM users FOR UPDATE",
+            "SELECT id FROM users FOR UPDATE NOWAIT",
+            "SELECT id FROM users WHERE ROWNUM <= 10",
+            "SELECT id FROM users FETCH FIRST 10 ROWS ONLY",
+        ] {
+            let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: sql.to_string(),
+                database_type: Some(DatabaseType::Oracle),
+                limit: 100,
+                offset: 0,
+            });
+            assert!(!result.ok, "expected query to be rejected: {sql}");
+            assert_eq!(result.reason.as_deref(), Some("unsupported"), "reason mismatch: {sql}");
+        }
     }
 
     #[test]
@@ -5048,6 +5284,57 @@ WHERE u.id = picked.id;
             Some("/*sets:allsets*/SELECT COUNT(*) AS dbx_total_rows FROM (select @@server_id) `dbx_count`;")
         );
         assert!(!plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn mysql_pagination_does_not_look_past_the_requested_page() {
+        for sql in [
+            "SELECT * FROM table1 a, table2 b WHERE a.id = b.id AND REPLACE(SUBSTR(b.ymd, 1, 7), '-', '') < a.ym",
+            "SELECT id FROM people WHERE active = 1",
+            "SELECT id FROM people",
+        ] {
+            for offset in [0, 1000] {
+                let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+                    sql: sql.to_string(),
+                    query_base_sql: sql.to_string(),
+                    database_type: Some(DatabaseType::Mysql),
+                    pagination: QueryPagination { limit: 1000, offset, session_id: None },
+                    use_agent_cursor: false,
+                    first_page_uses_actual_sql: false,
+                    execution_hint: None,
+                });
+                let expected_sql = if offset == 0 {
+                    format!("{sql} LIMIT 1000;")
+                } else {
+                    format!("{sql} LIMIT 1000 OFFSET {offset};")
+                };
+
+                assert_eq!(plan.sql_to_execute, expected_sql);
+                assert_eq!(plan.page_sql.as_deref(), Some(expected_sql.as_str()));
+                assert_eq!(plan.page_limit, Some(1000));
+                assert_eq!(plan.page_offset, Some(offset));
+                assert!(plan.page_probe_sql.is_none(), "must not wait for a 1001st match: {sql}");
+                assert!(serde_json::to_value(&plan).unwrap().get("pageProbeSql").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_pagination_keeps_the_user_limit_without_a_probe() {
+        let sql = "SELECT id FROM people LIMIT 10";
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.to_string(),
+            query_base_sql: sql.to_string(),
+            database_type: Some(DatabaseType::Mysql),
+            pagination: QueryPagination { limit: 1000, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+            execution_hint: None,
+        });
+
+        assert_eq!(plan.sql_to_execute, "SELECT id FROM people LIMIT 10;");
+        assert_eq!(plan.exact_query_row_bound, Some(10));
+        assert!(plan.page_probe_sql.is_none());
     }
 
     #[test]
@@ -5821,7 +6108,7 @@ WHERE u.id = picked.id;
     }
 
     #[test]
-    fn oracle_offset_jump_keeps_agent_result_session() {
+    fn oracle_offset_jump_with_wildcard_keeps_agent_result_session() {
         let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
             sql: "SELECT * FROM events".to_string(),
             query_base_sql: "SELECT * FROM events".to_string(),
@@ -5832,12 +6119,37 @@ WHERE u.id = picked.id;
             execution_hint: None,
         });
 
-        // Oracle user queries are Unbounded: the SQL stays unchanged, so the
-        // client must consume the agent result session through to the offset.
-        assert_eq!(plan.sql_to_execute, "SELECT * FROM events;");
+        // Wildcard projections cannot safely be wrapped in a derived table due to unknown
+        // column collisions; offset jumps must keep the agent cursor session.
+        assert_eq!(plan.sql_to_execute, "SELECT * FROM events");
         assert_eq!(plan.page_limit, Some(100));
         assert_eq!(plan.page_offset, Some(200));
         assert!(plan.use_agent_result_session);
+        assert!(plan.pagination_row_number_column.is_none());
+    }
+
+    #[test]
+    fn oracle_offset_jump_with_safe_projection_rewrites_with_rownum() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT id FROM events".to_string(),
+            query_base_sql: "SELECT id FROM events".to_string(),
+            database_type: Some(DatabaseType::Oracle),
+            pagination: QueryPagination { limit: 100, offset: 200, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+            execution_hint: None,
+        });
+
+        // Safe projections without wildcard or duplicate output names support ROWNUM pagination (#12789),
+        // so offset jumps rewrite the query with server-side row-number bounds.
+        assert_eq!(
+            plan.sql_to_execute,
+            "SELECT * FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM (SELECT id FROM events) dbx_inner WHERE ROWNUM <= 300) WHERE \"__dbx_row_num\" > 200;"
+        );
+        assert_eq!(plan.page_limit, Some(100));
+        assert_eq!(plan.page_offset, Some(200));
+        assert!(!plan.use_agent_result_session);
+        assert_eq!(plan.pagination_row_number_column.as_deref(), Some("__dbx_row_num"));
     }
 
     #[test]
@@ -6817,7 +7129,7 @@ WHERE u.id = picked.id;
                 (" \n\t", "empty"),
                 (";", "empty"),
                 ("SELECT 1; SELECT 2;", "multi"),
-                ("WITH cte AS (SELECT 1 AS id) SELECT id FROM cte", "with"),
+                ("WITH cte AS (SELECT 1 AS id) INSERT INTO users SELECT id FROM cte", "with"),
                 ("SHOW TABLES", "not_select"),
                 ("UPDATE users SET id = 2", "not_select"),
             ] {
@@ -7332,19 +7644,152 @@ WHERE u.id = picked.id;
         assert_eq!(result.sql.unwrap(), "SELECT * FROM (SELECT id, name FROM users) t(id, name) ORDER BY id ASC;");
     }
 
-    #[test]
-    fn rejects_with_query_sorting() {
-        let result = build_sorted_query_sql(SortedQuerySqlOptions {
-            original_sql: "WITH cte AS (SELECT 1) SELECT * FROM cte".to_string(),
-            database_type: Some(DatabaseType::Postgres),
-            result_columns: vec!["id".to_string()],
-            column_index: 0,
-            column: "id".to_string(),
-            direction: QuerySortDirection::Asc,
-            tie_breaker_column_indexes: Vec::new(),
-        });
+    fn sorted_cte_sql(
+        original_sql: &str,
+        database_type: Option<DatabaseType>,
+        result_columns: &[&str],
+        column_index: usize,
+        direction: QuerySortDirection,
+        tie_breaker_column_indexes: Vec<usize>,
+    ) -> QuerySqlBuildResult {
+        build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: original_sql.to_string(),
+            database_type,
+            result_columns: result_columns.iter().map(|column| column.to_string()).collect(),
+            column_index,
+            column: result_columns.get(column_index).map(|column| column.to_string()).unwrap_or_default(),
+            direction,
+            tie_breaker_column_indexes,
+        })
+    }
 
-        assert_eq!(result, err("with"));
+    #[test]
+    fn sorts_with_query_by_appending_order_by_to_main_query() {
+        for database_type in [
+            None,
+            Some(DatabaseType::Postgres),
+            Some(DatabaseType::Mysql),
+            Some(DatabaseType::SqlServer),
+            Some(DatabaseType::Oracle),
+            Some(DatabaseType::Dameng),
+            Some(DatabaseType::Sqlite),
+            Some(DatabaseType::ClickHouse),
+            Some(DatabaseType::Hive),
+        ] {
+            let result = sorted_cte_sql(
+                "WITH t AS (SELECT a, b, c FROM src) SELECT a, b, sum(c) AS total FROM t GROUP BY a, b",
+                database_type,
+                &["a", "b", "total"],
+                2,
+                QuerySortDirection::Desc,
+                Vec::new(),
+            );
+
+            assert_eq!(
+                result,
+                ok("WITH t AS (SELECT a, b, c FROM src) SELECT a, b, sum(c) AS total FROM t GROUP BY a, b ORDER BY 3 DESC;"
+                    .to_string()),
+                "{database_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sorts_with_query_by_replacing_its_trailing_order_by() {
+        let result = sorted_cte_sql(
+            "WITH cte AS (SELECT id, name FROM users) SELECT id, name FROM cte ORDER BY id DESC;",
+            Some(DatabaseType::Postgres),
+            &["id", "name"],
+            1,
+            QuerySortDirection::Asc,
+            vec![0],
+        );
+
+        assert_eq!(
+            result,
+            ok("WITH cte AS (SELECT id, name FROM users) SELECT id, name FROM cte ORDER BY 2 ASC, 1 ASC;".to_string())
+        );
+    }
+
+    #[test]
+    fn sorts_with_query_keeping_order_by_inside_the_cte() {
+        let result = sorted_cte_sql(
+            "WITH top_users AS (SELECT TOP 5 id, name FROM users ORDER BY id) SELECT id, name FROM top_users",
+            Some(DatabaseType::SqlServer),
+            &["id", "name"],
+            1,
+            QuerySortDirection::Desc,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            result,
+            ok("WITH top_users AS (SELECT TOP 5 id, name FROM users ORDER BY id) SELECT id, name FROM top_users ORDER BY 2 DESC;"
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn sorts_recursive_with_query() {
+        for database_type in [Some(DatabaseType::Postgres), Some(DatabaseType::Mysql), Some(DatabaseType::Sqlite)] {
+            let result = sorted_cte_sql(
+                "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums",
+                database_type,
+                &["n"],
+                0,
+                QuerySortDirection::Desc,
+                Vec::new(),
+            );
+
+            assert_eq!(
+                result,
+                ok("WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums ORDER BY 1 DESC;"
+                    .to_string()),
+                "{database_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sorts_with_query_whose_main_query_is_a_union() {
+        let result = sorted_cte_sql(
+            "WITH a AS (SELECT 1 AS id), b AS (SELECT 2 AS id) SELECT id FROM a UNION ALL SELECT id FROM b",
+            Some(DatabaseType::Postgres),
+            &["id"],
+            0,
+            QuerySortDirection::Desc,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            result,
+            ok("WITH a AS (SELECT 1 AS id), b AS (SELECT 2 AS id) SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY 1 DESC;"
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_with_query_sorting_when_order_by_cannot_be_appended() {
+        for (original_sql, database_type, reason) in [
+            ("WITH cte AS (SELECT 1 AS id) SELECT id FROM cte LIMIT 10", Some(DatabaseType::Postgres), "unsupported"),
+            (
+                "WITH cte AS (SELECT 1 AS id) SELECT id FROM cte FETCH FIRST 10 ROWS ONLY",
+                Some(DatabaseType::Oracle),
+                "unsupported",
+            ),
+            ("WITH cte AS (SELECT 1 AS id) SELECT TOP 10 id FROM cte", Some(DatabaseType::SqlServer), "unsupported"),
+            ("WITH cte AS (SELECT 1 AS id) SELECT id FROM cte FOR UPDATE", Some(DatabaseType::Mysql), "unsupported"),
+            ("WITH cte AS (SELECT 1 AS id) SELECT id INTO #ids FROM cte", Some(DatabaseType::SqlServer), "with"),
+            (
+                "WITH cte AS (SELECT 1 AS id) DELETE FROM users WHERE id IN (SELECT id FROM cte)",
+                Some(DatabaseType::Postgres),
+                "with",
+            ),
+        ] {
+            let result = sorted_cte_sql(original_sql, database_type, &["id"], 0, QuerySortDirection::Asc, Vec::new());
+
+            assert_eq!(result, err(reason), "{original_sql:?}");
+        }
     }
 
     // -----------------------------------------------------------------------

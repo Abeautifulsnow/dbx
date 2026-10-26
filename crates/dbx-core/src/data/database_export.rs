@@ -76,6 +76,8 @@ pub enum DatabaseExportOutputCompression {
     #[default]
     None,
     Gzip,
+    /// Navicat `.nb3` backup archive (MySQL and PostgreSQL only).
+    Nb3,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +179,7 @@ enum DatabaseExportWriter {
     Plain(BufWriter<std::fs::File>),
     Gzip(Box<GzEncoder<BufWriter<std::fs::File>>>),
     SplitZip(Box<crate::export_split_zip::SplitZipExportWriter>),
+    Nb3(Box<crate::navicat_nb3::Nb3ExportWriter>),
 }
 
 impl DatabaseExportWriter {
@@ -185,6 +188,7 @@ impl DatabaseExportWriter {
             Self::Plain(writer) => writer.write_all(unit),
             Self::Gzip(writer) => writer.write_all(unit),
             Self::SplitZip(writer) => writer.write_sql_unit(unit),
+            Self::Nb3(writer) => writer.write_all(unit),
         }
     }
 }
@@ -195,6 +199,7 @@ impl Write for DatabaseExportWriter {
             Self::Plain(writer) => writer.write(buffer),
             Self::Gzip(writer) => writer.write(buffer),
             Self::SplitZip(writer) => writer.write(buffer),
+            Self::Nb3(writer) => writer.write(buffer),
         }
     }
 
@@ -209,6 +214,7 @@ impl Write for DatabaseExportWriter {
             Self::Plain(writer) => writer.flush(),
             Self::Gzip(writer) => writer.flush(),
             Self::SplitZip(writer) => writer.flush(),
+            Self::Nb3(writer) => writer.flush(),
         }
     }
 }
@@ -224,6 +230,7 @@ impl DatabaseExportWriter {
                 .and_then(|mut output| output.flush())
                 .map_err(|error| format!("Failed to finalize export file: {error}")),
             Self::SplitZip(writer) => writer.finish(source_file_name),
+            Self::Nb3(writer) => writer.finish(),
         }
     }
 }
@@ -2881,8 +2888,10 @@ pub async fn begin_database_backup_snapshot_core_for_export(
         .get(connection_id)
         .map(|config| config.db_type)
         .ok_or_else(|| format!("Connection config not found: {connection_id}"))?;
-    if !matches!(db_type, DatabaseType::Mysql | DatabaseType::Postgres) {
-        return Err("Consistent database backup snapshots are only supported for MySQL and PostgreSQL".to_string());
+    if !matches!(db_type, DatabaseType::Mysql | DatabaseType::Postgres | DatabaseType::OpenGauss) {
+        return Err(
+            "Consistent database backup snapshots are only supported for MySQL, PostgreSQL, and openGauss".to_string()
+        );
     }
 
     let session_id = if let Some(export_id) = export_id {
@@ -2912,7 +2921,7 @@ pub async fn begin_database_backup_snapshot_core_for_export(
         crate::query::begin_database_backup_snapshot(state, connection_id, database).await?
     };
 
-    let schemas_result = if matches!(db_type, DatabaseType::Postgres) {
+    let schemas_result = if matches!(db_type, DatabaseType::Postgres | DatabaseType::OpenGauss) {
         const POSTGRES_BACKUP_SCHEMAS_SQL: &str = "SELECT n.nspname FROM pg_catalog.pg_namespace n \
              WHERE n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast') \
              AND n.nspname NOT LIKE 'pg_toast_temp_%' \
@@ -2999,7 +3008,7 @@ fn database_export_metadata_prefetch_concurrency(db_type: DatabaseType) -> usize
     // PostgreSQL exports can hold a snapshot connection while metadata and UI
     // requests share the base pool. Keep enough capacity available for normal
     // browsing instead of filling nearly the entire ten-connection pool.
-    if db_type == DatabaseType::Postgres {
+    if matches!(db_type, DatabaseType::Postgres | DatabaseType::OpenGauss) {
         4
     } else {
         8
@@ -3698,11 +3707,12 @@ pub async fn export_database_sql_core(
     // Keep the large export state machine on the heap. Besides making the
     // caller future small, this prevents the metadata-prefetch locals from
     // exhausting the bounded stack used by test and runtime worker threads.
-    let result = if matches!(db_type, DatabaseType::Postgres) && request.schema.trim().is_empty() {
-        Box::pin(export_postgres_all_schemas_sql_core(state, request, &on_progress)).await
-    } else {
-        Box::pin(export_database_sql_core_inner(state, request, &on_progress)).await
-    };
+    let result =
+        if matches!(db_type, DatabaseType::Postgres | DatabaseType::OpenGauss) && request.schema.trim().is_empty() {
+            Box::pin(export_postgres_all_schemas_sql_core(state, request, &on_progress)).await
+        } else {
+            Box::pin(export_database_sql_core_inner(state, request, &on_progress)).await
+        };
     let metadata_session_id = database_export_client_session_id(&request.export_id);
     if let Err(error) =
         state.close_metadata_session_pool(&request.connection_id, Some(&request.database), &metadata_session_id).await
@@ -3791,6 +3801,20 @@ async fn create_database_export_writer(
         }
         return Ok(DatabaseExportWriter::SplitZip(Box::new(writer)));
     }
+    // Reject unsupported connections before the destination is created or truncated.
+    let nb3_database_type = if request.output_compression == DatabaseExportOutputCompression::Nb3 {
+        let db_type = state
+            .configs
+            .read()
+            .await
+            .get(&request.connection_id)
+            .map(|config| config.db_type)
+            .ok_or_else(|| format!("Connection config not found: {}", request.connection_id))?;
+        crate::navicat_nb3::ensure_supported_database_type(db_type)?;
+        Some(db_type)
+    } else {
+        None
+    };
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -3834,6 +3858,20 @@ async fn create_database_export_writer(
         DatabaseExportOutputCompression::None => DatabaseExportWriter::Plain(BufWriter::new(file)),
         DatabaseExportOutputCompression::Gzip => {
             DatabaseExportWriter::Gzip(Box::new(GzEncoder::new(BufWriter::new(file), Compression::default())))
+        }
+        DatabaseExportOutputCompression::Nb3 => {
+            let db_type = nb3_database_type.expect("Navicat backup database type is validated before opening");
+            let writer = crate::navicat_nb3::Nb3ExportWriter::new(
+                file,
+                export_destination_parent_dir(&request.file_path),
+                db_type,
+                &request.database,
+                &request.schema,
+            )
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&request.file_path);
+            })?;
+            DatabaseExportWriter::Nb3(Box::new(writer))
         }
     })
 }
@@ -6122,6 +6160,7 @@ mod tests {
     #[test]
     fn postgres_metadata_prefetch_reserves_pool_capacity() {
         assert_eq!(database_export_metadata_prefetch_concurrency(DatabaseType::Postgres), 4);
+        assert_eq!(database_export_metadata_prefetch_concurrency(DatabaseType::OpenGauss), 4);
         assert_eq!(database_export_metadata_prefetch_concurrency(DatabaseType::Mysql), 8);
     }
 

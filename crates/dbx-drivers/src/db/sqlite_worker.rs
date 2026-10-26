@@ -123,6 +123,7 @@ impl SqliteWorkerSession<'_> {
             WorkerBody::Ok { columns, column_types, rows, affected_rows, truncated, .. } => Ok(QueryResult {
                 columns: columns.unwrap_or_default(),
                 column_types: column_types.unwrap_or_default(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -565,6 +566,7 @@ async fn open_final_hop_session(
             &final_ssh.key_passphrase,
             final_ssh.use_ssh_agent,
             &final_ssh.ssh_agent_sock_path,
+            &final_ssh.ssh_agent_key_fingerprint,
             &final_ssh.auth_method,
             ssh_tunnel::effective_hop_timeout(final_ssh),
             tunnels.known_hosts_path(),
@@ -601,6 +603,7 @@ async fn open_final_hop_session(
         &final_ssh.key_passphrase,
         final_ssh.use_ssh_agent,
         &final_ssh.ssh_agent_sock_path,
+        &final_ssh.ssh_agent_key_fingerprint,
         &final_ssh.auth_method,
         ssh_tunnel::effective_hop_timeout(final_ssh),
         tunnels.known_hosts_path(),

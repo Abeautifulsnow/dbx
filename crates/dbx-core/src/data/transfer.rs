@@ -24,8 +24,10 @@ mod iris_tests;
 
 mod db2;
 mod ddl_plan;
+pub(crate) mod oracle_table_contract;
 mod overwrite_clear;
 mod structure_plan;
+pub(crate) mod xugu_objects;
 
 pub use overwrite_clear::clear_foreign_key_linked_overwrite_targets;
 
@@ -265,9 +267,12 @@ pub enum TransferObjectKind {
     MaterializedView,
     Procedure,
     Function,
+    Package,
+    PackageBody,
     Trigger,
     Sequence,
     Event,
+    Synonym,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -306,10 +311,17 @@ pub fn transfer_object_kinds_for_family(family: &TransferObjectFamily) -> Vec<Tr
 }
 
 pub fn transfer_object_kinds(db_type: &DatabaseType) -> Vec<TransferObjectKind> {
-    match transfer_object_family(db_type) {
+    if *db_type == DatabaseType::Xugu {
+        return xugu_objects::supported_kinds();
+    }
+    let mut kinds = match transfer_object_family(db_type) {
         Some(family) => transfer_object_kinds_for_family(&family),
         None => Vec::new(),
+    };
+    if matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
+        kinds.extend([TransferObjectKind::Package, TransferObjectKind::PackageBody]);
     }
+    kinds
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +371,8 @@ pub struct TransferRequest {
     /// Production database confirmation for drop_target_before_create.
     #[serde(default)]
     pub drop_target_confirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_packages: Option<crate::schema::oracle_routines::OraclePackageTransferRequest>,
 }
 
 fn default_quote_target_column_names() -> bool {
@@ -377,6 +391,8 @@ pub struct TransferOwnershipPreview {
     /// re-reads source and target metadata before executing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure: Option<TransferStructurePreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_packages: Option<crate::schema::oracle_routines::OraclePackageTransferPreview>,
 }
 
 /// SQL plan preview for a `drop_target_before_create` (rebuild) transfer.
@@ -487,6 +503,8 @@ impl TransferStructureOperation {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferStructurePreviewTable {
+    #[serde(skip)]
+    pub(crate) oracle_plan: Option<ddl_plan::PreparedTableDdl>,
     pub source_table: String,
     pub target_table: String,
     /// The target table already exists and this transfer plans no structure DDL for it,
@@ -526,6 +544,15 @@ impl<'a> TransferObjectSelectionMode<'a> {
 }
 
 impl TransferRequest {
+    pub(crate) fn has_package_selection(&self) -> bool {
+        self.objects.as_ref().is_some_and(|objects| {
+            objects.iter().any(|selection| {
+                matches!(selection.object_type, TransferObjectKind::Package | TransferObjectKind::PackageBody)
+                    && !selection.names.is_empty()
+            })
+        })
+    }
+
     fn object_selection_mode(&self) -> TransferObjectSelectionMode<'_> {
         match self.objects.as_deref() {
             Some(selections) => TransferObjectSelectionMode::Explicit(selections),
@@ -570,6 +597,12 @@ pub struct TransferTableResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferProgress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_package_approval: Option<crate::schema::oracle_routines::OraclePackageTransferPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_package_preflight: Option<crate::schema::oracle_routines::OraclePackageTransferPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_routine_operation: Option<crate::schema::oracle_routines::RoutineOperationRecord>,
     pub transfer_id: String,
     pub table: String,
     pub table_index: usize,
@@ -718,6 +751,13 @@ pub fn validate_transfer_target_table_names(request: &TransferRequest) -> Result
 /// target for the cross-family DDL pipeline (the executor rejects it).
 pub fn cross_family_transferable_object_kinds(source: &DatabaseType, target: &DatabaseType) -> Vec<TransferObjectKind> {
     use TransferObjectKind::*;
+    if *source == DatabaseType::Xugu || *target == DatabaseType::Xugu {
+        return if *source == DatabaseType::Xugu && *target == DatabaseType::Xugu {
+            xugu_objects::supported_kinds()
+        } else {
+            vec![]
+        };
+    }
     if is_same_transfer_family(source, target) {
         return transfer_object_kinds(source);
     }
@@ -1108,6 +1148,15 @@ pub fn validate_transfer_database_pair(
     source_db_type: &DatabaseType,
     target_db_type: &DatabaseType,
 ) -> Result<(), String> {
+    if request.has_package_selection()
+        && !(matches!((source_db_type, target_db_type), (DatabaseType::Xugu, DatabaseType::Xugu))
+            && request.oracle_packages.is_none())
+        && ![source_db_type, target_db_type]
+            .into_iter()
+            .all(|product| matches!(product, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
+    {
+        return Err("Package transfer requires actual Oracle or OceanBase Oracle endpoints; the Oracle family alone does not establish package support".into());
+    }
     if transfer_support_level(source_db_type).is_none() {
         return Err(format!("{} 暂未声明数据传输兼容级别", source_db_type.as_str()));
     }
@@ -1144,8 +1193,10 @@ pub fn validate_transfer_database_pair(
     if !matches!((source_db_type, target_db_type), (DatabaseType::Xugu, DatabaseType::Xugu)) {
         return Err("虚谷数据传输当前仅支持虚谷到虚谷".to_string());
     }
-    if request.objects.as_ref().is_some_and(|objects| !objects.is_empty()) {
-        return Err("虚谷数据传输当前仅支持表对象".to_string());
+    if request.objects.as_ref().is_some_and(|objects| {
+        objects.iter().any(|selection| !xugu_objects::supported_kinds().contains(&selection.object_type))
+    }) {
+        return Err("虚谷数据传输不支持所选对象类型".to_string());
     }
     if request.mode == TransferMode::Upsert || request.drop_target_before_create {
         return Err("虚谷数据传输当前仅支持追加或覆盖，暂不支持更新插入或重建".to_string());
@@ -1367,6 +1418,11 @@ pub fn target_object_exists_sql(
     name: &str,
     kind: &TransferObjectKind,
 ) -> Result<String, String> {
+    if matches!(kind, TransferObjectKind::Package | TransferObjectKind::PackageBody)
+        && !matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+    {
+        return Err("Package existence requires actual Oracle or OceanBase Oracle".into());
+    }
     let schema = quote_string_literal(schema);
     let name = quote_string_literal(name);
     let q = |literal: &str| literal.to_string();
@@ -1419,6 +1475,8 @@ pub fn target_object_exists_sql(
             | TransferObjectKind::MaterializedView
             | TransferObjectKind::Procedure
             | TransferObjectKind::Function
+            | TransferObjectKind::Package
+            | TransferObjectKind::PackageBody
             | TransferObjectKind::Trigger
             | TransferObjectKind::Sequence,
         ) => format!(
@@ -1428,6 +1486,8 @@ pub fn target_object_exists_sql(
                 TransferObjectKind::MaterializedView => "'MATERIALIZED VIEW'",
                 TransferObjectKind::Procedure => "'PROCEDURE'",
                 TransferObjectKind::Function => "'FUNCTION'",
+                TransferObjectKind::Package => "'PACKAGE'",
+                TransferObjectKind::PackageBody => "'PACKAGE BODY'",
                 TransferObjectKind::Trigger => "'TRIGGER'",
                 _ => "'SEQUENCE'",
             })
@@ -2290,11 +2350,6 @@ fn transfer_column_names_match(
 /// column exists. Reusing the catalog's declared name keeps the statement on a
 /// column that really exists; an exact match still wins so case-sensitive
 /// targets that do have the source-cased column keep addressing it.
-#[cfg(test)]
-fn resolve_transfer_target_column_names(col_names: &[String], target_columns: &[db::ColumnInfo]) -> Vec<String> {
-    resolve_transfer_target_column_names_or(col_names, target_columns, col_names)
-}
-
 /// Maps source names to target names; a name the target does not declare
 /// falls back to the matching entry of `fallbacks` (the requested target column case).
 fn resolve_transfer_target_column_names_or(
@@ -3179,6 +3234,20 @@ fn generate_mysql_foreign_key_alter_statements(
     statements
 }
 
+/// Single `setval` statement that moves the sequence behind `column` on `full_table`
+/// (already identifier-quoted) past the column's current maximum. `MAX(...::bigint)`
+/// keeps the expression type-safe for non-integer sequence-backed columns, and the
+/// statement is a no-op when `pg_get_serial_sequence` returns NULL for an unowned
+/// sequence.
+pub(crate) fn postgres_sequence_sync_statement(full_table: &str, column: &str) -> String {
+    let quoted_column = quote_identifier(column, &DatabaseType::Postgres);
+    format!(
+        "SELECT setval(pg_get_serial_sequence({}, {})::regclass, GREATEST(COALESCE(MAX({quoted_column}::bigint), 0), 1), MAX({quoted_column}::bigint) IS NOT NULL) FROM {full_table}",
+        quote_string_literal(full_table),
+        quote_string_literal(column)
+    )
+}
+
 /// `setval` statements that move a PostgreSQL sequence or identity column past the
 /// values already in the table.
 ///
@@ -3194,14 +3263,7 @@ fn generate_postgres_sequence_sync_sql(columns: &[db::ColumnInfo], table: &str, 
                 || is_postgres_identity_extra(column.extra.as_deref())
                 || (column.is_primary_key && column_is_auto_increment(column))
         })
-        .map(|column| {
-            let quoted_column = quote_identifier(&column.name, &DatabaseType::Postgres);
-            format!(
-                "SELECT setval(pg_get_serial_sequence({}, {})::regclass, GREATEST(COALESCE(MAX({quoted_column}::bigint), 0), 1), MAX({quoted_column}::bigint) IS NOT NULL) FROM {full_table}",
-                quote_string_literal(&full_table),
-                quote_string_literal(&column.name)
-            )
-        })
+        .map(|column| postgres_sequence_sync_statement(&full_table, &column.name))
         .collect()
 }
 
@@ -4171,7 +4233,7 @@ fn format_oracle_temporal_sql_literal(
     let normalized_column_type = column_type?.trim().to_ascii_lowercase();
     let parts = oracle_export_date_parts(value)?;
     match kind {
-        "date" => Some(format_oracle_date_sql_literal_parts(&parts)),
+        "date" => Some(format_oracle_date_sql_literal_parts(&parts, db_type)),
         "datetime"
             if (normalized_column_type.contains("with time zone")
                 || normalized_column_type.contains("with local time zone"))
@@ -4201,8 +4263,11 @@ struct OracleExportDateParts<'a> {
     zone: Option<&'a str>,
 }
 
-fn format_oracle_date_sql_literal_parts(parts: &OracleExportDateParts<'_>) -> String {
-    if oracle_export_date_parts_are_midnight(parts) {
+fn format_oracle_date_sql_literal_parts(parts: &OracleExportDateParts<'_>, db_type: &DatabaseType) -> String {
+    // Oracle accepts the ANSI `DATE 'YYYY-MM-DD'` literal for midnight values.
+    // OceanBase's Oracle mode resolves that spelling through NLS_DATE_FORMAT, so the
+    // same value can raise ORA-01858; use the explicit mask there (#12841).
+    if *db_type == DatabaseType::Oracle && oracle_export_date_parts_are_midnight(parts) {
         format!("DATE '{}'", parts.date)
     } else {
         format!("TO_DATE('{} {}', 'YYYY-MM-DD HH24:MI:SS')", parts.date, parts.time)
@@ -4435,6 +4500,42 @@ fn target_text_type(target_db: &DatabaseType) -> &'static str {
     }
 }
 
+fn has_max_length_param(lowered_source_type: &str) -> bool {
+    lowered_source_type
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .is_some_and(|(params, _)| params.trim() == "max")
+}
+
+/// DuckDB reads a bare `NUMERIC`/`DECIMAL` as DECIMAL(18, 3), which keeps only
+/// 15 integer digits, so a transferred NUMBER(18) key failed every insert with
+/// "Could not convert string ... to DECIMAL(18,3)" (#12846). A precision/scale
+/// pair DuckDB accepts (precision 1..=38, scale 0..=precision) is kept as is.
+/// Anything else, including an unconstrained Oracle `NUMBER` or PostgreSQL
+/// `numeric`, has no exact DuckDB equivalent and becomes DECIMAL(38, 10): the
+/// widest width DuckDB supports, with room for both 28 integer digits and a
+/// fractional part.
+fn duckdb_decimal_type(lowered_source_type: &str) -> String {
+    const FALLBACK: &str = "DECIMAL(38,10)";
+    let Some(params) =
+        lowered_source_type.split_once('(').and_then(|(_, rest)| rest.split_once(')')).map(|(params, _)| params)
+    else {
+        return FALLBACK.into();
+    };
+    let mut parts = params.split(',').map(str::trim);
+    let precision = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let scale = match parts.next() {
+        Some(value) => value.parse::<u32>().ok(),
+        None => Some(0),
+    };
+    match (precision, scale, parts.next()) {
+        (Some(precision), Some(scale), None) if (1..=38).contains(&precision) && scale <= precision => {
+            format!("DECIMAL({precision},{scale})")
+        }
+        _ => FALLBACK.into(),
+    }
+}
+
 pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &DatabaseType) -> String {
     if source_db == target_db {
         return source_type.to_string();
@@ -4489,6 +4590,13 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
         };
     }
 
+    // SQL Server `timestamp` is a synonym for `rowversion`: an 8 byte binary row
+    // counter read as `0x...`, not a date and time. Mapping it to a temporal type
+    // made every insert fail with an invalid timestamp format (#13190).
+    if *source_db == DatabaseType::SqlServer && is_sqlserver_rowversion_type(&t) {
+        base = "binary";
+    }
+
     if matches!(
         target_db,
         DatabaseType::Hive | DatabaseType::Kyuubi | DatabaseType::Impala | DatabaseType::Argo | DatabaseType::Transwarp
@@ -4530,10 +4638,18 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
             DatabaseType::SqlServer => "INT".into(),
             _ => "INTEGER".into(),
         },
-        "bigint" | "int8" => "BIGINT".into(),
+        // Oracle has no BIGINT/TINYINT spelling. `INTEGER` and `SMALLINT` are ANSI
+        // synonyms for NUMBER(38, 0), so they hold the full MySQL range (#12976:
+        // a MySQL -> OceanBase Oracle structure transfer failed with ORA-00900 at
+        // `BIGINT NOT NULL`). Other targets keep their native widths.
+        "bigint" | "int8" => match target_db {
+            DatabaseType::Oracle | DatabaseType::OceanbaseOracle => "INTEGER".into(),
+            _ => "BIGINT".into(),
+        },
         "smallint" | "int2" => "SMALLINT".into(),
         "tinyint" => match target_db {
             target_db if is_postgres_transfer_dialect(target_db) => "SMALLINT".into(),
+            DatabaseType::Oracle | DatabaseType::OceanbaseOracle => "SMALLINT".into(),
             _ => "TINYINT".into(),
         },
         "serial" | "bigserial" | "smallserial" => match target_db {
@@ -4556,6 +4672,7 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
             DatabaseType::Oracle | DatabaseType::OceanbaseOracle => "DOUBLE PRECISION".into(),
             _ => "DOUBLE".into(),
         },
+        "decimal" | "numeric" | "number" if *target_db == DatabaseType::DuckDb => duckdb_decimal_type(&t),
         "decimal" | "numeric" | "number" => {
             if t.contains('(') {
                 let params = &t[t.find('(').unwrap()..];
@@ -4581,7 +4698,12 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
             }
         }
         "varchar" | "nvarchar" | "character varying" | "varchar2" => {
-            if t.contains('(') {
+            // `(max)` is SQL Server only syntax for an up to 2 GB string. Other
+            // targets reject `VARCHAR(max)` in CREATE TABLE (#13190), so the
+            // column becomes the target's unbounded text type instead.
+            if has_max_length_param(&t) && *target_db != DatabaseType::SqlServer {
+                target_text_type(target_db).into()
+            } else if t.contains('(') {
                 let len_part = transfer_length_params(&t, source_db, target_db);
                 match target_db {
                     target_db if is_postgres_transfer_dialect(target_db) => format!("VARCHAR{len_part}"),
@@ -4863,7 +4985,14 @@ fn generate_create_table_ddl_with_column_quoting(
                     // sources must pass the same target type gate: Doris/StarRocks accept
                     // only BIGINT auto-increment columns, so an `INT AUTO_INCREMENT` from a
                     // MySQL source must stay a plain column there too (#12691 review).
+                    // MySQL also requires the auto-increment column to be a key, and the
+                    // generated DDL only recreates the primary key: a source column with
+                    // `extra = auto_increment` but no PK (a UNIQUE-key auto-increment is
+                    // legal MySQL) must stay a plain column instead of producing DDL MySQL
+                    // rejects ("there can be only one auto column and it must be defined
+                    // as a key").
                     let mysql_auto_increment = mysql_auto_increment_type_ok
+                        && c.is_primary_key
                         && (mysql_identity_source
                             || mysql_extra_clauses.as_ref().is_some_and(|extra| extra.auto_increment));
                     if !skip_default && !mysql_auto_increment {
@@ -8532,12 +8661,21 @@ fn should_prepare_fresh_agent_transfer_session(db_type: Option<DatabaseType>, er
     if !db_type.is_some_and(|db_type| crate::database_capabilities::is_agent_type(&db_type)) {
         return false;
     }
+    let xugu_local_timeout = db_type == Some(DatabaseType::Xugu)
+        && error.trim_start().to_ascii_lowercase().starts_with("agent rpc call timed out ");
+    if xugu_local_timeout {
+        return true;
+    }
     matches!(
         crate::db::agent_driver::try_agent_error_from_legacy(error),
         Some(crate::db::agent_driver::AgentCallError::Structured { context, .. })
             if context.session_disposition
                 == crate::db::agent_driver::AgentSessionDisposition::Quarantine
     )
+}
+
+fn should_reconnect_missing_xugu_transfer_metadata_pool(db_type: Option<DatabaseType>, pool_missing: bool) -> bool {
+    pool_missing && db_type == Some(DatabaseType::Xugu)
 }
 
 /// Whether a discarded transfer pool has to be replaced before the next statement runs.
@@ -8928,13 +9066,24 @@ fn effective_transfer_database_type(config: &ConnectionConfig) -> DatabaseType {
 pub async fn get_columns_for_transfer(
     state: &AppState,
     pool_key: &str,
-    _connection_id: &str,
+    connection_id: &str,
     database: &str,
     schema: &str,
     table: &str,
     catalog: Option<&str>,
 ) -> Result<Vec<db::ColumnInfo>, String> {
-    let pool_handle = state.pool_handle(pool_key).await;
+    let mut pool_handle = state.pool_handle(pool_key).await;
+    if pool_handle.is_none() {
+        let db_type = get_db_type(state, connection_id).await.ok();
+        if should_reconnect_missing_xugu_transfer_metadata_pool(db_type, true) {
+            // A timed-out Xugu Agent operation can invalidate its session and, when
+            // the shared Agent runtime is replaced, detach sibling source/target
+            // sessions too. Recreate only the missing Xugu transfer pool before
+            // asking the Agent for the next table's columns.
+            ensure_transfer_statement_pool(state, pool_key).await?;
+            pool_handle = state.pool_handle(pool_key).await;
+        }
+    }
 
     #[cfg(feature = "duckdb-sidecar")]
     if let Some(PoolKind::DuckDbWorker(client)) = pool_handle.as_ref() {
@@ -9441,10 +9590,13 @@ pub fn ordered_transfer_object_kinds(kinds: Vec<TransferObjectKind>) -> Vec<Tran
         TransferObjectKind::Sequence => 1,
         TransferObjectKind::View => 2,
         TransferObjectKind::MaterializedView => 2,
+        TransferObjectKind::Package => 3,
+        TransferObjectKind::Synonym => 4,
         TransferObjectKind::Function => 3,
         TransferObjectKind::Procedure => 4,
-        TransferObjectKind::Trigger => 5,
-        TransferObjectKind::Event => 6,
+        TransferObjectKind::PackageBody => 5,
+        TransferObjectKind::Trigger => 6,
+        TransferObjectKind::Event => 7,
     };
     let mut kinds = kinds;
     kinds.sort_by_key(rank);
@@ -9484,6 +9636,9 @@ pub fn object_kind_selected_or_defaulted(
     selections: Option<&[TransferObjectSelection]>,
     kind: &TransferObjectKind,
 ) -> bool {
+    if selections.is_none() && matches!(kind, TransferObjectKind::Package | TransferObjectKind::PackageBody) {
+        return false;
+    }
     selections.is_none_or(|selections| !selected_object_names(selections, kind).is_empty())
 }
 
@@ -9580,18 +9735,86 @@ pub async fn transfer_schema_objects<F>(
     request: &TransferRequest,
     source_pool_key: &str,
     target_pool_key: &str,
+    mut progress_callback: F,
+) -> Result<TransferObjectOutcome, String>
+where
+    F: FnMut(TransferProgress),
+{
+    if request.has_package_selection() {
+        let source_db_type = get_db_type(state, &request.source_connection_id).await?;
+        let target_db_type = get_db_type(state, &request.target_connection_id).await?;
+        validate_transfer_database_pair(request, &source_db_type, &target_db_type)?;
+    }
+    let packages = match crate::schema::oracle_routines::claim_transfer_packages(state, request, None).await {
+        Ok(packages) => packages,
+        Err(error) => {
+            let progress = error.into_progress(request);
+            let message = progress.error.clone().unwrap();
+            progress_callback(progress);
+            return Err(message);
+        }
+    };
+    if matches!(request.content, TransferContent::DataOnly) {
+        return Ok(TransferObjectOutcome::default());
+    }
+    let routine_context = crate::schema::oracle_routines::capture_routine_transfer_context(
+        state,
+        &request.source_connection_id,
+        &request.target_connection_id,
+    )
+    .await?;
+    let mut outcome = transfer_schema_objects_with_routine_context(
+        state,
+        request,
+        source_pool_key,
+        target_pool_key,
+        routine_context.as_ref(),
+        &mut progress_callback,
+    )
+    .await?;
+    if let Some(packages) = packages {
+        let (package_outcome, cancelled, preflight_error) =
+            packages.run(state, request, outcome.failed.is_empty(), progress_callback).await;
+        outcome.transferred.extend(package_outcome.transferred);
+        outcome.skipped.extend(package_outcome.skipped);
+        outcome.failed.extend(package_outcome.failed);
+        if cancelled {
+            return Err("Cancelled".into());
+        }
+        if let Some(error) = preflight_error {
+            return Err(error);
+        }
+    }
+    Ok(outcome)
+}
+
+pub(crate) async fn transfer_schema_objects_with_routine_context<F>(
+    state: &AppState,
+    request: &TransferRequest,
+    source_pool_key: &str,
+    target_pool_key: &str,
+    routine_context: Option<&crate::schema::oracle_routines::RoutineTransferContext>,
     progress_callback: F,
 ) -> Result<TransferObjectOutcome, String>
 where
     F: FnMut(TransferProgress),
 {
-    if matches!(request.content, TransferContent::DataOnly) {
+    if matches!(request.content, TransferContent::DataOnly) && !request.has_package_selection() {
         return Ok(TransferObjectOutcome::default());
     }
     let source_db_type = get_db_type(state, &request.source_connection_id).await?;
     let target_db_type = get_db_type(state, &request.target_connection_id).await?;
+    if request.has_package_selection() {
+        validate_transfer_database_pair(request, &source_db_type, &target_db_type)?;
+    }
+    if matches!(request.content, TransferContent::DataOnly) {
+        return Ok(TransferObjectOutcome::default());
+    }
     if !should_transfer_schema_objects(&source_db_type, &target_db_type, request) {
         return Ok(TransferObjectOutcome::default());
+    }
+    if source_db_type == DatabaseType::Xugu && target_db_type == DatabaseType::Xugu {
+        return Err("Xugu schema objects must run through the prepared transfer plan".into());
     }
     if !is_same_transfer_family(&source_db_type, &target_db_type) {
         return transfer_cross_family_schema_objects(
@@ -9634,6 +9857,7 @@ where
                 &target_db_type,
                 source_pool_key,
                 target_pool_key,
+                routine_context,
                 progress_callback,
             )
             .await
@@ -9680,6 +9904,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -9905,6 +10132,7 @@ async fn transfer_oracle_schema_objects<F>(
     target_db_type: &DatabaseType,
     source_pool_key: &str,
     target_pool_key: &str,
+    routine_context: Option<&crate::schema::oracle_routines::RoutineTransferContext>,
     mut progress_callback: F,
 ) -> Result<TransferObjectOutcome, String>
 where
@@ -9924,6 +10152,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -9941,6 +10172,47 @@ where
             if exists {
                 outcome.skipped.push(format!("{kind:?}:{name}"));
                 progress(&mut outcome, TransferStatus::Running, None);
+                continue;
+            }
+            if let Some(context) =
+                routine_context.filter(|_| matches!(kind, TransferObjectKind::Procedure | TransferObjectKind::Function))
+            {
+                let identity = crate::schema::oracle_routines::RoutineIdentity {
+                    owner: source_schema.clone(),
+                    name: name.clone(),
+                    kind: if kind == TransferObjectKind::Procedure {
+                        db::ObjectSourceKind::Procedure
+                    } else {
+                        db::ObjectSourceKind::Function
+                    },
+                };
+                let result = crate::schema::oracle_routines::transfer_oracle_routine_core(
+                    state,
+                    context,
+                    crate::schema::oracle_routines::RoutineTransferInput {
+                        source_connection_id: request.source_connection_id.clone(),
+                        source_database: request.source_database.clone(),
+                        identity,
+                        target_connection_id: request.target_connection_id.clone(),
+                        target_database: request.target_database.clone(),
+                        target_owner: target_schema.clone(),
+                    },
+                )
+                .await;
+                match result {
+                    Ok(operation) if operation.verified() => {
+                        outcome.transferred.push(format!("{kind:?}:{name}"));
+                        progress(&mut outcome, TransferStatus::Running, None);
+                    }
+                    result => {
+                        let error = match result {
+                            Ok(operation) => operation.failure_message(),
+                            Err(error) => error,
+                        };
+                        outcome.failed.push(format!("{kind:?}:{name}"));
+                        progress(&mut outcome, TransferStatus::Error, Some(error));
+                    }
+                }
                 continue;
             }
             let query = oracle_object_source_query(&kind, &source_schema, &name)?;
@@ -10029,6 +10301,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -10123,6 +10398,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -10320,6 +10598,7 @@ async fn get_postgres_schema_object_sources_for_transfer(
             source,
             editable: None,
             routine_parameters: None,
+            trigger: None,
         });
     }
     for row in execute_on_pool(state, pool_key, &routines_sql).await?.rows {
@@ -10340,6 +10619,7 @@ async fn get_postgres_schema_object_sources_for_transfer(
             source,
             editable: None,
             routine_parameters: None,
+            trigger: None,
         });
     }
 
@@ -10929,6 +11209,25 @@ async fn build_rebuild_preview(
     Ok(TransferRebuildPreview { sql: phases.join("\n\n"), tables, backup_sql, cleanup_sql })
 }
 
+pub(crate) async fn build_package_transfer_structure(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    source_db_type: &DatabaseType,
+    target_db_type: &DatabaseType,
+    source_pool_key: &str,
+    target_pool_key: &str,
+) -> Result<TransferStructurePreview, String> {
+    structure_plan::build_structure_preview(
+        state,
+        request,
+        source_db_type,
+        target_db_type,
+        source_pool_key,
+        target_pool_key,
+    )
+    .await
+}
+
 pub async fn preview_transfer_ownership(
     state: &Arc<AppState>,
     request: &TransferRequest,
@@ -10937,6 +11236,9 @@ pub async fn preview_transfer_ownership(
     source_pool_key: &str,
     target_pool_key: &str,
 ) -> Result<TransferOwnershipPreview, String> {
+    if request.has_package_selection() {
+        validate_transfer_request(request)?;
+    }
     validate_transfer_database_pair(request, source_db_type, target_db_type)?;
     // PostgreSQL-compatible transfers report role ownership gaps for the confirmation flow.
     let (missing_owners, target_owner) =
@@ -10968,7 +11270,10 @@ pub async fn preview_transfer_ownership(
     // Structure-only transfers expose the statements their create pass will run. The other
     // content modes keep their existing previews: data-only runs no DDL, and
     // structure-and-data is deliberately unchanged here.
-    let structure = if matches!(request.content, TransferContent::StructureOnly) {
+    let mut structure = if matches!(request.content, TransferContent::StructureOnly)
+        || (request.has_package_selection()
+            && matches!(source_db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
+    {
         Some(
             structure_plan::build_structure_preview(
                 state,
@@ -10984,7 +11289,30 @@ pub async fn preview_transfer_ownership(
         None
     };
 
-    Ok(TransferOwnershipPreview { missing_owners, target_owner, rebuild, structure })
+    let oracle_packages =
+        crate::schema::oracle_routines::prepare_transfer_packages(state, request, structure.as_mut()).await?;
+    if let (Some(packages), Some(structure)) = (&oracle_packages, &mut structure) {
+        let sql = packages
+            .plan
+            .steps
+            .iter()
+            .filter(|step| !step.sql.trim().is_empty())
+            .map(|step| step.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n/\n");
+        if !sql.is_empty() {
+            structure.sql.push_str("\n\n");
+            structure.sql.push_str(&sql);
+        }
+        structure.schema_objects_expanded = request.objects.iter().flatten().all(|selection| {
+            selection.names.is_empty()
+                || matches!(
+                    selection.object_type,
+                    TransferObjectKind::Table | TransferObjectKind::Package | TransferObjectKind::PackageBody
+                )
+        });
+    }
+    Ok(TransferOwnershipPreview { missing_owners, target_owner, rebuild, structure, oracle_packages })
 }
 
 fn postgres_transfer_grant_statements_sql(
@@ -11565,6 +11893,9 @@ where
         offset += row_count as u64;
 
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: table.to_string(),
             table_index,
@@ -12055,6 +12386,9 @@ where
             }
 
             progress_callback(TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: request.transfer_id.clone(),
                 table: format!("rename: {table}"),
                 table_index: i,
@@ -12328,7 +12662,7 @@ async fn create_transfer_target_table(
     // confirmation dialog and the actual creation can never disagree on the DDL
     // or the names inside it. Rebuild mode additionally fails closed here when
     // source metadata cannot be trusted.
-    let prepared = ddl_plan::prepare_table_ddl(
+    let mut prepared = ddl_plan::prepare_table_ddl(
         state,
         request,
         table,
@@ -12341,6 +12675,21 @@ async fn create_transfer_target_table(
         known_foreign_keys,
     )
     .await?;
+    if let Some(frozen) = request
+        .oracle_packages
+        .as_ref()
+        .and_then(|packages| packages.pending_tables.as_ref())
+        .and_then(|pending| pending.tables.iter().find(|frozen| frozen.source_table() == table))
+    {
+        let regenerated = frozen.verify_server_plan(
+            table,
+            &request.target_schema,
+            target_table,
+            &prepared.ddl,
+            prepared.source_evidence.clone().ok_or("The original table evidence is unavailable before CREATE")?,
+        )?;
+        prepared.ddl = regenerated.final_ddl().to_owned();
+    }
     let reused_source_ddl = prepared.reused_source_ddl;
     let ddl = prepared.ddl;
     let ddl = if pg_compat_transfer && !owned_sequences.is_empty() {
@@ -12916,6 +13265,9 @@ where
             .map_err(|error| format!("Native Inceptor transfer failed for '{table}': {error}"))?;
         let copied = total_rows.expect("complex transfer count validated");
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: table.to_string(),
             table_index,
@@ -12970,6 +13322,9 @@ where
             batch_size as u64,
             &mut |rows| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.to_string(),
                     table_index,
@@ -12989,6 +13344,9 @@ where
                 total_transferred = rows;
                 log::info!("[transfer] {table}: COPY fast path moved {rows} rows in {:?}", started.elapsed());
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.to_string(),
                     table_index,
@@ -13261,6 +13619,9 @@ where
             offset += row_count as u64;
 
             progress_callback(TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: request.transfer_id.clone(),
                 table: table.to_string(),
                 table_index,
@@ -13883,6 +14244,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("extension: {}", extension.extension_name),
             table_index,
@@ -13904,6 +14268,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("enum: {}", enum_type.type_name),
             table_index,
@@ -13925,6 +14292,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("domain: {}", domain.domain_name),
             table_index,
@@ -13951,6 +14321,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("sequence: {}", sequence.name),
             table_index,
@@ -14086,6 +14459,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("schema object: {}", object.name),
             table_index,
@@ -14146,6 +14522,9 @@ where
             }
             completed_steps += 1;
             progress_callback(TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: request.transfer_id.clone(),
                 table: format!("materialized view: {}", view.view_name),
                 table_index,
@@ -14180,6 +14559,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("trigger: {}", trigger.trigger_name),
             table_index,
@@ -14200,6 +14582,9 @@ where
             .map_err(|e| format!("Failed to drop PostgreSQL trigger {}: {e}", trigger.trigger_name))?;
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("trigger: {}", trigger.trigger_name),
             table_index,
@@ -14228,6 +14613,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: "row security policies".to_string(),
             table_index,
@@ -14249,6 +14637,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: "ownership".to_string(),
             table_index,
@@ -14280,6 +14671,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: "grants".to_string(),
             table_index,
@@ -15027,6 +15421,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         db::QueryResult {
             columns: Vec::new(),
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -15319,6 +15714,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             batch_size: 1000,
             drop_target_before_create: false,
             drop_target_confirmed: false,
+            oracle_packages: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["content"], "structureOnly");
@@ -15358,6 +15754,33 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             let dm = transfer_object_kinds(&DatabaseType::Dameng);
             assert!(dm.contains(&TransferObjectKind::Trigger));
             assert!(dm.contains(&TransferObjectKind::Sequence));
+            assert!(!dm.contains(&TransferObjectKind::Package));
+            for product in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+                let kinds = transfer_object_kinds(&product);
+                assert!(kinds.contains(&TransferObjectKind::Package));
+                assert!(kinds.contains(&TransferObjectKind::PackageBody));
+                assert!(target_object_exists_sql(
+                    &product,
+                    "Owner.With.Dot",
+                    "Pkg.With.Dot😀",
+                    &TransferObjectKind::Package
+                )
+                .unwrap()
+                .contains("OBJECT_TYPE = 'PACKAGE'"));
+                assert!(target_object_exists_sql(
+                    &product,
+                    "Owner.With.Dot",
+                    "Pkg.With.Dot😀",
+                    &TransferObjectKind::PackageBody
+                )
+                .unwrap()
+                .contains("OBJECT_TYPE = 'PACKAGE BODY'"));
+            }
+            assert!(
+                target_object_exists_sql(&DatabaseType::Dameng, "OWNER", "PKG", &TransferObjectKind::Package).is_err()
+            );
+            assert!(!object_kind_selected_or_defaulted(None, &TransferObjectKind::Package));
+            assert!(!object_kind_selected_or_defaulted(None, &TransferObjectKind::PackageBody));
             let sqlserver = transfer_object_kinds(&DatabaseType::SqlServer);
             assert!(sqlserver.contains(&TransferObjectKind::View));
             assert!(sqlserver.contains(&TransferObjectKind::Procedure));
@@ -15408,11 +15831,12 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 table_filters: std::collections::HashMap::new(),
                 drop_target_before_create: false,
                 drop_target_confirmed: false,
+                oracle_packages: None,
             }
         }
 
         #[test]
-        fn xugu_transfer_is_same_engine_table_only_and_append_or_overwrite() {
+        fn xugu_transfer_is_same_engine_only_and_append_or_overwrite() {
             let request = base_request();
             assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu).is_ok());
             // Existing non-Xugu transfer combinations retain their prior policy.
@@ -15434,6 +15858,44 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 .contains("追加或覆盖"));
             let rebuild = TransferRequest { drop_target_before_create: true, ..request.clone() };
             assert!(validate_transfer_database_pair(&rebuild, &DatabaseType::Xugu, &DatabaseType::Xugu).is_err());
+        }
+
+        #[test]
+        fn explicit_package_requests_round_trip_and_reject_unsupported_products_before_filtering() {
+            let request = TransferRequest {
+                objects: Some(vec![
+                    TransferObjectSelection {
+                        object_type: TransferObjectKind::Package,
+                        names: vec!["Pkg.With.Dot:😀".into()],
+                    },
+                    TransferObjectSelection {
+                        object_type: TransferObjectKind::PackageBody,
+                        names: vec!["Pkg.With.Dot:😀".into()],
+                    },
+                ]),
+                ..base_request()
+            };
+            let wire = serde_json::to_value(&request).unwrap();
+            assert_eq!(wire["objects"][0]["objectType"], "PACKAGE");
+            assert_eq!(wire["objects"][1]["objectType"], "PACKAGE_BODY");
+            let restored: TransferRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(restored.objects, request.objects);
+            for source in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+                for target in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+                    assert!(validate_transfer_database_pair(&restored, &source, &target).is_ok());
+                }
+                for target in [DatabaseType::Dameng, DatabaseType::Mysql, DatabaseType::Postgres, DatabaseType::Xugu] {
+                    assert!(validate_transfer_database_pair(&restored, &source, &target)
+                        .unwrap_err()
+                        .contains("actual Oracle"));
+                    assert!(validate_transfer_database_pair(&restored, &target, &source)
+                        .unwrap_err()
+                        .contains("actual Oracle"));
+                }
+            }
+            let legacy = TransferRequest { objects: None, ..restored };
+            assert!(!legacy.has_package_selection());
+            assert!(validate_transfer_database_pair(&legacy, &DatabaseType::Dameng, &DatabaseType::Oracle).is_ok());
         }
 
         #[test]
@@ -15469,7 +15931,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         }
 
         #[test]
-        fn xugu_structure_transfer_rejects_renamed_tables_and_non_table_objects() {
+        fn xugu_structure_transfer_preserves_names_and_accepts_native_objects() {
             let request = TransferRequest { target_table_name_case: TransferTableNameCase::Upper, ..base_request() };
             assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu)
                 .unwrap_err()
@@ -15482,9 +15944,29 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 }]),
                 ..base_request()
             };
-            assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu)
-                .unwrap_err()
-                .contains("仅支持表对象"));
+            assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu).is_ok());
+            for kind in [
+                TransferObjectKind::Package,
+                TransferObjectKind::Synonym,
+                TransferObjectKind::Sequence,
+                TransferObjectKind::Procedure,
+                TransferObjectKind::Function,
+                TransferObjectKind::Trigger,
+            ] {
+                let request = TransferRequest {
+                    objects: Some(vec![TransferObjectSelection { object_type: kind, names: vec!["O".into()] }]),
+                    ..base_request()
+                };
+                assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu).is_ok());
+            }
+            let unsupported = TransferRequest {
+                objects: Some(vec![TransferObjectSelection {
+                    object_type: TransferObjectKind::Event,
+                    names: vec!["E".into()],
+                }]),
+                ..base_request()
+            };
+            assert!(validate_transfer_database_pair(&unsupported, &DatabaseType::Xugu, &DatabaseType::Xugu).is_err());
         }
 
         #[test]
@@ -15512,6 +15994,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 objects: Some(Vec::new()),
                 drop_target_before_create: false,
                 drop_target_confirmed: false,
+                oracle_packages: None,
             };
             assert!(validate_transfer_request(&base).is_ok());
 
@@ -15554,6 +16037,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 objects: Some(Vec::new()),
                 drop_target_before_create: false,
                 drop_target_confirmed: false,
+                oracle_packages: None,
             };
 
             // drop_target_before_create=false → valid
@@ -16750,6 +17234,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                     source: "SELECT 1".into(),
                     editable: None,
                     routine_parameters: None,
+                    trigger: None,
                 },
                 db::ObjectSource {
                     name: "v2".into(),
@@ -16758,6 +17243,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                     source: "SELECT 2".into(),
                     editable: None,
                     routine_parameters: None,
+                    trigger: None,
                 },
             ];
             let selection =
@@ -16881,6 +17367,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             batch_size: 1000,
             drop_target_before_create: false,
             drop_target_confirmed: false,
+            oracle_packages: None,
         }
     }
 
@@ -17051,7 +17538,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             resolve_transfer_target_column_names_or(&names, &target, &upper),
             vec!["ID".to_string(), "Name".to_string(), "EXTRA".to_string()]
         );
-        assert_eq!(resolve_transfer_target_column_names(&names, &target)[2], "extra");
+        assert_eq!(resolve_transfer_target_column_names_or(&names, &target, &names)[2], "extra");
     }
 
     #[test]
@@ -17433,7 +17920,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         let col_names = vec!["id".to_string(), "name".to_string()];
 
         assert_eq!(
-            resolve_transfer_target_column_names(&col_names, &target_columns),
+            resolve_transfer_target_column_names_or(&col_names, &target_columns, &col_names),
             vec!["ID".to_string(), "NAME".to_string()]
         );
     }
@@ -17446,7 +17933,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         let col_names = vec!["id".to_string(), "ID".to_string()];
 
         assert_eq!(
-            resolve_transfer_target_column_names(&col_names, &target_columns),
+            resolve_transfer_target_column_names_or(&col_names, &target_columns, &col_names),
             vec!["id".to_string(), "ID".to_string()]
         );
     }
@@ -17457,7 +17944,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         let col_names = vec!["id".to_string(), "missing".to_string()];
 
         assert_eq!(
-            resolve_transfer_target_column_names(&col_names, &target_columns),
+            resolve_transfer_target_column_names_or(&col_names, &target_columns, &col_names),
             vec!["ID".to_string(), "missing".to_string()]
         );
     }
@@ -20519,6 +21006,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_generates_index_and_foreign_key_sql() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20577,6 +21065,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_includes_opclass_for_gin_trigram() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20608,6 +21097,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
         // (`syntax error at or near "NOT"`), so the transfer must fall back to the
         // plain form there (issue #8853).
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20646,6 +21136,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_no_opclass_when_all_default() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20680,6 +21171,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
         // `indclass` into `column_opclasses`, so transfer DDL must append it to an
         // expression key just like a real column.
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20709,6 +21201,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_mixed_opclass_and_default() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20737,6 +21230,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_preserves_per_key_ordering_and_include_columns() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20770,6 +21264,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_ignores_access_method_options_for_non_btree_indexes() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20799,6 +21294,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_empty_column_opclasses_vec_falls_back_to_no_opclass() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -21294,6 +21790,11 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             "DATE '2022-08-25'"
         );
         assert_eq!(
+            escape_value_typed(&json!("2022-08-25T00:00:00Z"), &DatabaseType::OceanbaseOracle, Some("DATE")),
+            "TO_DATE('2022-08-25 00:00:00', 'YYYY-MM-DD HH24:MI:SS')",
+            "OceanBase Oracle mode must not use the ANSI DATE literal (#12841)"
+        );
+        assert_eq!(
             escape_value_typed(
                 &json!("2022-08-25T09:58:43.123456+08:00"),
                 &DatabaseType::Oracle,
@@ -21301,6 +21802,24 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             ),
             "TO_TIMESTAMP_TZ('2022-08-25 09:58:43.123456 +08:00', 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')"
         );
+    }
+
+    #[test]
+    fn oceanbase_oracle_insert_uses_explicit_to_date_for_midnight_dates() {
+        // #12841: OceanBase's Oracle mode resolves `DATE '...'` through NLS_DATE_FORMAT,
+        // so midnight DATE values raised ORA-01858 during transfer; use TO_DATE instead.
+        let sql = generate_insert_typed(
+            &[String::from("id"), String::from("ordertime")],
+            &[Some(String::from("NUMBER")), Some(String::from("DATE"))],
+            &[vec![json!(1), json!("2026-10-20T00:00:00Z")]],
+            "appointments",
+            "APP",
+            &DatabaseType::OceanbaseOracle,
+            None,
+        );
+
+        assert!(sql.contains("TO_DATE('2026-10-20 00:00:00', 'YYYY-MM-DD HH24:MI:SS')"), "{sql}");
+        assert!(!sql.contains("DATE '2026-10-20'"), "{sql}");
     }
 
     #[test]
@@ -21909,7 +22428,14 @@ SELECT 1 FROM dual"#
             assert!(sql.contains("ON (t.\"ID\" = s.\"ID\" AND t.\"Kind\" = s.\"Kind\")"));
             assert!(sql.contains("WHEN MATCHED THEN UPDATE SET t.\"Name\" = s.\"Name\", t.\"CREATED\" = s.\"CREATED\", t.\"UPDATED\" = s.\"UPDATED\", t.\"OPTIONAL\" = s.\"OPTIONAL\""));
             assert!(sql.contains("'O''Brien' AS \"Name\""));
-            assert!(sql.contains("DATE '2026-10-09' AS \"CREATED\""));
+            // OceanBase's Oracle mode resolves ANSI date literals through
+            // NLS_DATE_FORMAT, so midnight values use an explicit TO_DATE (#12841).
+            let created_literal = if matches!(database_type, DatabaseType::OceanbaseOracle) {
+                "TO_DATE('2026-10-09 00:00:00', 'YYYY-MM-DD HH24:MI:SS') AS \"CREATED\""
+            } else {
+                "DATE '2026-10-09' AS \"CREATED\""
+            };
+            assert!(sql.contains(created_literal), "{database_type:?}: {sql}");
             assert!(sql.contains("TO_DATE('2026-10-09 12:34:56', 'YYYY-MM-DD HH24:MI:SS') AS \"UPDATED\""));
             assert!(sql.contains("NULL AS \"OPTIONAL\""));
             assert_eq!(sql.matches("FROM dual").count(), 2);
@@ -22725,7 +23251,7 @@ SELECT 1 FROM dual"#
     }
 
     #[test]
-    fn fresh_transfer_session_preparation_is_scoped_to_structured_agent_quarantine() {
+    fn fresh_transfer_session_preparation_is_scoped_to_agent_quarantine_and_xugu_timeout() {
         let quarantine = "Agent RPC error (-1): lost\nDBX_AGENT_ERROR_DATA:{\"contractVersion\":1,\"category\":\"connection\",\"retryable\":false,\"sessionDisposition\":\"quarantine\",\"stage\":\"execute\",\"operationOutcome\":\"unknown\"}";
         let keep = "Agent RPC error (-1): syntax error\nDBX_AGENT_ERROR_DATA:{\"contractVersion\":1,\"category\":\"sql\",\"retryable\":false,\"sessionDisposition\":\"keep\",\"stage\":\"execute\",\"operationOutcome\":\"unknown\"}";
         let replace_runtime = "Agent RPC error (-1): exhausted\nDBX_AGENT_ERROR_DATA:{\"contractVersion\":1,\"category\":\"resource\",\"retryable\":false,\"sessionDisposition\":\"replace_runtime\",\"stage\":\"execute\",\"operationOutcome\":\"unknown\"}";
@@ -22739,6 +23265,36 @@ SELECT 1 FROM dual"#
             Some(DatabaseType::OceanbaseOracle),
             "Agent RPC error (-1): legacy connection error"
         ));
+        assert!(should_prepare_fresh_agent_transfer_session(
+            Some(DatabaseType::Xugu),
+            "Agent RPC call timed out at execute"
+        ));
+        assert_eq!(
+            transfer_pool_error_action(
+                TransferExecutionSafety::WriteNoReplay,
+                Some(DatabaseType::Xugu),
+                "Agent RPC call timed out at execute"
+            ),
+            PoolErrorAction::Discard,
+            "a local Xugu RPC timeout must discard the uncertain session without replaying the write"
+        );
+        assert!(!should_prepare_fresh_agent_transfer_session(
+            Some(DatabaseType::OceanbaseOracle),
+            "Agent RPC call timed out at execute"
+        ));
+        assert!(!should_prepare_fresh_agent_transfer_session(
+            Some(DatabaseType::Xugu),
+            "Agent RPC error (-1): SQL execution failed"
+        ));
+    }
+
+    #[test]
+    fn transfer_metadata_pool_recovery_is_scoped_to_missing_xugu_pools() {
+        assert!(should_reconnect_missing_xugu_transfer_metadata_pool(Some(DatabaseType::Xugu), true));
+        assert!(!should_reconnect_missing_xugu_transfer_metadata_pool(Some(DatabaseType::Xugu), false));
+        assert!(!should_reconnect_missing_xugu_transfer_metadata_pool(Some(DatabaseType::Postgres), true));
+        assert!(!should_reconnect_missing_xugu_transfer_metadata_pool(Some(DatabaseType::Oracle), true));
+        assert!(!should_reconnect_missing_xugu_transfer_metadata_pool(None, true));
     }
 
     #[test]
@@ -22774,6 +23330,61 @@ SELECT 1 FROM dual"#
         // no precision to lose.
         assert_eq!(map_column_type("NUMBER", &DatabaseType::Oracle, &DatabaseType::OceanbaseOracle), "NUMERIC");
         assert_eq!(map_column_type("NUMBER", &DatabaseType::Oracle, &DatabaseType::Dameng), "NUMERIC");
+    }
+
+    #[test]
+    fn map_column_type_uses_oracle_family_integer_types_for_mysql_widths() {
+        // Issue #12976: MySQL `bigint` / `tinyint` were emitted verbatim, but
+        // Oracle-compatible targets have no BIGINT/TINYINT type. INTEGER and
+        // SMALLINT are ANSI synonyms for NUMBER(38, 0) and cover the source range.
+        for target in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+            assert_eq!(map_column_type("bigint", &DatabaseType::Mysql, &target), "INTEGER");
+            assert_eq!(map_column_type("BIGINT", &DatabaseType::Mysql, &target), "INTEGER");
+            assert_eq!(map_column_type("bigint unsigned", &DatabaseType::Mysql, &target), "INTEGER");
+            assert_eq!(map_column_type("BIGINT(20)", &DatabaseType::Mysql, &target), "INTEGER");
+            assert_eq!(map_column_type("int8", &DatabaseType::Postgres, &target), "INTEGER");
+            assert_eq!(map_column_type("tinyint", &DatabaseType::Mysql, &target), "SMALLINT");
+            assert_eq!(map_column_type("TINYINT(1)", &DatabaseType::Mysql, &target), "SMALLINT");
+            assert_eq!(map_column_type("int", &DatabaseType::Mysql, &target), "INTEGER");
+            assert_eq!(map_column_type("smallint", &DatabaseType::Mysql, &target), "SMALLINT");
+        }
+
+        // Other targets keep their native integer spellings.
+        assert_eq!(map_column_type("bigint", &DatabaseType::Postgres, &DatabaseType::Mysql), "BIGINT");
+        assert_eq!(map_column_type("bigint", &DatabaseType::Mysql, &DatabaseType::Postgres), "BIGINT");
+        assert_eq!(map_column_type("bigint", &DatabaseType::Mysql, &DatabaseType::SqlServer), "BIGINT");
+        assert_eq!(map_column_type("bigint", &DatabaseType::Mysql, &DatabaseType::Dameng), "BIGINT");
+        assert_eq!(map_column_type("tinyint", &DatabaseType::SqlServer, &DatabaseType::Mysql), "TINYINT");
+        assert_eq!(map_column_type("tinyint", &DatabaseType::Mysql, &DatabaseType::SqlServer), "TINYINT");
+        assert_eq!(map_column_type("tinyint", &DatabaseType::Mysql, &DatabaseType::Dameng), "TINYINT");
+    }
+
+    #[test]
+    fn transfer_create_table_mysql_bigint_to_oceanbase_oracle_uses_integer() {
+        let columns = vec![
+            db::ColumnInfo { is_primary_key: true, ..test_column("ID", "bigint") },
+            test_column("GROUPNO", "int"),
+            test_column("GROUPDESC", "varchar(100)"),
+            test_column("TINY", "tinyint"),
+        ];
+
+        let ddl = generate_create_table_ddl(
+            &columns,
+            "CLAIM",
+            "nw",
+            "NWGJ",
+            &DatabaseType::OceanbaseOracle,
+            &DatabaseType::Mysql,
+            None,
+            None,
+        );
+
+        assert!(ddl.contains("\"ID\" INTEGER"), "{ddl}");
+        assert!(ddl.contains("\"GROUPNO\" INTEGER"), "{ddl}");
+        assert!(ddl.contains("\"GROUPDESC\" VARCHAR(100 CHAR)"), "{ddl}");
+        assert!(ddl.contains("\"TINY\" SMALLINT"), "{ddl}");
+        assert!(!ddl.contains("BIGINT"), "{ddl}");
+        assert!(!ddl.contains("TINYINT"), "{ddl}");
     }
 
     #[test]
@@ -23173,7 +23784,8 @@ SELECT 1 FROM dual"#
             map_column_type("varchar(20 byte)", &DatabaseType::Mysql, &DatabaseType::Oracle),
             "VARCHAR(20 byte)"
         );
-        assert_eq!(map_column_type("nvarchar(max)", &DatabaseType::SqlServer, &DatabaseType::Dameng), "VARCHAR(max)");
+        // SQL Server `(max)` has no Dameng spelling and becomes CLOB (#13190).
+        assert_eq!(map_column_type("nvarchar(max)", &DatabaseType::SqlServer, &DatabaseType::Dameng), "CLOB");
     }
 
     #[test]
@@ -23262,6 +23874,60 @@ SELECT 1 FROM dual"#
         // mappings must not change.
         assert_eq!(map_column_type("int", &DatabaseType::Mysql, &DatabaseType::SqlServer), "INT");
         assert_eq!(map_column_type("INTEGER", &DatabaseType::DuckDb, &DatabaseType::SqlServer), "INT");
+    }
+
+    #[test]
+    fn map_column_type_keeps_decimal_precision_for_duckdb_target() {
+        // DuckDB reads a bare `NUMERIC` as DECIMAL(18, 3), which holds only 15
+        // integer digits: an Oracle NUMBER(18) value such as 490230030329188353
+        // failed the insert with a conversion error (#12846).
+        assert_eq!(map_column_type("NUMBER(18)", &DatabaseType::Oracle, &DatabaseType::DuckDb), "DECIMAL(18,0)");
+        assert_eq!(map_column_type("NUMBER(14,2)", &DatabaseType::Oracle, &DatabaseType::DuckDb), "DECIMAL(14,2)");
+        assert_eq!(map_column_type("decimal(10, 4)", &DatabaseType::Mysql, &DatabaseType::DuckDb), "DECIMAL(10,4)");
+        assert_eq!(map_column_type("numeric(38,38)", &DatabaseType::Postgres, &DatabaseType::DuckDb), "DECIMAL(38,38)");
+    }
+
+    #[test]
+    fn map_column_type_maps_sqlserver_max_length_strings_to_text() {
+        // `(max)` is SQL Server only syntax: DuckDB failed CREATE TABLE with
+        // `syntax error at or near "max"` on `VARCHAR(max)` (#13190).
+        for source_type in ["nvarchar(max)", "varchar(max)", "NVARCHAR(MAX)"] {
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::DuckDb), "TEXT");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Postgres), "TEXT");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Mysql), "TEXT");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Oracle), "CLOB");
+        }
+        assert_eq!(map_column_type("nvarchar(50)", &DatabaseType::SqlServer, &DatabaseType::DuckDb), "VARCHAR(50)");
+    }
+
+    #[test]
+    fn map_column_type_maps_sqlserver_rowversion_to_binary() {
+        // SQL Server `timestamp` is a rowversion (8 binary bytes), not a date and
+        // time, so its `0x...` values cannot be inserted into a TIMESTAMP column.
+        for source_type in ["timestamp", "rowversion"] {
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::DuckDb), "BLOB");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Postgres), "BYTEA");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Mysql), "BLOB");
+        }
+        assert_eq!(map_column_type("timestamp", &DatabaseType::Postgres, &DatabaseType::DuckDb), "TIMESTAMP");
+    }
+
+    #[test]
+    fn map_column_type_widens_unrepresentable_decimals_for_duckdb_target() {
+        // An unconstrained NUMBER/numeric, and any precision/scale DuckDB rejects
+        // (width above 38, scale above width), fall back to the widest decimal.
+        for (source_type, source_db) in [
+            ("NUMBER", DatabaseType::Oracle),
+            ("numeric", DatabaseType::Postgres),
+            ("numeric(50,2)", DatabaseType::Postgres),
+            ("NUMBER(3,5)", DatabaseType::Oracle),
+        ] {
+            assert_eq!(
+                map_column_type(source_type, &source_db, &DatabaseType::DuckDb),
+                "DECIMAL(38,10)",
+                "{source_type}"
+            );
+        }
     }
 
     #[test]
@@ -23653,6 +24319,50 @@ SELECT 1 FROM dual"#
     }
 
     #[test]
+    fn transfer_create_table_keeps_non_key_auto_increment_sources_out_of_auto_increment() {
+        // A MySQL source may define AUTO_INCREMENT on a UNIQUE-key column without a
+        // primary key. The generated transfer DDL only recreates the primary key, so
+        // emitting AUTO_INCREMENT there would fail with "there can be only one auto
+        // column and it must be defined as a key"; keep it a plain column instead.
+        let non_key = vec![db::ColumnInfo {
+            is_primary_key: false,
+            is_nullable: false,
+            extra: Some("auto_increment".to_string()),
+            ..test_column("ticket", "int")
+        }];
+        let non_key_ddl = generate_create_table_ddl(
+            &non_key,
+            "users",
+            "source",
+            "shop",
+            &DatabaseType::Mysql,
+            &DatabaseType::Mysql,
+            None,
+            None,
+        );
+        assert!(!non_key_ddl.contains("AUTO_INCREMENT"), "ddl: {non_key_ddl}");
+
+        // A primary-key AUTO_INCREMENT column keeps the clause.
+        let primary_key = vec![db::ColumnInfo {
+            is_primary_key: true,
+            is_nullable: false,
+            extra: Some("auto_increment".to_string()),
+            ..test_column("id", "int")
+        }];
+        let primary_key_ddl = generate_create_table_ddl(
+            &primary_key,
+            "users",
+            "source",
+            "shop",
+            &DatabaseType::Mysql,
+            &DatabaseType::Mysql,
+            None,
+            None,
+        );
+        assert!(primary_key_ddl.contains("AUTO_INCREMENT"), "ddl: {primary_key_ddl}");
+    }
+
+    #[test]
     fn mysql_auto_increment_type_supported_accepts_only_mysql_integers() {
         for supported in ["INT", "int(11)", "BIGINT", "TINYINT(1)", "SMALLINT UNSIGNED", "MEDIUMINT", "INTEGER"] {
             assert!(mysql_auto_increment_type_supported(supported, &DatabaseType::Mysql), "{supported}");
@@ -24014,6 +24724,9 @@ CREATE INDEX items_name_idx ON public.items (id);"#;
             try_send_transfer_progress(
                 &sender,
                 TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: "transfer".to_string(),
                     table: "table".to_string(),
                     table_index: 0,

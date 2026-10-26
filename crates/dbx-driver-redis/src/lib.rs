@@ -2562,11 +2562,11 @@ fn crc16_xmodem(bytes: &[u8]) -> u16 {
     crc
 }
 
-pub fn parse_command_argv(command_text: &str) -> Result<Vec<String>, String> {
+pub fn parse_command_argv(command_text: &str) -> Result<Vec<Vec<u8>>, String> {
     // Strip trailing semicolons so commands like "HGETALL aaa;" work naturally
     let command_text = command_text.trim_end().trim_end_matches(';');
-    let mut argv = Vec::new();
-    let mut current = String::new();
+    let mut argv: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
     let mut chars = command_text.chars().peekable();
     let mut quote: Option<char> = None;
     let mut escaping = false;
@@ -2575,12 +2575,46 @@ pub fn parse_command_argv(command_text: &str) -> Result<Vec<String>, String> {
     while let Some(ch) = chars.next() {
         if escaping {
             token_started = true;
-            current.push(match ch {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                other => other,
-            });
+            if ch == 'x' {
+                let hex1 = chars.peek().copied();
+                if let Some(h1) = hex1 {
+                    if h1.is_ascii_hexdigit() {
+                        chars.next();
+                        let hex2 = chars.peek().copied();
+                        if let Some(h2) = hex2 {
+                            if h2.is_ascii_hexdigit() {
+                                chars.next();
+                                let byte = u8::from_str_radix(&format!("{h1}{h2}"), 16).unwrap();
+                                current.push(byte);
+                                escaping = false;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                current.push(b'x');
+            } else {
+                let byte = match ch {
+                    'n' => b'\n',
+                    'r' => b'\r',
+                    't' => b'\t',
+                    'a' => b'\x07',
+                    'b' => b'\x08',
+                    'f' => b'\x0c',
+                    'v' => b'\x0b',
+                    '\\' => b'\\',
+                    '"' => b'"',
+                    '\'' => b'\'',
+                    other => {
+                        let mut buf = [0u8; 4];
+                        let s = other.encode_utf8(&mut buf);
+                        current.extend_from_slice(s.as_bytes());
+                        escaping = false;
+                        continue;
+                    }
+                };
+                current.push(byte);
+            }
             escaping = false;
             continue;
         }
@@ -2595,7 +2629,9 @@ pub fn parse_command_argv(command_text: &str) -> Result<Vec<String>, String> {
             if ch == q {
                 quote = None;
             } else {
-                current.push(ch);
+                let mut buf = [0u8; 4];
+                let s = ch.encode_utf8(&mut buf);
+                current.extend_from_slice(s.as_bytes());
             }
             continue;
         }
@@ -2618,11 +2654,13 @@ pub fn parse_command_argv(command_text: &str) -> Result<Vec<String>, String> {
         }
 
         token_started = true;
-        current.push(ch);
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        current.extend_from_slice(s.as_bytes());
     }
 
     if escaping {
-        current.push('\\');
+        current.push(b'\\');
     }
     if quote.is_some() {
         return Err("Redis command has an unterminated quote".to_string());
@@ -2630,10 +2668,19 @@ pub fn parse_command_argv(command_text: &str) -> Result<Vec<String>, String> {
     if token_started {
         argv.push(current);
     }
-    if argv.first().is_none_or(String::is_empty) {
+    if argv.first().is_none_or(Vec::is_empty) {
         return Err("Redis command is empty".to_string());
     }
     Ok(argv)
+}
+
+pub fn parse_command_raw_argv(command_text: &str) -> Result<Vec<Vec<u8>>, String> {
+    parse_command_argv(command_text)
+}
+
+pub fn parse_command_argv_strings(command_text: &str) -> Result<Vec<String>, String> {
+    let raw = parse_command_argv(command_text)?;
+    Ok(raw.into_iter().map(|b| String::from_utf8_lossy(&b).into_owned()).collect())
 }
 
 pub fn classify_command(command: &str) -> RedisCommandSafety {
@@ -3017,7 +3064,7 @@ where
     C: ConnectionLike + Send + Sync + Unpin,
 {
     let argv = parse_command_argv(command_text)?;
-    let command = argv[0].to_ascii_uppercase();
+    let command = String::from_utf8_lossy(&argv[0]).to_ascii_uppercase();
     if command == "MONITOR" {
         return Err(
             "MONITOR requires a dedicated streaming connection; run MONITOR alone in the query editor".to_string()
@@ -3028,9 +3075,9 @@ where
         return Err(format!("Redis command is blocked for safety: {command}"));
     }
 
-    let mut cmd = redis::cmd(&argv[0]);
+    let mut cmd = redis::cmd(&command);
     for arg in argv.iter().skip(1) {
-        cmd.arg(arg);
+        cmd.arg(arg.as_slice());
     }
     let raw: RedisRawValue = cmd.query_async(con).await.map_err(|e| e.to_string())?;
 
@@ -3392,45 +3439,7 @@ where
 
     let data = match redis_type.as_str() {
         "string" => {
-            // GETRANGE in spans no larger than `STRING_PREVIEW_MAX_BYTES`: some
-            // Redis-compatible servers (e.g. TongRDS) reject a larger span, so a
-            // configured preview above the default budget is fetched in chunks
-            // (issue #11792). Filling the budget exactly means the value may
-            // continue — STRLEN settles that without materializing the rest in
-            // the backend or IPC layer.
-            let mut bytes: Vec<u8> = Vec::new();
-            let mut at_budget = false;
-            while bytes.len() < preview_limit_bytes {
-                let span = (preview_limit_bytes - bytes.len()).min(STRING_PREVIEW_MAX_BYTES);
-                let start = bytes.len() as i64;
-                let chunk: RedisRawValue = redis::cmd("GETRANGE")
-                    .arg(key)
-                    .arg(start)
-                    .arg(start + span as i64 - 1)
-                    .query_async(con)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let chunk = redis_value_to_bytes(chunk)
-                    .ok_or_else(|| "Redis string payload is not byte-addressable".to_string())?;
-                let chunk_len = chunk.len();
-                bytes.extend_from_slice(&chunk);
-                if chunk_len < span {
-                    break;
-                }
-                if bytes.len() >= preview_limit_bytes {
-                    at_budget = true;
-                    break;
-                }
-            }
-            let total_bytes = if at_budget {
-                redis::cmd("STRLEN").arg(key).query_async(con).await.ok()
-            } else {
-                Some(bytes.len() as u64)
-            };
-            let truncated = total_bytes.map_or(at_budget, |total| total > preview_limit_bytes as u64);
-            if truncated {
-                bytes.truncate(preview_limit_bytes);
-            }
+            let (bytes, total_bytes, truncated) = read_string_preview(con, key, preview_limit_bytes).await?;
             RedisValueData::String { content: redis_blob_from_bytes(&bytes), total_bytes, truncated }
         }
         "list" => {
@@ -3502,6 +3511,152 @@ where
         ttl,
         data,
     })
+}
+
+/// Read the preview window of a Redis string value.
+///
+/// `GETRANGE` is used instead of `GET` so a large value is never pulled over
+/// the wire in full. The window is requested optimistically first, the way
+/// Redis clamps it to the value length, so reading a value stays a single
+/// round trip for the servers that clamp.
+///
+/// Strict servers reject a window that reaches past the value instead of
+/// clamping it: TongRDS answers `ERR 0-65536 is out of bounds` and the read
+/// failed, which left the key detail empty for every string shorter than the
+/// preview window (issue #13114). Such a rejection is answered with the exact
+/// value length, and the windows are then requested inside it.
+async fn read_string_preview<C>(
+    con: &mut C,
+    key: &[u8],
+    preview_limit_bytes: usize,
+) -> Result<(Vec<u8>, Option<u64>, bool), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    match read_string_windows(con, key, preview_limit_bytes, None).await {
+        Ok(result) => Ok(result),
+        Err(error) if !is_redis_out_of_bounds_error(&error) => Err(error),
+        // The server refuses to clamp the window, so the value length
+        // decides where a window may end.
+        Err(rejected) => read_string_preview_by_length(con, key, preview_limit_bytes, rejected).await,
+    }
+}
+
+/// Read a Redis string in windows that never reach past the value.
+///
+/// `rejected` is the error the optimistic window produced. The value length
+/// decides where a window may end, so the same rejection cannot come back —
+/// unless the value shrinks between the length read and the window read,
+/// which is retried against the fresh length.
+///
+/// Without a length there is no bounded window to fall back to, and asking
+/// for the rejected window again would only repeat the same failure.
+async fn read_string_preview_by_length<C>(
+    con: &mut C,
+    key: &[u8],
+    preview_limit_bytes: usize,
+    rejected: String,
+) -> Result<(Vec<u8>, Option<u64>, bool), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let Some(known_length) = redis_string_length(con, key).await else {
+        return Err(rejected);
+    };
+    match read_string_windows(con, key, preview_limit_bytes, Some(known_length)).await {
+        Ok(result) => Ok(result),
+        Err(error) if is_redis_out_of_bounds_error(&error) => {
+            // The value shrank between the length read and the window read.
+            let Some(fresh_length) = redis_string_length(con, key).await else {
+                return Err(error);
+            };
+            read_string_windows(con, key, preview_limit_bytes, Some(fresh_length)).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Read a Redis string in windows.
+///
+/// `known_length` is the value length reported by `STRLEN`; with it a window
+/// never reaches past the value. Without it the window is requested
+/// optimistically, the way Redis clamps it, and a short read ends the value.
+async fn read_string_windows<C>(
+    con: &mut C,
+    key: &[u8],
+    preview_limit_bytes: usize,
+    known_length: Option<u64>,
+) -> Result<(Vec<u8>, Option<u64>, bool), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let limit = preview_limit_bytes as u64;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut at_budget = false;
+    while (bytes.len() as u64) < limit {
+        // Windows stay at most `STRING_PREVIEW_MAX_BYTES` wide so a large
+        // configured budget is fetched in chunks (issue #11792).
+        let span = match known_length {
+            Some(total) => {
+                let remaining = total.saturating_sub(bytes.len() as u64);
+                if remaining == 0 {
+                    break;
+                }
+                remaining.min(limit - bytes.len() as u64).min(STRING_PREVIEW_MAX_BYTES as u64)
+            }
+            None => (limit - bytes.len() as u64).min(STRING_PREVIEW_MAX_BYTES as u64),
+        };
+        let start = bytes.len() as i64;
+        let chunk: RedisRawValue = redis::cmd("GETRANGE")
+            .arg(key)
+            .arg(start)
+            .arg(start + span as i64 - 1)
+            .query_async(con)
+            .await
+            .map_err(|e| e.to_string())?;
+        let chunk =
+            redis_value_to_bytes(chunk).ok_or_else(|| "Redis string payload is not byte-addressable".to_string())?;
+        let chunk_len = chunk.len() as u64;
+        bytes.extend_from_slice(&chunk);
+        if chunk_len < span {
+            // The value ended before the window did.
+            break;
+        }
+        if (bytes.len() as u64) >= limit {
+            at_budget = true;
+            break;
+        }
+    }
+    let total_bytes = match known_length {
+        Some(total) => Some(total),
+        // The budget was filled exactly, so the value may continue — STRLEN
+        // settles that without materializing the rest in the backend or IPC
+        // layer.
+        None if at_budget => redis_string_length(con, key).await,
+        None => Some(bytes.len() as u64),
+    };
+    let truncated = total_bytes.map_or(at_budget, |total| total > limit);
+    if truncated {
+        bytes.truncate(preview_limit_bytes);
+    }
+    Ok((bytes, total_bytes, truncated))
+}
+
+/// Read the length of a Redis string value.
+async fn redis_string_length<C>(con: &mut C, key: &[u8]) -> Option<u64>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let length: i64 = redis::cmd("STRLEN").arg(key).query_async(con).await.ok()?;
+    u64::try_from(length).ok()
+}
+
+/// Whether a server rejected a range because it reached past the value.
+///
+/// TongRDS answers `ERR 0-65536 is out of bounds`; Redis never rejects a
+/// range for that reason.
+fn is_redis_out_of_bounds_error(error: &str) -> bool {
+    error.contains("out of bounds")
 }
 
 /// Read the complete raw payload for a Redis string-like key.
@@ -6318,6 +6473,502 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collection_overflow_session_store_and_take_lifecycle() {
+        let scope_a = super::RedisOperationScope { connection_id: "conn-alpha".to_string(), db: 2 };
+        let scope_b = super::RedisOperationScope { connection_id: "conn-beta".to_string(), db: 2 };
+        let scope_a_db3 = super::RedisOperationScope { connection_id: "conn-alpha".to_string(), db: 3 };
+        let unscoped = super::RedisOperationScope::default();
+
+        // 1. Direct Hash overflow store & take lifecycle
+        {
+            let key = b"direct-hash-lifecycle";
+            let mut items: Vec<RedisHashItem> = (0..5)
+                .map(|i| RedisHashItem {
+                    field: text_blob(&format!("f{i}")),
+                    value: text_blob(&format!("v{i}")),
+                    field_ttl: None,
+                })
+                .collect();
+
+            // Storing with count = 2 keeps 2 items in `items` and buffers the remaining 3 items.
+            let followup_cursor = 888u64;
+            let session_cursor =
+                super::store_hash_overflow_page(&scope_a, key, &mut items, 2, followup_cursor, None).await;
+            assert_eq!(items.len(), 2);
+            assert!(session_cursor >= super::COLLECTION_OVERFLOW_CURSOR_START);
+
+            // Scope isolation: foreign connection, foreign db, unscoped default, wrong key, wrong filter, wrong kind
+            // must all return None and leave the stored session intact.
+            assert!(super::take_hash_overflow_page(&scope_b, key, session_cursor, 2, None).await.is_none());
+            assert!(super::take_hash_overflow_page(&scope_a_db3, key, session_cursor, 2, None).await.is_none());
+            assert!(super::take_hash_overflow_page(&unscoped, key, session_cursor, 2, None).await.is_none());
+            assert!(super::take_hash_overflow_page(&scope_a, b"other-key", session_cursor, 2, None).await.is_none());
+            assert!(super::take_hash_overflow_page(&scope_a, key, session_cursor, 2, Some("query")).await.is_none());
+            assert!(super::take_set_overflow_page(&scope_a, key, session_cursor, 2, None).await.is_none());
+
+            // First take with matching scope: takes 2 of the 3 buffered items.
+            // Since 1 item remains in the session, cursor must be retained.
+            let (next_cursor, p1) = super::take_hash_overflow_page(&scope_a, key, session_cursor, 2, None)
+                .await
+                .expect("take first buffered page");
+            assert_eq!(p1.len(), 2);
+            assert_eq!(p1[0].field, text_blob("f2"));
+            assert_eq!(p1[1].field, text_blob("f3"));
+            assert_eq!(next_cursor, session_cursor, "cursor must be retained while buffer has items");
+
+            // Second take: takes the last buffered item.
+            // Buffer is now empty, but followup_cursor != 0 and scope != default,
+            // so cursor is still retained for the subsequent server scan.
+            let (next_cursor, p2) = super::take_hash_overflow_page(&scope_a, key, session_cursor, 2, None)
+                .await
+                .expect("take remaining buffered page");
+            assert_eq!(p2.len(), 1);
+            assert_eq!(p2[0].field, text_blob("f4"));
+            assert_eq!(next_cursor, session_cursor, "cursor must be retained for followup server scan");
+
+            // Buffer is now empty, so take_hash_overflow_page returns None.
+            assert!(super::take_hash_overflow_page(&scope_a, key, session_cursor, 2, None).await.is_none());
+
+            // take_collection_scan_cursor must enforce scope isolation.
+            assert!(super::take_collection_scan_cursor(
+                &scope_b,
+                key,
+                session_cursor,
+                super::RedisCollectionOverflowKind::Hash,
+                None,
+            )
+            .await
+            .is_err());
+            assert!(super::take_collection_scan_cursor(
+                &unscoped,
+                key,
+                session_cursor,
+                super::RedisCollectionOverflowKind::Hash,
+                None,
+            )
+            .await
+            .is_err());
+
+            // Matching scope takes the followup server scan cursor and consumes the session.
+            let (server_cursor, session_opt) = super::take_collection_scan_cursor(
+                &scope_a,
+                key,
+                session_cursor,
+                super::RedisCollectionOverflowKind::Hash,
+                None,
+            )
+            .await
+            .expect("take scan cursor");
+            assert_eq!(server_cursor, followup_cursor);
+            assert!(session_opt.is_some());
+
+            // Session has been consumed from registry; any subsequent access is rejected.
+            assert!(super::take_collection_scan_cursor(
+                &scope_a,
+                key,
+                session_cursor,
+                super::RedisCollectionOverflowKind::Hash,
+                None,
+            )
+            .await
+            .is_err());
+        }
+
+        // 2. Direct Set overflow store & take lifecycle
+        {
+            let key = b"direct-set-lifecycle";
+            let mut items: Vec<RedisSetItem> =
+                (0..5).map(|i| RedisSetItem { member: text_blob(&format!("m{i}")) }).collect();
+
+            let followup_cursor = 999u64;
+            let session_cursor =
+                super::store_set_overflow_page(&scope_a, key, &mut items, 2, followup_cursor, None).await;
+            assert_eq!(items.len(), 2);
+            assert!(session_cursor >= super::COLLECTION_OVERFLOW_CURSOR_START);
+
+            // Scope isolation
+            assert!(super::take_set_overflow_page(&scope_b, key, session_cursor, 2, None).await.is_none());
+            assert!(super::take_set_overflow_page(&scope_a_db3, key, session_cursor, 2, None).await.is_none());
+            assert!(super::take_set_overflow_page(&unscoped, key, session_cursor, 2, None).await.is_none());
+            assert!(super::take_set_overflow_page(&scope_a, b"other-key", session_cursor, 2, None).await.is_none());
+            assert!(super::take_hash_overflow_page(&scope_a, key, session_cursor, 2, None).await.is_none());
+
+            // Paging buffered items
+            let (next_cursor, p1) =
+                super::take_set_overflow_page(&scope_a, key, session_cursor, 2, None).await.expect("take set page 1");
+            assert_eq!(p1.len(), 2);
+            assert_eq!(p1[0].member, text_blob("m2"));
+            assert_eq!(p1[1].member, text_blob("m3"));
+            assert_eq!(next_cursor, session_cursor);
+
+            let (next_cursor, p2) =
+                super::take_set_overflow_page(&scope_a, key, session_cursor, 2, None).await.expect("take set page 2");
+            assert_eq!(p2.len(), 1);
+            assert_eq!(p2[0].member, text_blob("m4"));
+            assert_eq!(next_cursor, session_cursor);
+
+            // Buffer drained -> take_collection_scan_cursor
+            let (server_cursor, session_opt) = super::take_collection_scan_cursor(
+                &scope_a,
+                key,
+                session_cursor,
+                super::RedisCollectionOverflowKind::Set,
+                None,
+            )
+            .await
+            .expect("take set scan cursor");
+            assert_eq!(server_cursor, followup_cursor);
+            assert!(session_opt.is_some());
+        }
+
+        // 3. Exhaustion behavior when followup_cursor is 0
+        {
+            let key = b"direct-exhaustion-hash";
+            let mut items: Vec<RedisHashItem> = (0..3)
+                .map(|i| RedisHashItem {
+                    field: text_blob(&format!("fx{i}")),
+                    value: text_blob(&format!("vx{i}")),
+                    field_ttl: None,
+                })
+                .collect();
+
+            // followup_cursor == 0: no further server pages exist
+            let cursor = super::store_hash_overflow_page(&scope_a, key, &mut items, 1, 0, None).await;
+            assert_eq!(items.len(), 1);
+            assert!(cursor >= super::COLLECTION_OVERFLOW_CURSOR_START);
+
+            // Drain remaining 2 items in one page
+            let (next_cursor, p) =
+                super::take_hash_overflow_page(&scope_a, key, cursor, 2, None).await.expect("take exhausted page");
+            assert_eq!(p.len(), 2);
+            // Since buffer is now empty AND followup_cursor == 0, cursor is NOT retained
+            assert_eq!(next_cursor, 0);
+
+            // Session has been evicted from registry on exhaustion
+            assert!(!super::collection_overflow_sessions().lock().await.entries.contains_key(&cursor));
+            assert!(super::take_hash_overflow_page(&scope_a, key, cursor, 1, None).await.is_none());
+            assert!(super::take_collection_scan_cursor(
+                &scope_a,
+                key,
+                cursor,
+                super::RedisCollectionOverflowKind::Hash,
+                None,
+            )
+            .await
+            .is_err());
+        }
+
+        // 4. Expiration behavior (TTL purge)
+        {
+            let key = b"direct-expiration-hash";
+            let mut items: Vec<RedisHashItem> = (0..3)
+                .map(|i| RedisHashItem {
+                    field: text_blob(&format!("fe{i}")),
+                    value: text_blob(&format!("ve{i}")),
+                    field_ttl: None,
+                })
+                .collect();
+
+            let cursor = super::store_hash_overflow_page(&scope_a, key, &mut items, 1, 0, None).await;
+            assert!(super::collection_overflow_sessions().lock().await.entries.contains_key(&cursor));
+
+            // Force expiration by winding last_used back past TTL
+            super::collection_overflow_sessions().lock().await.entries.get_mut(&cursor).unwrap().last_used =
+                std::time::Instant::now() - super::COLLECTION_OVERFLOW_SESSION_TTL - std::time::Duration::from_secs(1);
+
+            // take_matching purges expired entries
+            assert!(super::take_hash_overflow_page(&scope_a, key, cursor, 1, None).await.is_none());
+            assert!(!super::collection_overflow_sessions().lock().await.entries.contains_key(&cursor));
+            assert!(super::take_collection_scan_cursor(
+                &scope_a,
+                key,
+                cursor,
+                super::RedisCollectionOverflowKind::Hash,
+                None,
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    /// Replays standalone-Redis pagination for sets (issue #12640 sibling collection):
+    /// a large set is read through get_value_scoped, then paged through load_more_collection_scoped.
+    /// Every member must arrive exactly once, foreign scopes must be rejected without server scan,
+    /// and pagination terminates cleanly when the collection is exhausted.
+    #[tokio::test]
+    async fn scoped_set_pagination_walks_large_collections_without_repeating_the_first_page() {
+        const MEMBERS: usize = 4000;
+        const PAGE: usize = 200;
+        let scope = super::RedisOperationScope { connection_id: "issue-12640-standalone-set".to_string(), db: 0 };
+
+        // Real SSCAN cursors: one batch of `PAGE` members per server round trip.
+        let mut responses = vec![bulk("set"), RedisRawValue::Int(-1), RedisRawValue::Int(MEMBERS as i64)];
+        let pages = MEMBERS.div_ceil(PAGE);
+        for page in 0..pages {
+            let cursor = if page + 1 == pages { "0".to_string() } else { (page + 1).to_string() };
+            let members: Vec<String> =
+                (page * PAGE..((page + 1) * PAGE).min(MEMBERS)).map(|index| format!("member:{index}")).collect();
+            responses.push(int_scan_response_owned(&cursor, members));
+        }
+        let mut con = FakeRedisConnection::new(responses);
+
+        let value = super::get_value_scoped(&mut con, b"issue-12640-set", &scope).await.unwrap();
+        let RedisValueData::Set { items: mut seen, scan_cursor, total } = value.data else {
+            panic!("expected set");
+        };
+        assert_eq!(total, MEMBERS as u64);
+        assert_eq!(seen.len(), PAGE, "the first page defaults to the configured page size");
+        let mut cursor = scan_cursor.expect("a 4000-member set must offer a continuation");
+        assert!(cursor >= super::COLLECTION_OVERFLOW_CURSOR_START, "the continuation is an overflow session marker");
+
+        // The unscoped path (default scope) must reject the marker without touching the server.
+        let mut mismatched = FakeRedisConnection::new(vec![]);
+        let error = super::load_more_collection(&mut mismatched, b"issue-12640-set", "set", cursor, PAGE, None, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("invalid, expired"), "{error}");
+        assert!(mismatched.commands.is_empty(), "foreign cursor must not reach the server");
+
+        // Foreign connection id must also be rejected without touching the server.
+        let foreign_scope = super::RedisOperationScope { connection_id: "foreign-conn".to_string(), db: 0 };
+        let mut wrong = FakeRedisConnection::new(vec![]);
+        let error = super::load_more_collection_scoped(
+            &mut wrong,
+            b"issue-12640-set",
+            "set",
+            cursor,
+            PAGE,
+            None,
+            None,
+            &foreign_scope,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("invalid, expired"), "{error}");
+        assert!(wrong.commands.is_empty());
+
+        // Foreign database must also be rejected without touching the server.
+        let foreign_db = super::RedisOperationScope { connection_id: scope.connection_id.clone(), db: 1 };
+        let error = super::load_more_collection_scoped(
+            &mut wrong,
+            b"issue-12640-set",
+            "set",
+            cursor,
+            PAGE,
+            None,
+            None,
+            &foreign_db,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("invalid, expired"), "{error}");
+        assert!(wrong.commands.is_empty());
+
+        // Mismatched collection type must be rejected without touching the server.
+        let error = super::load_more_collection_scoped(
+            &mut wrong,
+            b"issue-12640-set",
+            "hash",
+            cursor,
+            PAGE,
+            None,
+            None,
+            &scope,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("different collection type") || error.contains("invalid, expired"), "{error}");
+        assert!(wrong.commands.is_empty());
+
+        let mut pages_seen = 1;
+        while cursor != 0 {
+            let page = super::load_more_collection_scoped(
+                &mut con,
+                b"issue-12640-set",
+                "set",
+                cursor,
+                PAGE,
+                None,
+                None,
+                &scope,
+            )
+            .await
+            .unwrap();
+            let RedisCollectionPage::Set { items, scan_cursor: next } = page else {
+                panic!("expected set");
+            };
+            seen.extend(items);
+            pages_seen += 1;
+            assert!(pages_seen <= pages, "pagination must terminate");
+            match next {
+                Some(next) => {
+                    assert_ne!(next, cursor, "each page must continue with a fresh marker");
+                    cursor = next;
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(pages_seen, pages);
+        assert_eq!(seen.len(), MEMBERS);
+        let unique: std::collections::HashSet<_> = seen.iter().map(|item| item.member.raw_base64.clone()).collect();
+        assert_eq!(unique.len(), MEMBERS, "every member arrives exactly once");
+        assert_eq!(con.command_count("SSCAN"), pages);
+    }
+
+    #[tokio::test]
+    async fn concurrent_collection_overflow_sessions_isolate_across_scopes_and_keys() {
+        let scope_1 = super::RedisOperationScope { connection_id: "conn-prod".to_string(), db: 0 };
+        let scope_2 = super::RedisOperationScope { connection_id: "conn-staging".to_string(), db: 0 };
+        let scope_3 = super::RedisOperationScope { connection_id: "conn-prod".to_string(), db: 1 };
+        let unscoped = super::RedisOperationScope::default();
+
+        let mut hash_items_1: Vec<RedisHashItem> = (0..4)
+            .map(|i| RedisHashItem {
+                field: text_blob(&format!("p_f{i}")),
+                value: text_blob(&format!("p_v{i}")),
+                field_ttl: None,
+            })
+            .collect();
+        let mut hash_items_2: Vec<RedisHashItem> = (0..4)
+            .map(|i| RedisHashItem {
+                field: text_blob(&format!("s_f{i}")),
+                value: text_blob(&format!("s_v{i}")),
+                field_ttl: None,
+            })
+            .collect();
+        let mut set_items_3: Vec<RedisSetItem> =
+            (0..4).map(|i| RedisSetItem { member: text_blob(&format!("db1_m{i}")) }).collect();
+
+        // All 3 use key b"shared-name", but have different scopes or kinds!
+        let key = b"shared-name";
+        let c1 = super::store_hash_overflow_page(&scope_1, key, &mut hash_items_1, 1, 101, None).await;
+        let c2 = super::store_hash_overflow_page(&scope_2, key, &mut hash_items_2, 1, 202, None).await;
+        let c3 = super::store_set_overflow_page(&scope_3, key, &mut set_items_3, 1, 303, None).await;
+
+        // Distinct session cursors allocated
+        assert_ne!(c1, c2);
+        assert_ne!(c1, c3);
+        assert_ne!(c2, c3);
+
+        // Cross-scope and cross-kind isolation:
+        // Session 1 (scope_1, Hash) cannot be consumed by scope_2, scope_3, unscoped, or as Set
+        assert!(super::take_hash_overflow_page(&scope_2, key, c1, 1, None).await.is_none());
+        assert!(super::take_hash_overflow_page(&scope_3, key, c1, 1, None).await.is_none());
+        assert!(super::take_hash_overflow_page(&unscoped, key, c1, 1, None).await.is_none());
+        assert!(super::take_set_overflow_page(&scope_1, key, c1, 1, None).await.is_none());
+
+        // Session 2 (scope_2, Hash) cannot be consumed by scope_1, scope_3, unscoped, or as Set
+        assert!(super::take_hash_overflow_page(&scope_1, key, c2, 1, None).await.is_none());
+        assert!(super::take_hash_overflow_page(&scope_3, key, c2, 1, None).await.is_none());
+        assert!(super::take_hash_overflow_page(&unscoped, key, c2, 1, None).await.is_none());
+        assert!(super::take_set_overflow_page(&scope_2, key, c2, 1, None).await.is_none());
+
+        // Session 3 (scope_3, Set) cannot be consumed by scope_1, scope_2, unscoped, or as Hash
+        assert!(super::take_set_overflow_page(&scope_1, key, c3, 1, None).await.is_none());
+        assert!(super::take_set_overflow_page(&scope_2, key, c3, 1, None).await.is_none());
+        assert!(super::take_set_overflow_page(&unscoped, key, c3, 1, None).await.is_none());
+        assert!(super::take_hash_overflow_page(&scope_3, key, c3, 1, None).await.is_none());
+
+        // Valid interleaved page consumption:
+        let (_, p1_a) = super::take_hash_overflow_page(&scope_1, key, c1, 1, None).await.unwrap();
+        assert_eq!(p1_a[0].field, text_blob("p_f1"));
+
+        let (_, p2_a) = super::take_hash_overflow_page(&scope_2, key, c2, 1, None).await.unwrap();
+        assert_eq!(p2_a[0].field, text_blob("s_f1"));
+
+        let (_, p3_a) = super::take_set_overflow_page(&scope_3, key, c3, 1, None).await.unwrap();
+        assert_eq!(p3_a[0].member, text_blob("db1_m1"));
+
+        // Drain the rest of session 1
+        let (_, p1_b) = super::take_hash_overflow_page(&scope_1, key, c1, 2, None).await.unwrap();
+        assert_eq!(p1_b.len(), 2);
+        assert_eq!(p1_b[0].field, text_blob("p_f2"));
+        assert_eq!(p1_b[1].field, text_blob("p_f3"));
+
+        // Session 1 buffer is drained; transition to server scan cursor
+        let (srv1, _) =
+            super::take_collection_scan_cursor(&scope_1, key, c1, super::RedisCollectionOverflowKind::Hash, None)
+                .await
+                .unwrap();
+        assert_eq!(srv1, 101);
+
+        // Session 2 and Session 3 are still intact and can continue
+        let (_, p2_b) = super::take_hash_overflow_page(&scope_2, key, c2, 2, None).await.unwrap();
+        assert_eq!(p2_b.len(), 2);
+        assert_eq!(p2_b[0].field, text_blob("s_f2"));
+        assert_eq!(p2_b[1].field, text_blob("s_f3"));
+        let (srv2, _) =
+            super::take_collection_scan_cursor(&scope_2, key, c2, super::RedisCollectionOverflowKind::Hash, None)
+                .await
+                .unwrap();
+        assert_eq!(srv2, 202);
+
+        let (_, p3_b) = super::take_set_overflow_page(&scope_3, key, c3, 2, None).await.unwrap();
+        assert_eq!(p3_b.len(), 2);
+        assert_eq!(p3_b[0].member, text_blob("db1_m2"));
+        assert_eq!(p3_b[1].member, text_blob("db1_m3"));
+        let (srv3, _) =
+            super::take_collection_scan_cursor(&scope_3, key, c3, super::RedisCollectionOverflowKind::Set, None)
+                .await
+                .unwrap();
+        assert_eq!(srv3, 303);
+    }
+
+    #[test]
+    fn collection_overflow_sessions_capacity_and_lru_eviction() {
+        let mut sessions = super::RedisCollectionOverflowSessions::default();
+        let scope = super::RedisOperationScope { connection_id: "capacity-test".to_string(), db: 0 };
+
+        let mut cursors = Vec::new();
+        for i in 0..super::COLLECTION_OVERFLOW_SESSION_LIMIT {
+            let session = super::RedisCollectionOverflowSession {
+                scope: scope.clone(),
+                key: format!("key-{i}").into_bytes(),
+                kind: super::RedisCollectionOverflowKind::Hash,
+                filter: None,
+                sort_direction: None,
+                followup_cursor: 0,
+                items: super::RedisCollectionOverflowItems::Hash(vec![]),
+                last_used: std::time::Instant::now(),
+            };
+            let cursor = sessions.insert(session);
+            cursors.push(cursor);
+        }
+
+        assert_eq!(sessions.entries.len(), super::COLLECTION_OVERFLOW_SESSION_LIMIT);
+
+        // Mark the first cursor as oldest
+        let oldest_cursor = cursors[0];
+        sessions.entries.get_mut(&oldest_cursor).unwrap().last_used =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+        // Inserting the 129th session must evict the oldest cursor
+        let extra_session = super::RedisCollectionOverflowSession {
+            scope: scope.clone(),
+            key: b"extra-key".to_vec(),
+            kind: super::RedisCollectionOverflowKind::Hash,
+            filter: None,
+            sort_direction: None,
+            followup_cursor: 0,
+            items: super::RedisCollectionOverflowItems::Hash(vec![]),
+            last_used: std::time::Instant::now(),
+        };
+        let extra_cursor = sessions.insert(extra_session);
+
+        assert_eq!(sessions.entries.len(), super::COLLECTION_OVERFLOW_SESSION_LIMIT);
+        assert!(!sessions.entries.contains_key(&oldest_cursor));
+        assert!(sessions
+            .take_matching(oldest_cursor, &scope, b"key-0", super::RedisCollectionOverflowKind::Hash, None, None)
+            .is_none());
+
+        assert!(sessions.entries.contains_key(&extra_cursor));
+        assert!(sessions
+            .take_matching(extra_cursor, &scope, b"extra-key", super::RedisCollectionOverflowKind::Hash, None, None)
+            .is_some());
+    }
+
+    #[tokio::test]
     #[ignore = "requires approved disposable Valkey multi-DB, default-one and Redis cluster fixtures"]
     async fn cluster_databases_live_native_mapped_and_permission_controls() {
         let mut config = redis_test_connection_config();
@@ -7517,6 +8168,19 @@ mod tests {
         assert_eq!(entry_json["deliveries"], unsafe_value.to_string());
     }
 
+    /// The `(start, end)` windows DBX requested with GETRANGE.
+    fn getrange_windows(con: &FakeRedisConnection) -> Vec<(String, String)> {
+        con.commands
+            .iter()
+            .filter(|packed| packed.contains("\r\nGETRANGE\r\n"))
+            .map(|packed| {
+                let parts: Vec<&str> = packed.split("\r\n").collect();
+                let last = parts.len();
+                (parts[last - 4].to_string(), parts[last - 2].to_string())
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn string_value_uses_a_bounded_range_for_small_values() {
         let mut con = FakeRedisConnection::new(vec![bulk("string"), RedisRawValue::Int(-1), bulk("hello")]);
@@ -7535,10 +8199,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn string_value_range_stays_within_the_64kib_server_limit() {
-        // Some Redis-compatible servers reject a GETRANGE span above 64 KiB;
-        // the old budget + 1 request asked for 65537 bytes (TongRDS answered
-        // "0-65537 is out of bounds").
+    async fn string_value_range_stays_within_the_64kib_window_limit() {
+        // A window never exceeds 64 KiB, so a configured preview above that is
+        // fetched in chunks (issue #11792).
         let mut con = FakeRedisConnection::new(vec![bulk("string"), RedisRawValue::Int(-1), bulk("hello")]);
 
         super::get_value(&mut con, b"message").await.unwrap();
@@ -7547,6 +8210,125 @@ mod tests {
             con.commands.iter().find(|packed| packed.contains("\r\nGETRANGE\r\n")).expect("GETRANGE is issued");
         assert!(getrange.contains(&format!("\r\n$5\r\n{}\r\n", super::STRING_PREVIEW_MAX_BYTES - 1)), "{getrange:?}");
         assert!(!getrange.contains(&format!("\r\n$5\r\n{}\r\n", super::STRING_PREVIEW_MAX_BYTES)), "{getrange:?}");
+    }
+
+    #[tokio::test]
+    async fn string_value_falls_back_to_the_value_length_when_the_server_rejects_the_window() {
+        // Issue #13114: TongRDS does not clamp a GETRANGE window that reaches
+        // past the value the way Redis does: it answers "ERR 0-65536 is out of
+        // bounds", which left the key detail empty for every string shorter
+        // than the preview window. The read has to fall back to the exact
+        // value length.
+        let out_of_bounds = redis::RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+            "ERR",
+            "0-65536 is out of bounds".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![
+            Ok(bulk("string")),
+            Ok(RedisRawValue::Int(-1)),
+            Err(out_of_bounds),
+            Ok(RedisRawValue::Int(3)),
+            Ok(bulk("123")),
+        ]);
+
+        let value = super::get_value(&mut con, b"123").await.unwrap();
+
+        let RedisValueData::String { content, total_bytes, truncated } = &value.data else {
+            panic!("expected a String value");
+        };
+        assert_eq!(redis_blob_display_text(content), "123");
+        assert_eq!(*total_bytes, Some(3));
+        assert!(!truncated);
+        // The retry asks for the value instead of the whole preview window.
+        assert_eq!(
+            getrange_windows(&con),
+            vec![("0".to_string(), "65535".to_string()), ("0".to_string(), "2".to_string())]
+        );
+        assert_eq!(con.command_count("GETRANGE"), 2);
+        assert_eq!(con.command_count("STRLEN"), 1);
+    }
+
+    #[tokio::test]
+    async fn string_value_fails_fast_when_a_strict_server_also_refuses_strlen() {
+        // The bounded fallback needs the value length. Without it the rejected
+        // window cannot be narrowed, so the read fails instead of asking for
+        // the same rejected window again.
+        let out_of_bounds = redis::RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+            "ERR",
+            "0-65536 is out of bounds".to_string(),
+        ));
+        let denied = redis::RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+            "ERR",
+            "NOPERM this user has no permissions to run the 'strlen' command".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![
+            Ok(bulk("string")),
+            Ok(RedisRawValue::Int(-1)),
+            Err(out_of_bounds),
+            Err(denied),
+        ]);
+
+        let error = super::get_value(&mut con, b"message").await.unwrap_err();
+
+        assert!(error.contains("out of bounds"), "{error}");
+        // One rejected window and one length read; the rejected window is not
+        // requested again.
+        assert_eq!(con.command_count("GETRANGE"), 1);
+        assert_eq!(con.command_count("STRLEN"), 1);
+    }
+
+    #[tokio::test]
+    async fn string_value_retries_when_the_value_shrinks() {
+        // The value was 100 bytes when its length was read and 10 bytes when
+        // the window was requested. The read is retried against the fresh
+        // length instead of failing.
+        let out_of_bounds = || {
+            redis::RedisError::from((
+                redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+                "ERR",
+                "0-100 is out of bounds".to_string(),
+            ))
+        };
+        let mut con = FakeRedisConnection::with_results(vec![
+            Ok(bulk("string")),
+            Ok(RedisRawValue::Int(-1)),
+            Err(out_of_bounds()),
+            Ok(RedisRawValue::Int(100)),
+            Err(out_of_bounds()),
+            Ok(RedisRawValue::Int(10)),
+            Ok(bulk("0123456789")),
+        ]);
+
+        let value = super::get_value(&mut con, b"message").await.unwrap();
+
+        let RedisValueData::String { content, total_bytes, truncated } = &value.data else {
+            panic!("expected a String value");
+        };
+        assert_eq!(redis_blob_display_text(content), "0123456789");
+        assert_eq!(*total_bytes, Some(10));
+        assert!(!truncated);
+        assert_eq!(con.command_count("GETRANGE"), 3);
+        assert_eq!(con.command_count("STRLEN"), 2);
+    }
+
+    #[tokio::test]
+    async fn string_value_reports_other_errors_without_retrying() {
+        let denied = redis::RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+            "ERR",
+            "NOPERM this user has no permissions to run the 'getrange' command".to_string(),
+        ));
+        let mut con =
+            FakeRedisConnection::with_results(vec![Ok(bulk("string")), Ok(RedisRawValue::Int(-1)), Err(denied)]);
+
+        let error = super::get_value(&mut con, b"message").await.unwrap_err();
+
+        assert!(error.contains("NOPERM"), "{error}");
+        assert_eq!(con.command_count("GETRANGE"), 1);
+        assert_eq!(con.command_count("STRLEN"), 0);
     }
 
     #[tokio::test]
@@ -7632,7 +8414,7 @@ mod tests {
             assert_eq!(con.command_count("GET"), 0);
             assert_eq!(con.command_count("STRLEN"), 0);
         }
-        // A configured limit above the 64 KiB span cap is fetched in 64 KiB chunks,
+        // A configured limit above the 64 KiB window limit is fetched in 64 KiB chunks,
         // and filling the budget exactly asks STRLEN for the real size.
         let limit = 128 * 1024;
         let mut con = FakeRedisConnection::new(vec![
@@ -7656,6 +8438,39 @@ mod tests {
         assert_eq!(base64::engine::general_purpose::STANDARD.decode(content.raw_base64).unwrap().len(), limit);
         assert_eq!(con.command_count("GETRANGE"), 2);
         assert_eq!(con.command_count("STRLEN"), 1);
+    }
+
+    /// Live check for servers that reject a GETRANGE window that reaches past
+    /// the value. TongRDS answers `ERR 0-65536 is out of bounds` there, which
+    /// left the key detail empty, so the preview has to read the value and
+    /// report its real size.
+    ///
+    /// Set `DBX_TEST_REDIS_STRING_KEY` to read an existing key instead of
+    /// writing a temporary one.
+    #[tokio::test]
+    #[ignore = "requires a disposable Redis via DBX_TEST_REDIS_URL"]
+    async fn string_preview_reads_the_value_on_strict_range_servers() {
+        let url = std::env::var("DBX_TEST_REDIS_URL").expect("DBX_TEST_REDIS_URL");
+        let existing = std::env::var("DBX_TEST_REDIS_STRING_KEY").ok();
+        let key = existing.clone().unwrap_or_else(|| "dbx-string-preview-probe".to_string());
+        let mut con = super::connect(&url, std::time::Duration::from_secs(5)).await.unwrap();
+        if existing.is_none() {
+            let _: () = redis::cmd("SET").arg(&key).arg("123").query_async(&mut con).await.unwrap();
+        }
+        let expected_len: i64 = redis::cmd("STRLEN").arg(&key).query_async(&mut con).await.unwrap();
+
+        let value = super::get_value(&mut con, key.as_bytes()).await.unwrap();
+
+        let RedisValueData::String { content, total_bytes, truncated } = value.data else {
+            panic!("expected a String value");
+        };
+        assert_eq!(total_bytes, Some(expected_len as u64));
+        assert!(!truncated);
+        let decoded = base64::engine::general_purpose::STANDARD.decode(&content.raw_base64).unwrap();
+        assert_eq!(decoded.len() as u64, expected_len as u64);
+        if existing.is_none() {
+            let _: u64 = redis::cmd("DEL").arg(&key).query_async(&mut con).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -10518,22 +11333,30 @@ mod tests {
     #[test]
     fn parses_command_text_with_quotes_and_escapes() {
         let argv = parse_command_argv(r#"SET "user:1" "Ada \"Lovelace\"""#).unwrap();
+        assert_eq!(argv, vec![b"SET".to_vec(), b"user:1".to_vec(), b"Ada \"Lovelace\"".to_vec()]);
 
-        assert_eq!(argv, vec!["SET", "user:1", "Ada \"Lovelace\""]);
+        let argv = parse_command_argv(r#"DEL "cache\\session""#).unwrap();
+        assert_eq!(argv, vec![b"DEL".to_vec(), b"cache\\session".to_vec()]);
+
+        let argv = parse_command_argv(r#"DEL "bin\x00key\xff""#).unwrap();
+        assert_eq!(argv, vec![b"DEL".to_vec(), b"bin\0key\xff".to_vec()]);
+        // Note: raw byte 0xff is preserved as a single byte 0xff, NOT UTF-8 encoded U+00FF (0xc3, 0xbf)
+        assert_eq!(argv[1], vec![b'b', b'i', b'n', 0x00, b'k', b'e', b'y', 0xff]);
     }
 
     #[test]
     fn parses_empty_quoted_arguments() {
         let argv = parse_command_argv(r#"SET "" """#).unwrap();
 
-        assert_eq!(argv, vec!["SET", "", ""]);
+        assert_eq!(argv, vec![b"SET".to_vec(), b"".to_vec(), b"".to_vec()]);
     }
 
     #[test]
     fn parses_quoted_and_escaped_command_names_before_classification() {
         for command_text in [r#""JSON.SET" user:1 $ {}"#, r#"JSON\.SET user:1 $ {}"#] {
             let argv = parse_command_argv(command_text).unwrap();
-            assert_eq!(classify_command(&argv[0]), RedisCommandSafety::Write);
+            let cmd = String::from_utf8_lossy(&argv[0]).to_ascii_uppercase();
+            assert_eq!(classify_command(&cmd), RedisCommandSafety::Write);
         }
     }
 
@@ -10542,6 +11365,125 @@ mod tests {
         for command_text in ["   ", "\"\""] {
             assert_eq!(parse_command_argv(command_text).unwrap_err(), "Redis command is empty");
         }
+    }
+
+    #[tokio::test]
+    async fn raw_command_execution_preserves_binary_bytes_and_isolates_similar_text_keys() {
+        use std::collections::HashSet;
+
+        struct TargetIsolatingConnection {
+            keys: HashSet<Vec<u8>>,
+            captured_commands: Vec<Vec<u8>>,
+        }
+
+        impl ConnectionLike for TargetIsolatingConnection {
+            fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, RedisRawValue> {
+                let packed = cmd.get_packed_command();
+                self.captured_commands.push(packed.clone());
+                // Parse RESP array: *<count>\r\n$<len>\r\n<arg>\r\n...
+                if packed.starts_with(b"*") {
+                    let mut pos = 0;
+                    if let Some(crlf) = packed[pos..].windows(2).position(|w| w == b"\r\n") {
+                        pos += crlf + 2;
+                        let mut args = Vec::new();
+                        while pos < packed.len() {
+                            if packed[pos] == b'$' {
+                                if let Some(len_end) = packed[pos..].windows(2).position(|w| w == b"\r\n") {
+                                    let len_str = std::str::from_utf8(&packed[pos + 1..pos + len_end]).unwrap();
+                                    let arg_len: usize = len_str.parse().unwrap();
+                                    let start = pos + len_end + 2;
+                                    let end = start + arg_len;
+                                    args.push(packed[start..end].to_vec());
+                                    pos = end + 2;
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        if args.first().is_some_and(|c| c.eq_ignore_ascii_case(b"DEL")) {
+                            for k in &args[1..] {
+                                self.keys.remove(k);
+                            }
+                        }
+                    }
+                }
+                Box::pin(async move { Ok(RedisRawValue::Int(1)) })
+            }
+
+            fn req_packed_commands<'a>(
+                &'a mut self,
+                cmd: &'a Pipeline,
+                _offset: usize,
+                count: usize,
+            ) -> RedisFuture<'a, Vec<RedisRawValue>> {
+                self.captured_commands.push(cmd.get_packed_pipeline());
+                Box::pin(async move { Ok(vec![RedisRawValue::Int(1); count]) })
+            }
+
+            fn get_db(&self) -> i64 {
+                0
+            }
+        }
+
+        let key_ff = vec![0xff];
+        let key_utf8_y_diaeresis = "ÿ".as_bytes().to_vec(); // [0xc3, 0xbf]
+        let key_80 = vec![0x80];
+        let key_c2_80 = vec![0xc2, 0x80]; // U+0080 in UTF-8
+        let key_nul = b"bin\x00key".to_vec();
+        let key_zero = b"bin0key".to_vec();
+        let key_zhong_n = vec![0xe4, 0xb8, 0xad, 0x5c, 0x6e]; // "中\n" in bytes
+        let key_zhong_nl = vec![0xe4, 0xb8, 0xad, 0x0a]; // "中<newline>" in bytes
+
+        let mut con = TargetIsolatingConnection {
+            keys: HashSet::from([
+                key_ff.clone(),
+                key_utf8_y_diaeresis.clone(),
+                key_80.clone(),
+                key_c2_80.clone(),
+                key_nul.clone(),
+                key_zero.clone(),
+                key_zhong_n.clone(),
+                key_zhong_nl.clone(),
+            ]),
+            captured_commands: Vec::new(),
+        };
+
+        // 1. Delete binary 0xff key: DEL "\xff"
+        super::execute_command(&mut con, r#"DEL "\xff""#, true).await.unwrap();
+        // Verify wire bytes: bulk string length must be $1, containing single byte 0xff
+        let last_cmd = con.captured_commands.last().unwrap();
+        assert!(last_cmd.ends_with(b"$1\r\n\xff\r\n"), "must send raw byte 0xff with length 1");
+        assert!(!con.keys.contains(&key_ff), "0xff key must be deleted");
+        assert!(con.keys.contains(&key_utf8_y_diaeresis), "UTF-8 'ÿ' key [0xc3, 0xbf] must NOT be deleted");
+
+        // 2. Delete UTF-8 'ÿ' key: DEL "ÿ"
+        super::execute_command(&mut con, r#"DEL "ÿ""#, true).await.unwrap();
+        let last_cmd = con.captured_commands.last().unwrap();
+        assert!(last_cmd.ends_with(b"$2\r\n\xc3\xbf\r\n"), "must send UTF-8 bytes for 'ÿ' with length 2");
+        assert!(!con.keys.contains(&key_utf8_y_diaeresis), "UTF-8 'ÿ' key must now be deleted");
+
+        // 3. Delete binary 0x80 key: DEL "\x80"
+        super::execute_command(&mut con, r#"DEL "\x80""#, true).await.unwrap();
+        let last_cmd = con.captured_commands.last().unwrap();
+        assert!(last_cmd.ends_with(b"$1\r\n\x80\r\n"), "must send raw byte 0x80 with length 1");
+        assert!(!con.keys.contains(&key_80), "0x80 key must be deleted");
+        assert!(con.keys.contains(&key_c2_80), "[0xc2, 0x80] key must NOT be deleted");
+
+        // 4. Delete binary NUL key: DEL "bin\x00key"
+        super::execute_command(&mut con, r#"DEL "bin\x00key""#, true).await.unwrap();
+        let last_cmd = con.captured_commands.last().unwrap();
+        assert!(last_cmd.ends_with(b"$7\r\nbin\x00key\r\n"), "must send raw NUL byte inside key");
+        assert!(!con.keys.contains(&key_nul), "NUL key must be deleted");
+        assert!(con.keys.contains(&key_zero), "bin0key must NOT be deleted");
+
+        // 5. Delete "中\n" (bytes: e4 b8 ad 5c 6e): DEL "中\\n"
+        super::execute_command(&mut con, r#"DEL "中\\n""#, true).await.unwrap();
+        let last_cmd = con.captured_commands.last().unwrap();
+        assert!(last_cmd.ends_with(b"$5\r\n\xe4\xb8\xad\\n\r\n"), "must send exact bytes for 中\\n");
+        assert!(!con.keys.contains(&key_zhong_n), "中\\n key must be deleted");
+        assert!(con.keys.contains(&key_zhong_nl), "中<newline> key must NOT be deleted");
     }
 
     #[tokio::test]

@@ -188,6 +188,38 @@ describe("query result labels", () => {
     expect(item?.title).toBe("SELECT 1");
   });
 
+  it("bounds the SQL fallback tooltip for results without a source object", () => {
+    const longSql = `SELECT * FROM (${Array.from({ length: 40 }, (_, i) => `SELECT ${i + 1} AS value`).join(" UNION ALL ")}) AS combined`;
+    const [item] = tabularResultItems([
+      {
+        columns: ["value"],
+        rows: [[1]],
+        affected_rows: 0,
+        execution_time_ms: 1,
+        sourceStatement: longSql,
+      },
+    ]);
+
+    const expected = `${longSql.replace(/\s+/g, " ").trim().slice(0, 160)}…`;
+    expect(item?.label).toBeUndefined();
+    expect(item?.title).toBe(expected);
+    expect(item?.title!.length).toBe(161);
+  });
+
+  it("collapses multiline SQL fallback tooltips onto a single line", () => {
+    const [item] = tabularResultItems([
+      {
+        columns: ["id"],
+        rows: [[1]],
+        affected_rows: 0,
+        execution_time_ms: 1,
+        sourceStatement: "SELECT *\n  FROM (SELECT id\n          FROM users)",
+      },
+    ]);
+
+    expect(item?.title).toBe("SELECT * FROM (SELECT id FROM users)");
+  });
+
   it("shows only the object name when result set names exclude the database", () => {
     const results = [
       {
@@ -1033,6 +1065,30 @@ describe("shared tab presentation helpers", () => {
     }
   });
 
+  it("restricts connection tab coloring to active tab when scope is active (#12955)", () => {
+    const settings = useSettingsStore().editorSettings;
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [{ id: "conn-1", name: "One", db_type: "mysql", color: "#3b82f6" }] as ConnectionConfig[];
+    const tab = queryTab({ connectionId: "conn-1" });
+
+    settings.colorizeConnectionTabs = true;
+    settings.colorizeConnectionTabsScope = "all";
+    const activeAll = tabColorStyle(tab, true, false);
+    const inactiveAll = tabColorStyle(tab, false, false);
+    expect(activeAll?.["--app-tab-background"]).toBe("rgba(59, 130, 246, 0.24)");
+    expect(activeAll?.borderColor).toBe("rgba(59, 130, 246, 0.72)");
+    expect(inactiveAll?.["--app-tab-background"]).toBe("rgba(59, 130, 246, 0.09)");
+    expect(inactiveAll?.borderColor).toBe("rgba(59, 130, 246, 0.18)");
+
+    settings.colorizeConnectionTabsScope = "active";
+    const activeScope = tabColorStyle(tab, true, false);
+    const inactiveScope = tabColorStyle(tab, false, false);
+    expect(activeScope?.["--app-tab-background"]).toBe("rgba(59, 130, 246, 0.24)");
+    expect(activeScope?.borderColor).toBe("rgba(59, 130, 246, 0.72)");
+    expect(inactiveScope?.borderColor).toBeUndefined();
+    expect(inactiveScope?.["--app-tab-background"]).toBeUndefined();
+  });
+
   it("swaps inline color-mix tab colors for concrete rgba on legacy WebViews", () => {
     useSettingsStore().editorSettings.colorizeConnectionTabs = false;
     // WebKit without color-mix() invalidates the inline values at computed-value
@@ -1065,18 +1121,27 @@ describe("shared tab presentation helpers", () => {
     expect(tabConnectionColor("conn-2")).toBe("#abcdef");
   });
 
-  it("resolves MQ driver icons from the connection store", () => {
+  it.each(["query", "plugin-workbench", "plugin-filesystem"] as const)("does not use an MQ icon for a %s tab without a connection", (mode) => {
+    expect(tabDatabaseIconType(queryTab({ connectionId: "", mode }))).toBe("unknown");
+    expect(tabDatabaseIconType(queryTab({ connectionId: "deleted-connection", mode }))).toBe("unknown");
+  });
+
+  it("preserves the MQ fallback for an MQ tab without a connection", () => {
+    expect(tabDatabaseIconType(queryTab({ connectionId: "deleted-mq", mode: "mq" }))).toBe("mq");
+  });
+
+  it.each(["kafka", "rabbitmq", "rocketmq", "pulsar"])("resolves the %s MQ driver icon from the connection store", (driver) => {
     const connectionStore = useConnectionStore();
     connectionStore.connections = [
       {
         id: "mq-1",
         name: "MQ",
         db_type: "mq",
-        driver_profile: "kafka",
+        driver_profile: driver,
         color: "",
       } as ConnectionConfig,
     ];
-    expect(tabDatabaseIconType(queryTab({ connectionId: "mq-1", mode: "mq" }))).toBe("kafka");
+    expect(tabDatabaseIconType(queryTab({ connectionId: "mq-1", mode: "mq" }))).toBe(driver);
   });
 
   it("returns a dirty-title style only when the tab is dirty", () => {
