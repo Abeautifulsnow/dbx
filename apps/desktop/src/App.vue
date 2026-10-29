@@ -661,7 +661,7 @@ function updatePluginAiRecommendations(tabId: string, update: PluginAiRecommenda
 // iframe moved out of the DOM reloads from scratch, so KeepAlive/ContentArea
 // remounts flash the whole webview and drop its live session state.
 const mountedPluginWorkbenchTabs = computed(() => queryStore.tabs.filter((tab) => tab.mode === "plugin-workbench" && tab.pluginWorkbench));
-type PluginWorkbenchTabHandle = { refresh: () => Promise<unknown>; notifyLayout?: () => void };
+type PluginWorkbenchTabHandle = { refresh: () => Promise<unknown> };
 const pluginWorkbenchTabRefs = new Map<string, PluginWorkbenchTabHandle>();
 let detachedEventUnlisteners: Array<() => void> = [];
 let floatingEventUnlisteners: Array<() => void> = [];
@@ -5622,7 +5622,7 @@ onUnmounted(() => {
               </Dialog>
               <div
                 v-show="!driverStoreActive && !pluginCenterActive && !settingsStore.settingsPageActive"
-                class="relative flex min-h-0 min-w-0 flex-1"
+                class="flex min-h-0 min-w-0 flex-1"
                 :class="activeTab?.mode === 'plugin-workbench' && isVerticalTabPlacement ? (settingsStore.editorSettings.tabPlacement === 'right' ? 'flex-row-reverse' : 'flex-row') : 'flex-col'"
               >
                 <div class="flex min-h-0" :class="activeTab?.mode === 'plugin-workbench' ? (isVerticalTabPlacement ? 'h-full flex-none flex-col' : 'flex-none flex-col') : 'flex-1 flex-col'">
@@ -5784,24 +5784,21 @@ onUnmounted(() => {
                   </SqlEditorWorkspace>
                 </div>
                 <!-- Always-mounted plugin workbench layer: switching tabs only
-                       toggles visibility without destroying iframes. Inactive
-                       tabs are preserved offscreen at full container bounds
-                       (visibility:hidden, absolute inset-0) rather than display:none,
-                       preventing terminal/layout collapse (0x0) during periodic
-                       background redraws (#13734). -->
-                <div v-if="mountedPluginWorkbenchTabs.length > 0" class="relative min-h-0 min-w-0" :class="activeTab?.mode === 'plugin-workbench' ? 'flex flex-1 flex-col' : 'pointer-events-none absolute inset-0 -z-10 invisible size-full'">
-                  <div v-for="workbenchTab in mountedPluginWorkbenchTabs" :key="workbenchTab.id" class="size-full min-h-0 flex-col" :class="activeTab && workbenchTab.id === activeTab.id ? 'relative flex flex-1' : 'pointer-events-none absolute inset-0 -z-10 invisible'">
-                    <PluginWorkbenchTab
-                      :ref="(element) => setPluginWorkbenchTabRef(workbenchTab.id, element)"
-                      :tab-id="workbenchTab.id"
-                      :active="activeTab?.id === workbenchTab.id"
-                      :plugin-id="workbenchTab.pluginWorkbench!.pluginId"
-                      :contribution-id="workbenchTab.pluginWorkbench!.contributionId"
-                      :context="workbenchTab.pluginWorkbench!.context"
-                      @close-tab="queryStore.closeTab(workbenchTab.id)"
-                      @recommendations="updatePluginAiRecommendations(workbenchTab.id, $event)"
-                    />
-                  </div>
+                       toggles visibility, so plugin webviews (SSH terminals) are
+                       never destroyed and reloaded. SqlEditorWorkspace no longer
+                       renders plugin tabs — this layer owns them. It in turn
+                       yields the layout (display:none) while a plugin tab is
+                       active, or both flex-1 siblings would split the column. -->
+                <div v-for="workbenchTab in mountedPluginWorkbenchTabs" :key="workbenchTab.id" v-show="activeTab && workbenchTab.id === activeTab.id" class="flex min-h-0 flex-1 flex-col">
+                  <PluginWorkbenchTab
+                    :ref="(element) => setPluginWorkbenchTabRef(workbenchTab.id, element)"
+                    :tab-id="workbenchTab.id"
+                    :plugin-id="workbenchTab.pluginWorkbench!.pluginId"
+                    :contribution-id="workbenchTab.pluginWorkbench!.contributionId"
+                    :context="workbenchTab.pluginWorkbench!.context"
+                    @close-tab="queryStore.closeTab(workbenchTab.id)"
+                    @recommendations="updatePluginAiRecommendations(workbenchTab.id, $event)"
+                  />
                 </div>
               </div>
               <PluginBottomDock v-if="!isDetachedWindowContext" />
