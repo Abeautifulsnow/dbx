@@ -87,7 +87,7 @@ import { resolveSqlSingleQuoteKeyAction } from "@/lib/sql/sqlQuoteCaret";
 import { formatMongoShellText } from "@/lib/mongo/mongoFormatter";
 import { detectAndFormatElasticsearchRequests } from "@/lib/elasticsearch/elasticsearchFormatter";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { useSettingsStore } from "@/stores/settingsStore";
+import { DEFAULT_EDITOR_SETTINGS, useSettingsStore } from "@/stores/settingsStore";
 import { useTheme } from "@/composables/useTheme";
 import { useToast } from "@/composables/useToast";
 import { buildSelectStarExpansion, selectStarResultColumnsMatch } from "@/lib/sql/sqlCompletion";
@@ -142,14 +142,18 @@ import { scrollEditorLine } from "@/lib/editor/scrollEditorLine";
 import { createQueryEditorStringMouseSelection } from "@/lib/editor/queryEditorStringMouseSelection";
 import { createQueryEditorCompletionShortcutBindings } from "@/lib/editor/queryEditorCompletionShortcut";
 import { handleQueryEditorCompletionNavigation } from "@/lib/editor/queryEditorCompletionNavigation";
+import { createQueryEditorLineCommentShortcutBindings } from "@/lib/editor/queryEditorLineComment";
 import { createQueryEditorSelectionCaseShortcutBindings } from "@/lib/editor/queryEditorSelectionCaseShortcut";
 import { createQueryEditorExecutionShortcutBindings, createQueryEditorExecutionShortcutHandler, createQueryEditorPostCompositionKeyGuard } from "@/lib/editor/queryEditorExecutionShortcut";
-import { supportsQueryEditorBlockComments, supportsSqlInListPaste } from "@/lib/database/databaseFeatureSupport";
+import { supportsPlDebugRoutine, supportsQueryEditorBlockComments, supportsSqlInListPaste } from "@/lib/database/databaseFeatureSupport";
+import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { launchPlDebugAnonymous } from "@/components/debug/plDebugLaunch";
 import { queryContextObjectRoute, queryTableCandidateAtSqlPosition, resolveQueryContextCandidateDatabase, resolveQueryContextObjectTarget, type QueryContextObjectAction } from "@/lib/sql/queryCursorTableTarget";
 import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { isMacOS } from "@/lib/backend/platform";
 import { resolveSqlDialectId } from "@/lib/sql/semantic/dialect";
+import { queryEditorStatementDatabaseType } from "@/lib/mongo/mongoSql";
 import { kingbaseSqlDatabaseType } from "@/lib/database/jdbcDialect";
 import type { SqlCompletionColumn, SqlCompletionContext, SqlCompletionReferencedTable } from "@/lib/sql/sqlCompletion";
 
@@ -171,7 +175,12 @@ function sqlSyntaxDialect() {
 
 function queryEditorSelectionLanguage(): "sql" | "text" {
   const databaseType = props.databaseType;
+  if (databaseType === "mongodb" && props.mongoQueryLanguage === "sql") return "sql";
   return databaseType === "redis" || databaseType === "mongodb" || databaseType === "elasticsearch" || databaseType === "easysearch" || databaseType === "meilisearch" || databaseType === "solr" || databaseType === "victoriametrics" ? "text" : "sql";
+}
+
+function statementDatabaseType() {
+  return queryEditorStatementDatabaseType(props.databaseType, props.mongoQueryLanguage);
 }
 
 const COMPLETION_REMOTE_LATENCY_BUDGET_MS = 120;
@@ -514,6 +523,7 @@ let previewContextRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let editorIsActive = true;
 
 let imeCompositionActive = false;
+let imeCompositionRecovered = false;
 let pendingImeModelEmit = false;
 const postCompositionKeyGuard = createQueryEditorPostCompositionKeyGuard();
 let postCompositionKeyGuardCleanup: (() => void) | null = null;
@@ -601,6 +611,7 @@ const zoomCommitScheduler = createEditorZoomCommitScheduler((fontSize) => {
   settingsStore.updateEditorSettings({ fontSize });
 });
 const wheelZoom = createEditorWheelZoomController();
+const EDITOR_ZOOM_TOAST_MS = 1500;
 
 const queryEditorAppearanceSettings = computed(() => {
   const settings = settingsStore.editorSettings;
@@ -675,6 +686,7 @@ function applyLiveFontSize(size: number) {
   // frame so that CSS variable changes remain smooth on every wheel tick,
   // while the CodeMirror measure → syncGutters path keeps gutters aligned.
   scheduleFontThemeReconfig(next, settingsStore.editorSettings.fontFamily);
+  toast(`${Math.round((next / DEFAULT_EDITOR_SETTINGS.fontSize) * 100)}%`, EDITOR_ZOOM_TOAST_MS);
 }
 
 function scheduleFontSizeCommit(size: number) {
@@ -1202,12 +1214,12 @@ function emitContextObjectAction(action: QueryContextObjectAction) {
 }
 
 function executableStatementRangeStartingAt(currentView: EditorViewType, lineFrom: number) {
-  executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, currentView.state.doc, props.databaseType, sqlStatementParameterOptions());
+  executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, currentView.state.doc, statementDatabaseType(), sqlStatementParameterOptions());
   return executableStatementRangeStartingAtLine(executableStatementRangeCache, lineFrom);
 }
 
 function executableStatementRangeAtPosition(currentView: EditorViewType, position: number): SqlTextRange | null {
-  executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, currentView.state.doc, props.databaseType, sqlStatementParameterOptions());
+  executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, currentView.state.doc, statementDatabaseType(), sqlStatementParameterOptions());
   return executableStatementRangeAtCursor(executableStatementRangeCache, position);
 }
 
@@ -1304,6 +1316,19 @@ function navigateStatementFromView(currentView: EditorViewType, direction: State
 }
 
 const contextMenuActions: QueryEditorContextMenuActions = {
+  debugPlSqlFromContextMenu: () => {
+    const currentView = view.value;
+    if (!currentView || !props.connectionId || !props.database) return;
+    const selection = currentView.state.selection.main;
+    void launchPlDebugAnonymous({
+      connectionId: props.connectionId,
+      database: props.database,
+      databaseType: effectiveDatabaseTypeForConnection(connectionStore.getConfig(props.connectionId)) ?? props.databaseType,
+      schema: props.schema,
+      selectedText: currentView.state.doc.sliceString(selection.from, selection.to),
+      documentText: currentView.state.doc.toString(),
+    });
+  },
   executeFromContextMenu,
   executeAllFromContextMenu,
   executeInNewResultTabFromContextMenu,
@@ -1351,6 +1376,7 @@ function getContextMenuState(): QueryEditorContextMenuState {
     readOnly: props.readOnly,
     hideExecutionControls: props.hideExecutionControls,
     databaseType: props.databaseType,
+    canDebugPlSql: !!props.connectionId && !!props.database && supportsPlDebugRoutine(effectiveDatabaseTypeForConnection(connectionStore.getConfig(props.connectionId || "")) ?? props.databaseType),
     selectedSql: selectedSql.value,
     executableSql: executableSql.value,
     previewContextSql: previewContextSql.value,
@@ -1537,7 +1563,7 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
         ...createQueryEditorSelectionCaseShortcutBindings(shortcuts.lowercaseSelection, () => convertSelectedSqlCase("lower")),
         ...createQueryEditorSelectionCaseShortcutBindings(shortcuts.toggleCaseSelection, () => convertSelectedSqlCase("toggle")),
         ...createQueryEditorSelectionCaseShortcutBindings(shortcuts.convertNamingStyle, () => convertSelectedNamingStyle()),
-        ...binding(shortcuts.toggleLineComment, (view) => codeMirrorRuntime.codeMirrorToggleLineComment?.(view) ?? false),
+        ...createQueryEditorLineCommentShortcutBindings(shortcuts.toggleLineComment, (view) => codeMirrorRuntime.codeMirrorToggleLineComment?.(view) ?? false),
         ...binding(shortcuts.toggleBlockComment, (view) => {
           if (!supportsQueryEditorBlockComments(props.databaseType)) return false;
           return codeMirrorRuntime.codeMirrorToggleBlockComment?.(view) ?? false;
@@ -1889,7 +1915,7 @@ async function formatCurrentSql() {
     let formatted: string;
     let formattedAsSql = false;
     let formatDiagnostic: SqlFormatterDiagnostic | undefined;
-    if (props.databaseType === "mongodb") {
+    if (props.databaseType === "mongodb" && props.mongoQueryLanguage !== "sql") {
       formatted = formatMongoShellText(source, settingsStore.editorSettings.sqlFormatter);
     } else {
       const esRequest = detectAndFormatElasticsearchRequests(source, props.databaseType, settingsStore.editorSettings.sqlFormatter.tabWidth);
@@ -2090,7 +2116,12 @@ const { editorIndentUnit, handleTab, handleEnter, acceptCompletionOrNextSnippetF
 });
 
 function isEditorComposing(currentView: EditorViewType): boolean {
-  return imeCompositionActive || currentView.compositionStarted || currentView.composing;
+  if (imeCompositionActive) return true;
+  // A real key with isComposing=false proves the IME stalled before sending
+  // compositionend. Ignore the stale CodeMirror flags until the next
+  // compositionstart, otherwise every shortcut stays blocked.
+  if (imeCompositionRecovered) return false;
+  return currentView.compositionStarted || currentView.composing;
 }
 
 async function flushImeComposition() {
@@ -2115,7 +2146,9 @@ async function flushImeComposition() {
 
 function defaultKeymapExtension() {
   if (!codeMirrorRuntime.editorViewModule || !codeMirrorRuntime.codeMirrorDefaultKeymap || !codeMirrorRuntime.codeMirrorToggleBlockComment) return [];
-  return codeMirrorRuntime.editorViewModule.keymap.of(defaultKeymapForGlobalShortcuts(codeMirrorRuntime.codeMirrorDefaultKeymap, settingsStore.editorSettings.shortcuts).filter((item) => item.run !== codeMirrorRuntime.codeMirrorToggleBlockComment));
+  return codeMirrorRuntime.editorViewModule.keymap.of(
+    defaultKeymapForGlobalShortcuts(codeMirrorRuntime.codeMirrorDefaultKeymap, settingsStore.editorSettings.shortcuts).filter((item) => item.run !== codeMirrorRuntime.codeMirrorToggleBlockComment && item.run !== codeMirrorRuntime.codeMirrorToggleLineComment),
+  );
 }
 
 const codeMirrorLifecycle = useQueryEditorCodeMirror({
@@ -2429,16 +2462,20 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
             return insertDroppedTableReference(currentView, event);
           },
           blur(_event, currentView) {
+            imeCompositionActive = false;
+            imeCompositionRecovered = false;
             documentState.recordSelection(currentView);
             return false;
           },
           compositionstart() {
             imeCompositionActive = true;
+            imeCompositionRecovered = false;
             completion.invalidateRequests();
             return false;
           },
           compositionend() {
             imeCompositionActive = false;
+            imeCompositionRecovered = false;
             window.setTimeout(flushImeComposition, 0);
             return false;
           },
@@ -2685,10 +2722,16 @@ watch(
   { deep: true },
 );
 
+function prefetchCompletionTablesIfEnabled() {
+  if (props.prefetchCompletion) void completionMetadata.prefetchCompletionTables();
+}
+
 watch(
   () => props.connectionId,
   () => {
+    completion.invalidateRequests();
     refreshCompletionCache();
+    prefetchCompletionTablesIfEnabled();
     setSemanticDiagnostics([]);
     scheduleSemanticDiagnostics();
   },
@@ -2697,7 +2740,9 @@ watch(
 watch(
   () => props.database,
   () => {
+    completion.invalidateRequests();
     refreshCompletionCache();
+    prefetchCompletionTablesIfEnabled();
     setSemanticDiagnostics([]);
     scheduleSemanticDiagnostics();
   },
@@ -2706,7 +2751,9 @@ watch(
 watch(
   () => props.catalog,
   () => {
+    completion.invalidateRequests();
     refreshCompletionCache();
+    prefetchCompletionTablesIfEnabled();
     setSemanticDiagnostics([]);
     scheduleSemanticDiagnostics();
   },
@@ -2715,7 +2762,9 @@ watch(
 watch(
   () => props.schema,
   () => {
+    completion.invalidateRequests();
     refreshCompletionCache();
+    prefetchCompletionTablesIfEnabled();
     setSemanticDiagnostics([]);
     scheduleSemanticDiagnostics();
   },
@@ -2731,6 +2780,8 @@ watch(
   },
 );
 
+prefetchCompletionTablesIfEnabled();
+
 watch([() => props.clientSessionId, () => props.completionContextVersion], () => {
   completion.invalidateRequests();
   refreshCompletionCache();
@@ -2739,7 +2790,7 @@ watch([() => props.clientSessionId, () => props.completionContextVersion], () =>
 });
 
 watch(
-  [() => props.tabId, () => props.databaseType, () => props.dialect, sqlSyntaxDialect, sqlDriverProfile, () => kingbaseConfig.value?.database_info?.compatibilityMode],
+  [() => props.tabId, () => props.databaseType, () => props.dialect, () => props.syntaxDialect, sqlSyntaxDialect, () => props.mongoQueryLanguage, sqlDriverProfile, () => kingbaseConfig.value?.database_info?.compatibilityMode],
   () => {
     completion.invalidateRequests();
     refreshCompletionCache();
@@ -2999,11 +3050,17 @@ onDeactivated(pauseQueryEditorBackgroundWork);
 
 onMounted(() => {
   if (typeof window === "undefined") return;
+  window.addEventListener("keydown", wheelZoom.recordModifiers, true);
+  window.addEventListener("keyup", wheelZoom.recordModifiers, true);
+  window.addEventListener("blur", wheelZoom.reset);
   documentState.attach();
   warmActiveTabConnection();
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener("keydown", wheelZoom.recordModifiers, true);
+  window.removeEventListener("keyup", wheelZoom.recordModifiers, true);
+  window.removeEventListener("blur", wheelZoom.reset);
   pauseQueryEditorBackgroundWork();
   documentState.dispose();
   pointerInteractions.dispose();
@@ -3116,6 +3173,11 @@ function unfoldAll(): boolean {
 function shouldBlockExecutionShortcut(event?: KeyboardEvent, currentView: EditorViewType | null = view.value): boolean {
   if (props.isExecuting) return true;
   if (event?.repeat) return true;
+  if (event && !event.isComposing && event.keyCode !== 229 && event.key !== "Process") {
+    // A stalled IME can drop compositionend; a real key proves it is over.
+    imeCompositionActive = false;
+    imeCompositionRecovered = true;
+  }
   return (currentView ? isEditorComposing(currentView) : false) || (event ? postCompositionKeyGuard.blocks(event) : false);
 }
 

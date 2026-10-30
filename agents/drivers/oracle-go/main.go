@@ -44,7 +44,7 @@ const oracleDatabaseVersionProbeTimeout = 3 * time.Second
 const oracleDatabaseVersionSQL = `
 SELECT VERSION
 FROM PRODUCT_COMPONENT_VERSION
-WHERE PRODUCT LIKE 'Oracle Database%'
+WHERE PRODUCT LIKE 'Oracle%Database%'
   AND ROWNUM = 1`
 
 const oracleDisableSegmentAttributesSQL = `BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE); END;`
@@ -59,7 +59,7 @@ var (
 	oracleNotNullConstraintRegexp        = regexp.MustCompile(`(?i)^\s*\(*\s*(?:"((?:[^"]|"")*)"|([A-Z0-9_$#]+))\s+IS\s+NOT\s+NULL\s*\)*\s*$`)
 	oracleDatabaseVersionQueries         = []string{
 		oracleDatabaseVersionSQL,
-		`SELECT BANNER FROM V$VERSION WHERE BANNER LIKE 'Oracle Database%' AND ROWNUM = 1`,
+		`SELECT BANNER FROM V$VERSION WHERE BANNER LIKE 'Oracle%Database%' AND ROWNUM = 1`,
 	}
 	oracleStringConverters = map[int]converters.IStringConverter{
 		oracleCharsetZHS32GB18030: oracleGB18030Converter{},
@@ -360,12 +360,13 @@ type queryOptions struct {
 const largeValueBytesColumnPrefix = "__DBX_LARGE_VALUE_BYTES_"
 
 type queryResult struct {
-	Columns         []string `json:"columns"`
-	ColumnTypes     []string `json:"column_types"`
-	Rows            [][]any  `json:"rows"`
-	AffectedRows    int64    `json:"affected_rows"`
-	ExecutionTimeMS int64    `json:"execution_time_ms"`
-	Truncated       bool     `json:"truncated"`
+	Columns         []string       `json:"columns"`
+	ColumnTypes     []string       `json:"column_types"`
+	Rows            [][]any        `json:"rows"`
+	AffectedRows    int64          `json:"affected_rows"`
+	ExecutionTimeMS int64          `json:"execution_time_ms"`
+	Truncated       bool           `json:"truncated"`
+	Messages        []queryMessage `json:"messages,omitempty"`
 }
 
 func (r queryResult) MarshalJSON() ([]byte, error) {
@@ -393,14 +394,15 @@ func (r queryResult) MarshalJSON() ([]byte, error) {
 }
 
 type queryPageResult struct {
-	Columns         []string `json:"columns"`
-	ColumnTypes     []string `json:"column_types"`
-	Rows            [][]any  `json:"rows"`
-	AffectedRows    int64    `json:"affected_rows"`
-	ExecutionTimeMS int64    `json:"execution_time_ms"`
-	Truncated       bool     `json:"truncated"`
-	SessionID       *string  `json:"session_id"`
-	HasMore         bool     `json:"has_more"`
+	Columns         []string       `json:"columns"`
+	ColumnTypes     []string       `json:"column_types"`
+	Rows            [][]any        `json:"rows"`
+	AffectedRows    int64          `json:"affected_rows"`
+	ExecutionTimeMS int64          `json:"execution_time_ms"`
+	Truncated       bool           `json:"truncated"`
+	SessionID       *string        `json:"session_id"`
+	HasMore         bool           `json:"has_more"`
+	Messages        []queryMessage `json:"messages,omitempty"`
 }
 
 func (r queryPageResult) MarshalJSON() ([]byte, error) {
@@ -454,17 +456,23 @@ func normalizeNonFiniteQueryRows(rows [][]any) ([][]any, bool) {
 }
 
 type querySession struct {
-	rows        *sql.Rows
-	columns     []string
-	columnTypes []string
-	pending     []any
-	remaining   int
+	rows           *sql.Rows
+	conn           *sql.Conn
+	columns        []string
+	columnTypes    []string
+	pending        []any
+	remaining      int
+	outputIdentity any
 }
 
 type oracleColumnMeta struct {
 	Name          string
 	DataType      string
 	DataTypeOwner string
+	// GeometryPlaceholder projects a geometry column as a placeholder instead
+	// of converting it, for servers that cannot run the conversion function
+	// (see oracleGeometryFunctionFallbackSQL).
+	GeometryPlaceholder bool
 }
 
 type oracleColumnMetaLoader func(schema, table string) ([]oracleColumnMeta, error)
@@ -651,6 +659,30 @@ type server struct {
 	activeRows             map[*sql.Rows]context.CancelFunc
 	activeTimer            *time.Timer
 	activeTimedOut         bool
+	dbmsOutput             dbmsOutputTracker
+	dbmsOutputBinding      dbmsOutputBinding
+	statementCtx           context.Context
+	statementCancel        context.CancelFunc
+	statementConn          *sql.Conn
+	statementSchema        string
+	repinnedStatementConn  *sql.Conn
+	plDebugMu              sync.Mutex
+	plDebugSessions        map[string]*plDebugSession
+	plAllocation           *plDebugAllocation
+	plConnection           *sql.Conn
+	plConnector            func(connectParams) (driver.Connector, error)
+	plDebuggeeAllocation   *plDebugAllocation
+	plDebuggeeConnection   *sql.Conn
+	plDebuggeeDB           *sql.DB
+	plDebuggeeOpenDone     chan struct{}
+	plDebuggeeOpenErr      error
+	plRetiring             bool
+	plCleanupDeadline      time.Time
+	plDebuggeeTx           *sql.Tx
+	plTxBeginDone          chan struct{}
+	plTxBeginErr           error
+	plTxRollbackDone       chan struct{}
+	plTxRollbackErr        error
 }
 
 type agentSession struct {
@@ -659,20 +691,28 @@ type agentSession struct {
 }
 
 type runtimeServer struct {
-	mu       sync.RWMutex
-	sessions map[string]*agentSession
+	mu               sync.RWMutex
+	sessions         map[string]*agentSession
+	plDebugRuntime   bool
+	plDebugConnector func(connectParams) (driver.Connector, error)
+	plNativeEntries  map[string]*plDebugNativeEntry
+	plMetadataBusy   bool
+	plCompileEntries map[string]*plDebugNativeCompileEntry
 }
 
 func main() {
-	runtime := newRuntimeServer()
-	encoder := json.NewEncoder(os.Stdout)
+	runOracleAgent(os.Stdin, os.Stdout, os.Stderr, newRuntimeServer())
+}
+
+func runOracleAgent(input io.Reader, output, diagnostics io.Writer, runtime *runtimeServer) {
+	encoder := json.NewEncoder(output)
 	var encoderMu sync.Mutex
 	var requests sync.WaitGroup
 	shutdown := make(chan struct{})
 	var shutdownOnce sync.Once
-	fmt.Fprintln(os.Stdout, `{"ready":true}`)
+	fmt.Fprintln(output, `{"ready":true}`)
 
-	scanner := bufio.NewScanner(os.Stdin)
+	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -681,13 +721,19 @@ func main() {
 		}
 		var requestEnvelope request
 		if json.Unmarshal([]byte(line), &requestEnvelope) == nil && requestEnvelope.Method == "shutdown" {
+			if runtime.plDebugRuntime {
+				_ = runtime.closeAllSessions()
+			}
 			requests.Wait()
 			resp, _ := runtime.handleLine(line)
 			encoderMu.Lock()
 			err := encoder.Encode(resp)
 			encoderMu.Unlock()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to write response: %v\n", err)
+				fmt.Fprintf(diagnostics, "failed to write response: %v\n", err)
+			}
+			if runtime.plDebugRuntime {
+				runtime.awaitNativeDrain()
 			}
 			return
 		}
@@ -699,7 +745,7 @@ func main() {
 			err := encoder.Encode(resp)
 			encoderMu.Unlock()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to write response: %v\n", err)
+				fmt.Fprintf(diagnostics, "failed to write response: %v\n", err)
 				shutdownOnce.Do(func() { close(shutdown) })
 				return
 			}
@@ -709,19 +755,35 @@ func main() {
 		}()
 		select {
 		case <-shutdown:
+			if runtime.plDebugRuntime {
+				_ = runtime.closeAllSessions()
+			}
 			requests.Wait()
+			if runtime.plDebugRuntime {
+				_ = runtime.closeAllSessions()
+				runtime.awaitNativeDrain()
+			}
 			return
 		default:
 		}
 	}
+	if runtime.plDebugRuntime {
+		_ = runtime.closeAllSessions()
+	}
 	requests.Wait()
+	if runtime.plDebugRuntime {
+		_ = runtime.closeAllSessions()
+		runtime.awaitNativeDrain()
+	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
-		fmt.Fprintf(os.Stderr, "failed to read stdin: %v\n", err)
+		fmt.Fprintf(diagnostics, "failed to read stdin: %v\n", err)
 	}
 }
 
 func newRuntimeServer() *runtimeServer {
-	return &runtimeServer{sessions: map[string]*agentSession{}}
+	return &runtimeServer{sessions: map[string]*agentSession{},
+		plDebugRuntime:   os.Getenv("DBX_PL_DEBUG_RUNTIME_SCOPE") != "",
+		plDebugConnector: newPLDebugConnector}
 }
 
 func (r *runtimeServer) handleLine(line string) (resp response, shutdown bool) {
@@ -741,6 +803,14 @@ func (r *runtimeServer) handleLine(line string) (resp response, shutdown bool) {
 	if len(req.ID) == 0 {
 		req.ID = json.RawMessage("1")
 	}
+	if r.plDebugRuntime && strings.HasPrefix(req.Method, "pl_debug_") && stringParam(req.Params, "metadataPreparation") == "type_only" && len(line) > plDebugTypedRequestWireBytes {
+		return errorResponse(req.ID, errors.New("typed debugger request wire byte budget exceeded"), req.Method, stringParam(req.Params, "agentSessionId")), false
+	}
+	if r.plDebugRuntime && strings.HasPrefix(req.Method, "pl_debug_") && stringParam(req.Params, "metadataPreparation") == "type_only" {
+		if err := plDebugValidateTypedUnicode(line); err != nil {
+			return errorResponse(req.ID, err, req.Method, stringParam(req.Params, "agentSessionId")), false
+		}
+	}
 	result, shouldShutdown, err := r.dispatch(req.Method, req.Params)
 	if err != nil {
 		return errorResponse(req.ID, err, req.Method, stringParam(req.Params, "agentSessionId")), false
@@ -749,8 +819,20 @@ func (r *runtimeServer) handleLine(line string) (resp response, shutdown bool) {
 }
 
 func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessage) (any, bool, error) {
+	if r.plDebugRuntime && strings.HasPrefix(method, "pl_debug_") && method != "pl_debug_probe" {
+		value, err := r.dispatchNativeDebug(method, params)
+		return value, false, err
+	}
 	switch method {
 	case "handshake":
+		if r.plDebugRuntime {
+			return map[string]any{
+				"protocolVersion":      multiSessionProtocolVersion,
+				"agentProtocolVersion": multiSessionProtocolVersion,
+				"capabilities":         []string{"connect", "multi_session", "pl_debug_retained_results_v1"},
+				"plDebug":              map[string]interface{}{"contractVersion": 1, "helperObjects": false, "setValueOperationStatus": true, "breakpointOperationStatus": true, "executeOperationStatus": true},
+			}, false, nil
+		}
 		return map[string]any{
 			"protocolVersion":      multiSessionProtocolVersion,
 			"agentProtocolVersion": multiSessionProtocolVersion,
@@ -769,6 +851,9 @@ func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessag
 	case "close_session":
 		return map[string]bool{"ok": true}, false, r.closeSession(stringParam(params, "agentSessionId"))
 	case "validate_session":
+		if r.plDebugRuntime {
+			return nil, false, errors.New("dedicated PL/SQL sessions cannot reconnect")
+		}
 		agentSessionID := stringParam(params, "agentSessionId")
 		session, err := r.session(agentSessionID)
 		if err != nil {
@@ -786,6 +871,9 @@ func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessag
 		}
 		return map[string]bool{"ok": true}, false, nil
 	case "cancel_session":
+		if r.plDebugRuntime {
+			return nil, false, errors.New("use the original PL/SQL operation cancellation")
+		}
 		session, err := r.session(stringParam(params, "agentSessionId"))
 		if err != nil {
 			return nil, false, err
@@ -793,6 +881,9 @@ func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessag
 		session.server.cancelActiveQuery()
 		return map[string]bool{"ok": true}, false, nil
 	case "test_connection":
+		if r.plDebugRuntime {
+			return nil, false, errors.New("dedicated PL/SQL runtime cannot open test connections")
+		}
 		return newServer().dispatch(method, params)
 	case "shutdown":
 		return map[string]bool{"ok": true}, true, r.closeAllSessions()
@@ -818,6 +909,9 @@ func (r *runtimeServer) withSession(agentSessionID, method string, params map[st
 	if err != nil {
 		return nil, false, err
 	}
+	if r.plDebugRuntime && method != "pl_debug_probe" {
+		return nil, false, errors.New("native PL/SQL dispatcher is not yet available")
+	}
 	// Oracle connection state, transactions, and cursors are session-scoped;
 	// serialize one session while allowing separate sessions to run in parallel.
 	session.mu.Lock()
@@ -835,7 +929,24 @@ func (r *runtimeServer) openSession(agentSessionID string, params connectParams)
 		r.mu.Unlock()
 		return fmt.Errorf("agent session limit reached: %d", maxAgentSessions)
 	}
+	if r.plDebugRuntime && len(r.sessions) != 0 {
+		r.mu.Unlock()
+		return errors.New("dedicated PL/SQL runtime already owns its logical session")
+	}
+	if r.plDebugRuntime && (len(r.plNativeEntries) != 0 || r.nativeCompileUnresolvedLocked()) {
+		r.mu.Unlock()
+		return errors.New("dedicated PL/SQL runtime retains its original operation receipt")
+	}
 	session := &agentSession{server: newServer()}
+	if r.plDebugRuntime {
+		connector, err := r.plDebugConnector(params)
+		if err != nil {
+			r.mu.Unlock()
+			return err
+		}
+		session.server.plAllocation = &plDebugAllocation{connector: connector, oci: usesOCIProfile(params)}
+		session.server.plConnector = r.plDebugConnector
+	}
 	r.sessions[agentSessionID] = session
 	r.mu.Unlock()
 
@@ -846,7 +957,7 @@ func (r *runtimeServer) openSession(agentSessionID string, params connectParams)
 	session.mu.Unlock()
 	if err != nil {
 		r.mu.Lock()
-		if r.sessions[agentSessionID] == session {
+		if !r.plDebugRuntime && r.sessions[agentSessionID] == session {
 			delete(r.sessions, agentSessionID)
 		}
 		r.mu.Unlock()
@@ -856,6 +967,9 @@ func (r *runtimeServer) openSession(agentSessionID string, params connectParams)
 }
 
 func (r *runtimeServer) replaceSession(agentSessionID string, params connectParams) error {
+	if r.plDebugRuntime {
+		return errors.New("dedicated PL/SQL runtime cannot replace its logical session")
+	}
 	_ = r.closeSession(agentSessionID)
 	return r.openSession(agentSessionID, params)
 }
@@ -874,22 +988,80 @@ func (r *runtimeServer) session(agentSessionID string) (*agentSession, error) {
 }
 
 func (r *runtimeServer) closeSession(agentSessionID string) error {
+	if r.plDebugRuntime {
+		r.mu.RLock()
+		var entry *plDebugNativeEntry
+		for _, candidate := range r.plNativeEntries {
+			if candidate.agentSessionID == agentSessionID {
+				entry = candidate
+				break
+			}
+		}
+		r.mu.RUnlock()
+		if entry != nil {
+			_, err := entry.close()
+			if err != nil {
+				return err
+			}
+			entry.mu.Lock()
+			released, message := entry.releaseState == "released", entry.cleanupError
+			entry.mu.Unlock()
+			if !released {
+				return errors.New(message)
+			}
+			return nil
+		}
+	}
+	return r.closeNativeLogicalSession(agentSessionID)
+}
+
+func (r *runtimeServer) closeNativeLogicalSession(agentSessionID string) error {
 	if agentSessionID == "" {
 		return errors.New("agentSessionId is required")
 	}
 	r.mu.Lock()
 	session := r.sessions[agentSessionID]
-	delete(r.sessions, agentSessionID)
+	if !r.plDebugRuntime {
+		delete(r.sessions, agentSessionID)
+	}
 	r.mu.Unlock()
 	if session == nil {
 		return nil
 	}
+	if r.plDebugRuntime {
+		if err := session.server.closeNativeAllocations(); err != nil {
+			return err
+		}
+	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	return session.server.disconnect()
+	err := session.server.disconnect()
+	if r.plDebugRuntime && err == nil {
+		r.mu.Lock()
+		if r.sessions[agentSessionID] == session {
+			delete(r.sessions, agentSessionID)
+		}
+		r.mu.Unlock()
+	}
+	return err
 }
 
 func (r *runtimeServer) closeAllSessions() error {
+	if r.plDebugRuntime {
+		r.mu.RLock()
+		ids := make([]string, 0, len(r.sessions))
+		for id := range r.sessions {
+			ids = append(ids, id)
+		}
+		r.mu.RUnlock()
+		var firstErr error
+		for _, id := range ids {
+			if err := r.closeSession(id); firstErr == nil && err != nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	}
 	r.mu.Lock()
 	sessions := r.sessions
 	r.sessions = map[string]*agentSession{}
@@ -964,6 +1136,9 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 			return nil, false, errors.New("not connected")
 		}
 		return map[string]bool{"ok": true}, false, pingDB(s.db, 5*time.Second)
+	case "connection_info":
+		result, err := s.connectionInfo()
+		return result, false, err
 	case "list_databases":
 		result, err := s.listDatabases()
 		return result, false, err
@@ -1027,6 +1202,14 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		objectType := stringParam(params, "object_type")
 		ddl, err := s.getTableDDLWithIdentity(schema, table, objectType, boolParam(params, "portable"), boolParam(params, "exact_identity"))
 		return ddl, false, err
+	case "pl_debug_probe":
+		return s.plDebugProbe(), false, nil
+	case "pl_debug_inspect":
+		result, err := s.plDebugInspect(params)
+		return result, false, err
+	case "pl_debug_resolve_target":
+		preview, err := s.previewNativeTarget(params)
+		return preview, false, err
 	case "execute_query":
 		var opts queryOptions
 		if err := decodeParams(params, &opts); err != nil {
@@ -1125,6 +1308,17 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 }
 
 func (s *server) connect(params connectParams) error {
+	if s.plAllocation != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), plDebugOpenTimeout)
+		defer cancel()
+		s.params = params
+		db, conn, err := s.plAllocation.open(ctx)
+		if err != nil {
+			return err
+		}
+		s.db, s.plConnection = db, conn
+		return nil
+	}
 	_ = s.disconnect()
 	db, err := openConfiguredSessionDB(params, 15*time.Second)
 	if err != nil {
@@ -1192,6 +1386,9 @@ func oracleServerMajorVersionFromDBConn(ctx context.Context, db *sql.DB) (int, b
 func oracleServerMajorVersionFromDriverConn(driverConn any) (int, bool) {
 	if guarded, ok := driverConn.(*oracleQueryConnection); ok {
 		driverConn = guarded.oracleThinConnection
+	}
+	if legacy, ok := driverConn.(*oracleLegacyConnection); ok {
+		driverConn = legacy.oracleThinConnection
 	}
 	conn, ok := driverConn.(*go_ora.Connection)
 	if !ok {
@@ -1296,9 +1493,23 @@ func withOracleLOBFetchPost(params connectParams) connectParams {
 }
 
 func (s *server) disconnect() error {
+	if s.plDebuggeeConnection != nil {
+		_ = s.plDebuggeeConnection.Close()
+		s.plDebuggeeConnection = nil
+	}
+	if s.plDebuggeeDB != nil {
+		_ = s.plDebuggeeDB.Close()
+		s.plDebuggeeDB = nil
+	}
+	s.plDebuggeeTx = nil
+	if s.plConnection != nil {
+		_ = s.plConnection.Close()
+		s.plConnection = nil
+	}
 	s.closeAllQuerySessions()
 	_ = s.rollbackManualTransactionQuiet()
 	jobErr := s.closeLegacyJob()
+	s.dbmsOutput.reset()
 	s.legacyLOBFetchDeferred = false
 	if s.db == nil {
 		return jobErr
@@ -1386,19 +1597,15 @@ func openDB(params connectParams) (*sql.DB, error) {
 
 func openDBWithStringConverter(params connectParams, stringConverter converters.IStringConverter) (*sql.DB, error) {
 	if usesOCIProfile(params) {
-		// OCI 由 Oracle 客户端负责字符集转换（NLS_LANG 在进程环境里生效），
-		// go-ora 的 string converter 机制不适用于它。
+		// godror uses UTF-8 explicitly; NLS_LANG does not override its data
+		// encoding. Legacy US7ASCII byte interpretation belongs to Thin.
 		return openOCIDB(params)
 	}
-	dsn, err := buildDSNForConnect(params)
+	connector, err := newOracleThinConnector(params, stringConverter)
 	if err != nil {
 		return nil, err
 	}
-	connector := go_ora.NewConnector(dsn)
-	if stringConverter != nil {
-		go_ora.SetStringConverter(connector, stringConverter, nil)
-	}
-	db := sql.OpenDB(oracleQueryConnector{connector})
+	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(30 * time.Minute)
@@ -1825,6 +2032,17 @@ func (s *server) currentSchema() (string, error) {
 	// tables against the wrong owner (#11258).
 	if s.manualTx != nil {
 		if err := s.manualTx.QueryRow(sqlText).Scan(&schema); err != nil {
+			return "", err
+		}
+		return strings.ToUpper(schema), nil
+	}
+	// The connection pinned for a statement's DBMS_OUTPUT capture carries the
+	// statement's CURRENT_SCHEMA the same way.
+	if s.statementConn != nil {
+		if err := s.repinPoisonedStatementConn(); err != nil {
+			return "", err
+		}
+		if err := s.statementConn.QueryRowContext(s.statementContext(), sqlText).Scan(&schema); err != nil {
 			return "", err
 		}
 		return strings.ToUpper(schema), nil
@@ -3770,6 +3988,7 @@ WHERE i.TABLE_OWNER = :1
       AND c.TABLE_NAME = :4
       AND c.CONSTRAINT_TYPE IN ('P', 'U')
       AND c.INDEX_NAME IS NOT NULL
+      AND c.INDEX_OWNER = i.OWNER
   )
 ORDER BY i.INDEX_NAME`
 
@@ -4381,28 +4600,36 @@ func (s *server) executeTransaction(params map[string]json.RawMessage) (queryRes
 	if err := decodeParams(params, &payload); err != nil {
 		return queryResult{}, err
 	}
-	db, err := s.requireDB()
+	var result queryResult
+	var err error
+	messages := s.withStatementDBMSOutput(strings.Join(payload.Statements, "\n"), func() error {
+		result, err = s.executeTransactionStatements(payload.Statements, payload.Schema)
+		return err
+	})
+	result.Messages = append(result.Messages, messages...)
+	return result, err
+}
+
+func (s *server) executeTransactionStatements(statements []string, schema string) (queryResult, error) {
+	ctx := s.statementContext()
+	tx, err := s.beginStatementTx(ctx)
 	if err != nil {
 		return queryResult{}, err
 	}
-	tx, err := db.Begin()
-	if err != nil {
-		return queryResult{}, err
-	}
-	if strings.TrimSpace(payload.Schema) != "" {
-		if _, err := tx.Exec("ALTER SESSION SET CURRENT_SCHEMA = " + quoteIdentifier(payload.Schema)); err != nil {
+	if strings.TrimSpace(schema) != "" {
+		if _, err := tx.ExecContext(ctx, "ALTER SESSION SET CURRENT_SCHEMA = "+quoteIdentifier(schema)); err != nil {
 			tx.Rollback()
 			return queryResult{}, err
 		}
 	}
 	var affected int64
 	start := time.Now()
-	for _, statement := range payload.Statements {
+	for _, statement := range statements {
 		statement = trimStatementSQL(statement)
 		if statement == "" {
 			continue
 		}
-		result, err := tx.Exec(statement)
+		result, err := tx.ExecContext(ctx, statement)
 		if err != nil {
 			tx.Rollback()
 			return queryResult{}, err
@@ -4422,6 +4649,24 @@ func (s *server) executeTransaction(params map[string]json.RawMessage) (queryRes
 }
 
 func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageResult, error) {
+	var result queryPageResult
+	var err error
+	conn, messages := s.withPagedStatementDBMSOutput(opts.SQL, func() error {
+		result, err = s.executeQueryPageWithoutOutput(opts, pageSize)
+		return err
+	})
+	result.Messages = append(result.Messages, messages...)
+	if conn != nil {
+		if err == nil && result.SessionID != nil {
+			s.sessions[*result.SessionID].conn = conn
+		} else {
+			_ = conn.Close()
+		}
+	}
+	return result, err
+}
+
+func (s *server) executeQueryPageWithoutOutput(opts queryOptions, pageSize int) (queryPageResult, error) {
 	start := time.Now()
 	if strings.TrimSpace(opts.Schema) != "" && !s.hasManualTransaction() {
 		if err := s.setSchema(opts.Schema); err != nil {
@@ -4464,12 +4709,18 @@ func (s *server) runPagedOracleSelect(sqlText string, opts queryOptions, pageSiz
 	// including panics while reading Columns/ColumnTypes before the first page.
 	var ownedRows *sql.Rows
 	defer func() { s.closeRows(ownedRows) }()
+	originalSQL := sqlText
 	for attempt := 0; ; attempt++ {
 		// Only the first page may be retried: once rows have been returned the
 		// caller owns them and a second execution would duplicate data.
 		retrySQL := func(err error) (string, bool) {
-			if attempt != 0 || s.hasManualTransaction() || oracleSQLLocksRows(sqlText) {
+			if attempt > 1 || s.hasManualTransaction() || oracleSQLLocksRows(originalSQL) {
 				return "", false
+			}
+			if attempt == 1 {
+				// The retry itself failed. When it was a value rewrite the
+				// server cannot run, project geometry as placeholders instead.
+				return oracleGeometryFunctionFallbackSQL(originalSQL, s.loadOracleColumnMeta, err)
 			}
 			return oraclePagedRetrySQL(sqlText, s.loadOracleColumnMeta, err)
 		}
@@ -4496,7 +4747,7 @@ func (s *server) runPagedOracleSelect(sqlText string, opts queryOptions, pageSiz
 		if maxRows <= 0 {
 			maxRows = defaultMaxRows
 		}
-		session := &querySession{rows: rows, columns: columns, columnTypes: columnTypes, remaining: maxRows}
+		session := &querySession{rows: rows, columns: columns, columnTypes: columnTypes, remaining: maxRows, outputIdentity: s.currentDBMSOutputIdentity()}
 		result, err := readQuerySessionPage(session, pageSize)
 		result.ExecutionTimeMS = time.Since(start).Milliseconds()
 		if err != nil {
@@ -4559,6 +4810,7 @@ func (s *server) fetchQueryPage(sessionID string, pageSize int) (queryPageResult
 	if session == nil {
 		return queryPageResult{Columns: []string{}, ColumnTypes: []string{}, Rows: [][]any{}, SessionID: nil, HasMore: false}, nil
 	}
+	s.dbmsOutput.markDirty(session.outputIdentity)
 	result, err := readQuerySessionPage(session, pageSize)
 	if err != nil {
 		s.closeQuerySession(sessionID)
@@ -4580,6 +4832,7 @@ func (s *server) storeQuerySession(session *querySession) string {
 }
 
 func (s *server) startTableRead(opts queryOptions, pageSize int) (queryPageResult, error) {
+	s.dbmsOutput.markDirty(s.currentDBMSOutputIdentity())
 	start := time.Now()
 	if strings.TrimSpace(opts.Schema) != "" && !s.hasManualTransaction() {
 		if err := s.setSchema(opts.Schema); err != nil {
@@ -4606,6 +4859,7 @@ func (s *server) fetchTableReadPage(sessionID string, pageSize int) (queryPageRe
 	if session == nil {
 		return queryPageResult{Columns: []string{}, ColumnTypes: []string{}, Rows: [][]any{}, SessionID: nil, HasMore: false}, nil
 	}
+	s.dbmsOutput.markDirty(session.outputIdentity)
 	result, err := readQuerySessionPage(session, pageSize)
 	if err != nil {
 		s.closeTableReadSession(sessionID)
@@ -4631,7 +4885,11 @@ func (s *server) closeQuerySession(sessionID string) bool {
 	if session == nil {
 		return false
 	}
+	s.dbmsOutput.markDirty(session.outputIdentity)
 	s.closeRows(session.rows)
+	if session.conn != nil {
+		_ = session.conn.Close()
+	}
 	delete(s.sessions, sessionID)
 	return true
 }
@@ -4641,6 +4899,7 @@ func (s *server) closeTableReadSession(sessionID string) bool {
 	if session == nil {
 		return false
 	}
+	s.dbmsOutput.markDirty(session.outputIdentity)
 	s.closeRows(session.rows)
 	delete(s.tableReadSessions, sessionID)
 	return true
@@ -4711,6 +4970,17 @@ func readQuerySessionPage(session *querySession, pageSize int) (result queryPage
 }
 
 func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
+	var result queryResult
+	var err error
+	messages := s.withStatementDBMSOutput(opts.SQL, func() error {
+		result, err = s.executeQueryWithoutOutput(opts)
+		return err
+	})
+	result.Messages = append(result.Messages, messages...)
+	return result, err
+}
+
+func (s *server) executeQueryWithoutOutput(opts queryOptions) (queryResult, error) {
 	start := time.Now()
 	if strings.TrimSpace(opts.Schema) != "" && !s.hasManualTransaction() {
 		if err := s.setSchema(opts.Schema); err != nil {
@@ -4730,7 +5000,7 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 	if _, err := s.requireDB(); err != nil {
 		return queryResult{}, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.statementContext())
 	var timer *time.Timer
 	if opts.TimeoutSecs > 0 {
 		var t *time.Timer
@@ -4769,6 +5039,9 @@ func (s *server) execContext(ctx context.Context, sqlText string) (sql.Result, e
 	if s.manualTx != nil {
 		return s.manualTx.ExecContext(ctx, sqlText)
 	}
+	if s.statementConn != nil {
+		return s.statementConn.ExecContext(ctx, sqlText)
+	}
 	db, err := s.requireDB()
 	if err != nil {
 		return nil, err
@@ -4783,13 +5056,22 @@ func (s *server) executeSelect(sqlText string, maxRows int, timeoutSecs int, def
 			return s.executeSelectOnce(query, maxRows, timeoutSecs, deferLOBs)
 		},
 		s.rewriteXMLTypeSelectSQL,
+		func(query string, err error) (string, bool) {
+			return oracleGeometryFunctionFallbackSQL(query, s.loadOracleColumnMeta, err)
+		},
 	)
 }
 
+// executeOracleSelectWithXMLTypeRetry retries a SELECT whose values could not
+// be decoded with the value rewrite. When the rewritten statement fails too,
+// fallback may supply one more statement for the original SQL (geometry
+// placeholders when the server cannot convert geometry); a nil fallback or a
+// failing fallback statement keeps the rewritten statement's error.
 func executeOracleSelectWithXMLTypeRetry(
 	sqlText string,
 	execute func(string) (queryResult, error),
 	rewrite func(string) (string, error),
+	fallback func(string, error) (string, bool),
 ) (queryResult, error) {
 	result, err := execute(sqlText)
 	if err == nil || !shouldRetryOracleXMLTypeRewrite(err) {
@@ -4799,12 +5081,27 @@ func executeOracleSelectWithXMLTypeRetry(
 	if rewriteErr != nil || rewritten == sqlText {
 		return result, err
 	}
-	return execute(rewritten)
+	result, err = execute(rewritten)
+	if err == nil || fallback == nil {
+		return result, err
+	}
+	placeholder, ok := fallback(sqlText, err)
+	if !ok {
+		return result, err
+	}
+	if placeholderResult, placeholderErr := execute(placeholder); placeholderErr == nil {
+		return placeholderResult, nil
+	}
+	return result, err
 }
 
 func shouldRetryOracleXMLTypeRewrite(err error) bool {
 	if err == nil {
 		return false
+	}
+	var decodeErr oracleProtocolDecodeError
+	if errors.As(err, &decodeErr) {
+		return true
 	}
 	message := err.Error()
 	return strings.Contains(message, "abnormal data representation for date") ||
@@ -4885,11 +5182,13 @@ func (s *server) queryRowsWithOracleValueRewriteIfNeeded(sqlText string, timeout
 	// A statement that keeps row locks while it runs is rewritten before the
 	// first attempt: when such a statement panics after the rows were locked,
 	// the locks stay behind and the retry below blocks on them until the query
-	// times out (issues #9344 / #9180).
-	if oracleSQLLocksRows(sqlText) {
+	// times out (issues #9344 / #9180). A manual transaction cannot retry at
+	// all: the panic leaves its session unusable and the transaction is rolled
+	// back (issue #13455).
+	if oracleSQLLocksRows(sqlText) || s.hasManualTransaction() {
 		rewritten, err := rewriteOracleSelectSQL(sqlText, s.loadOracleColumnMeta, deferLOBs)
 		if err == nil && rewritten != sqlText {
-			return s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
+			return s.queryOracleValueRewrite(sqlText, rewritten, timeoutSecs)
 		}
 		return s.queryRowsWithTimeout(sqlText, nil, timeoutSecs)
 	}
@@ -4916,20 +5215,7 @@ func (s *server) queryRowsWithOracleValueRewriteIfNeeded(sqlText string, timeout
 		if !s.hasManualTransaction() && errors.As(err, &panicErr) {
 			rewritten, rewriteErr := rewriteOracleSelectSQL(sqlText, s.loadOracleColumnMeta, false)
 			if rewriteErr == nil && rewritten != sqlText {
-				rewrittenRows, rewrittenErr := s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
-				if rewrittenErr == nil {
-					return rewrittenRows, nil
-				}
-				// When the server's ArcSDE extproc agent is broken, the
-				// SDE.ST_AsText rewrite itself fails with ORA-28595 and would
-				// hide the remaining columns; retry once with the placeholder
-				// projection so the query stays readable.
-				if placeholder, ok := oracleExtprocFallbackSQL(sqlText, s.loadOracleColumnMeta, rewrittenErr); ok {
-					if placeholderRows, placeholderErr := s.queryRowsWithTimeout(placeholder, nil, timeoutSecs); placeholderErr == nil {
-						return placeholderRows, nil
-					}
-				}
-				return nil, rewrittenErr
+				return s.queryOracleValueRewrite(sqlText, rewritten, timeoutSecs)
 			}
 		}
 		return nil, err
@@ -4956,7 +5242,7 @@ func (s *server) queryRowsWithOracleValueRewriteIfNeeded(sqlText string, timeout
 	// XMLTYPE keeps its metadata-triggered fallback so ordinary non-preview
 	// queries do not run dictionary probes.
 	s.closeRows(rows)
-	return s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
+	return s.queryOracleValueRewrite(sqlText, rewritten, timeoutSecs)
 }
 
 func oracleColumnTypeNamesContainXMLType(typeNames []string) bool {
@@ -4981,19 +5267,77 @@ func isOracleExtprocAgentFailure(err error) bool {
 	return strings.Contains(strings.ToUpper(err.Error()), "28595")
 }
 
-// oracleExtprocFallbackSQL returns the placeholder projection to retry with
-// when the panic-fallback SDE.ST_AsText rewrite failed because of a broken
-// extproc agent (ORA-28595). It reports false when the error is unrelated or
-// no placeholder rewrite applies.
-func oracleExtprocFallbackSQL(sqlText string, loadColumns oracleColumnMetaLoader, rewriteErr error) (string, bool) {
-	if !isOracleExtprocAgentFailure(rewriteErr) {
+// isOracleSpatialUnavailable reports whether err shows that the server cannot
+// run Oracle Spatial code, so SDO_UTIL.TO_WKTGEOMETRY fails for every value.
+// A missing or invalid MDSYS.SDO_GEOMETRY type body is reported as ORA-04067
+// with ORA-06508 (issue #13827). Matching stays deliberately narrow: one of
+// those ORA codes must appear together with an MDSYS.SDO_ unit name, so an
+// ORA-13xxx error about a single geometry does not match.
+func isOracleSpatialUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToUpper(err.Error())
+	if !strings.Contains(message, "MDSYS.SDO_") {
+		return false
+	}
+	return strings.Contains(message, "ORA-04067") || strings.Contains(message, "ORA-06508")
+}
+
+// isOracleGeometryFunctionFailure reports whether a value-rewritten statement
+// failed because the server cannot run the geometry conversion it calls:
+// SDE.ST_AsText behind a broken extproc agent, or SDO_UTIL.TO_WKTGEOMETRY
+// without a usable Oracle Spatial installation.
+func isOracleGeometryFunctionFailure(err error) bool {
+	return isOracleExtprocAgentFailure(err) || isOracleSpatialUnavailable(err)
+}
+
+// oracleGeometryFunctionFallbackSQL returns the statement to retry with when
+// the value rewrite of sqlText failed because the server cannot convert its
+// geometry columns. It keeps the value rewrite for the other columns and
+// projects geometry columns as placeholders, so the rest of the row stays
+// readable. It reports false when the error is unrelated or no rewrite applies.
+func oracleGeometryFunctionFallbackSQL(sqlText string, loadColumns oracleColumnMetaLoader, rewriteErr error) (string, bool) {
+	if !isOracleGeometryFunctionFailure(rewriteErr) {
 		return "", false
 	}
-	placeholder, err := rewriteOracleSelectSQL(sqlText, loadColumns, true)
+	placeholder, err := rewriteOracleSelectSQL(sqlText, oracleGeometryPlaceholderLoader(loadColumns), false)
 	if err != nil || placeholder == sqlText {
 		return "", false
 	}
 	return placeholder, true
+}
+
+func oracleGeometryPlaceholderLoader(loadColumns oracleColumnMetaLoader) oracleColumnMetaLoader {
+	return func(schema, table string) ([]oracleColumnMeta, error) {
+		columns, err := loadColumns(schema, table)
+		if err != nil {
+			return nil, err
+		}
+		marked := make([]oracleColumnMeta, len(columns))
+		for i, column := range columns {
+			column.GeometryPlaceholder = isOracleGeometryType(column)
+			marked[i] = column
+		}
+		return marked, nil
+	}
+}
+
+// queryOracleValueRewrite runs rewrittenSQL, the value rewrite of originalSQL.
+// When the server cannot run the rewrite's geometry conversion, it retries
+// once with geometry placeholders; otherwise it returns the rewritten
+// statement's error.
+func (s *server) queryOracleValueRewrite(originalSQL, rewrittenSQL string, timeoutSecs int) (*sql.Rows, error) {
+	rows, err := s.queryRowsWithTimeout(rewrittenSQL, nil, timeoutSecs)
+	if err == nil {
+		return rows, nil
+	}
+	if placeholder, ok := oracleGeometryFunctionFallbackSQL(originalSQL, s.loadOracleColumnMeta, err); ok {
+		if placeholderRows, placeholderErr := s.queryRowsWithTimeout(placeholder, nil, timeoutSecs); placeholderErr == nil {
+			return placeholderRows, nil
+		}
+	}
+	return nil, err
 }
 
 func (s *server) rewriteXMLTypeSelectSQL(sqlText string) (string, error) {
@@ -5397,6 +5741,9 @@ func oracleSDOGeometryExpression(columnRef, alias string) string {
 }
 
 func oracleGeometryExpression(column oracleColumnMeta, columnRef, alias string) string {
+	if column.GeometryPlaceholder {
+		return fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE '%s' END AS %s", columnRef, oracleGeometryPlaceholder(column), alias)
+	}
 	if isOracleSDOGeometry(column) {
 		return oracleSDOGeometryExpression(columnRef, alias)
 	}
@@ -5881,12 +6228,59 @@ func (s *server) setSchema(schema string) error {
 		_, err := s.manualConn.ExecContext(context.Background(), sqlText)
 		return err
 	}
+	if s.statementConn != nil {
+		_, err := s.statementConn.ExecContext(s.statementContext(), sqlText)
+		if err == nil {
+			s.statementSchema = schema
+		}
+		return err
+	}
 	db, err := s.requireDB()
 	if err != nil {
 		return err
 	}
 	_, err = db.Exec(sqlText)
 	return err
+}
+
+// repinPoisonedStatementConn replaces the statement's pinned connection once a
+// driver panic or a response decode error has poisoned it, so the fallbacks of
+// the same statement do not fail on the dead session (issues #13455, #13667).
+// The fresh connection gets the statement's CURRENT_SCHEMA back; the
+// statement's owner closes it together with the original one.
+func (s *server) repinPoisonedStatementConn() error {
+	if s.manualTx != nil || s.statementConn == nil || !oracleConnPoisoned(s.statementConn) {
+		return nil
+	}
+	db, err := s.requireDB()
+	if err != nil {
+		return err
+	}
+	conn, err := db.Conn(s.statementContext())
+	if err != nil {
+		return err
+	}
+	if s.statementSchema != "" {
+		if _, err := conn.ExecContext(s.statementContext(), "ALTER SESSION SET CURRENT_SCHEMA = "+quoteIdentifier(s.statementSchema)); err != nil {
+			_ = conn.Close()
+			return err
+		}
+	}
+	if s.repinnedStatementConn != nil {
+		_ = s.repinnedStatementConn.Close()
+	}
+	s.repinnedStatementConn = conn
+	s.statementConn = conn
+	return nil
+}
+
+// takeRepinnedStatementConn hands a connection opened by
+// repinPoisonedStatementConn to the statement's owner.
+func (s *server) takeRepinnedStatementConn() *sql.Conn {
+	conn := s.repinnedStatementConn
+	s.repinnedStatementConn = nil
+	s.statementSchema = ""
+	return conn
 }
 
 func (s *server) queryRows(sqlText string, args []any) (*sql.Rows, error) {
@@ -5897,7 +6291,10 @@ func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs in
 	if _, err := s.requireDB(); err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	if err := s.repinPoisonedStatementConn(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(s.statementContext())
 	var timer *time.Timer
 	if timeoutSecs > 0 {
 		var t *time.Timer
@@ -5939,6 +6336,8 @@ func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs in
 	}()
 	if s.manualTx != nil {
 		rows, queryErr = s.manualTx.QueryContext(ctx, sqlText, args...)
+	} else if s.statementConn != nil {
+		rows, queryErr = s.statementConn.QueryContext(ctx, sqlText, args...)
 	} else {
 		db, err := s.requireDB()
 		if err != nil {
@@ -5972,6 +6371,9 @@ func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs in
 func (s *server) cancelActiveQuery() {
 	s.activeCancelMu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(s.activeRows)+1)
+	if s.statementCancel != nil {
+		cancels = append(cancels, s.statementCancel)
+	}
 	if s.activeCancel != nil {
 		cancels = append(cancels, s.activeCancel)
 	}

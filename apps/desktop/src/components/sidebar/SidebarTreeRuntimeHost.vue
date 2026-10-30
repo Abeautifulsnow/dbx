@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useTableCopyTaskStore } from "@/stores/tableCopyTaskStore";
 import { uuid } from "@/lib/common/utils";
 import { computed, defineAsyncComponent, nextTick, watch, onBeforeUnmount, onScopeDispose, inject, reactive, ref, shallowRef } from "vue";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -11,10 +12,14 @@ import { useSidebarConnectionMutationRuntime } from "@/composables/useSidebarCon
 import { useSidebarDatabaseSpecificMutationRuntime } from "@/composables/useSidebarDatabaseSpecificMutationRuntime";
 import { useSidebarTableMutationRuntime } from "@/composables/useSidebarTableMutationRuntime";
 import { useSidebarTreeExportRuntime } from "@/composables/useSidebarTreeExportRuntime";
+import { mysqlDataCharsetEnabled } from "@/lib/connection/mysqlDataCharset";
 import { useSidebarTreeToolRuntime } from "@/composables/useSidebarTreeToolRuntime";
 import { canDropDatabaseNode, notifyDatabaseBrowserMutation } from "@/lib/database/databaseBrowserActions";
+import { dropDatabaseOtherSessionCount } from "@/lib/database/dropDatabaseError";
 import { canDropDatabaseTables, canEmptyDatabaseTables, useDatabaseTableEmpty } from "@/composables/useDatabaseTableEmpty";
 import { useI18n } from "vue-i18n";
+import { launchPlDebug, openPlDebugRecovery } from "@/components/debug/plDebugLaunch";
+import { supportsPlDebugRoutine } from "@/lib/database/databaseFeatureSupport";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { normalizeBackendError } from "@/lib/backend/errorUtils";
 import { isConnectionTimeoutErrorMessage } from "@/lib/sql/queryError";
@@ -97,7 +102,7 @@ import type { ElasticsearchIndexMetadataKind } from "@/lib/backend/tauri";
 import { queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { connectionUsesVisibleSchemaFilter } from "@/lib/database/visibleDatabases";
-import { canTreeNodePin, canTreeNodeShowExpander } from "@/lib/sidebar/sidebarTreeItemLayout";
+import { canTreeNodeExpand, canTreeNodePin, canTreeNodeShowExpander } from "@/lib/sidebar/sidebarTreeItemLayout";
 import { sidebarConnectionVisibleFilterMenu } from "@/lib/sidebar/sidebarVisibleFilterMenu";
 import { supportsSidebarObjectNameFilter } from "@/lib/sidebar/sidebarObjectNameFilter";
 import { connectionGroupDestinationRows } from "@/lib/sidebar/sidebarLayout";
@@ -286,7 +291,7 @@ import { buildXuguCompileSql } from "@/lib/database/xuguCompileSql";
 import { buildDamengCompileViewSql } from "@/lib/database/damengCompileSql";
 import { buildTriggerToggleSql, supportsTriggerToggle } from "@/lib/database/triggerToggleSql";
 import type { SidebarDataOpenRequest } from "@/lib/sidebar/sidebarDataOpenCoordinator";
-import { createSidebarActionRequest, createSidebarActionTarget, findSidebarActionTarget, releaseRemovedSidebarActionTarget, type SidebarActionRequest, type SidebarActionTarget } from "@/lib/sidebar/sidebarActionTarget";
+import { createSidebarActionRequest, createSidebarActionTarget, findSidebarActionTarget, matchesSidebarActionTarget, releaseRemovedSidebarActionTarget, type SidebarActionRequest, type SidebarActionTarget } from "@/lib/sidebar/sidebarActionTarget";
 import { collapseSubtreeDescendants } from "@/lib/sidebar/sidebarTreeCollapse";
 import { createSidebarMenuContext, normalizeSidebarMenuDescriptors } from "@/lib/sidebar/sidebarTreeMenuDescriptors";
 import { driverProfileDatabaseWorkspace } from "@/lib/database/driverProfileExtensions";
@@ -952,12 +957,17 @@ async function toggle(requestId = beginNavigationRequest()) {
   emit("search-toggle", node);
   const wasExpanded = !!node.isExpanded;
 
-  // A search result is a projection over children that are already loaded for
-  // the query. Expanding a collapsed result must only remove it from the
-  // projection's collapsed set; entering the normal load path here can replace
-  // the live subtree with the filtered projection and leave the sidebar blank.
-  if (!wasExpanded && node.children?.length && sidebarTreeContext?.isSearchProjectionActive?.()) {
-    return;
+  // Skip loading only when removing the collapsed marker actually expanded
+  // the projection. Descendants of a matching connection retain their live
+  // expansion state and still need the normal lazy-load path. A saved-SQL
+  // shortcut alone also does not mean a database's objects have been loaded.
+  if (!wasExpanded && node.children?.some((child) => child.type !== "saved-sql-root") && sidebarTreeContext?.isSearchProjectionActive?.()) {
+    const visible = sidebarTreeContext.getVisibleNodes();
+    const index = sidebarTreeContext.getVisibleNodeIndex(node.id);
+    const indexed = visible[index];
+    // Database names containing ':' can share an id with a schema in another database.
+    const projected = indexed && matchesSidebarActionTarget(indexed, node) ? indexed : visible.find((candidate) => matchesSidebarActionTarget(candidate, node));
+    if (projected?.isExpanded) return;
   }
 
   if (node.type === "connection-group") {
@@ -1142,6 +1152,9 @@ async function toggle(requestId = beginNavigationRequest()) {
       } else {
         await connectionStore.loadDatabases(node.connectionId, treeLoadSearchOptions);
       }
+      node.isExpanded = true;
+      const liveNode = findSidebarActionTarget(connectionStore.treeNodes, createSidebarActionTarget(node));
+      if (liveNode) liveNode.isExpanded = true;
     } else if (node.type === "redis-db" && node.connectionId && node.database) {
       await connectionStore.ensureConnected(node.connectionId);
       const alias = connectionStore.getRedisDatabaseAlias(node.connectionId, node.database);
@@ -2830,6 +2843,7 @@ const CONNECTION_URL_COPY_LABEL_KEYS: Record<ConnectionUrlCopyFormat, string> = 
   dsn: "contextMenu.copyDsn",
   dsnWithPassword: "contextMenu.copyDsnWithPassword",
   psqlCommand: "contextMenu.copyPsqlCommand",
+  password: "contextMenu.copyPasswordText",
 };
 
 /**
@@ -5576,7 +5590,11 @@ async function createDuckDbAttachedDatabaseFile() {
     }
     await connectionStore.ensureVisibleDatabase(node.connectionId, name);
     await connectionStore.loadDatabases(node.connectionId, { force: true });
-    connectionStore.selectedTreeNodeId = `${node.connectionId}:${name}`;
+    const nodeId = `${node.connectionId}:${name}`;
+    connectionStore.connectionMultiSelectActive = false;
+    connectionStore.selectedTreeNodeId = nodeId;
+    connectionStore.selectedTreeNodeIds = [nodeId];
+    connectionStore.treeSelectionAnchorId = nodeId;
     toast(t("contextMenu.createDuckDbFileSuccess", { name }), 3000);
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
@@ -5621,7 +5639,11 @@ async function attachSqliteDatabaseFile() {
     }
     await connectionStore.ensureVisibleDatabase(node.connectionId, name);
     await connectionStore.loadDatabases(node.connectionId, { force: true });
-    connectionStore.selectedTreeNodeId = `${node.connectionId}:${name}`;
+    const nodeId = `${node.connectionId}:${name}`;
+    connectionStore.connectionMultiSelectActive = false;
+    connectionStore.selectedTreeNodeId = nodeId;
+    connectionStore.selectedTreeNodeIds = [nodeId];
+    connectionStore.treeSelectionAnchorId = nodeId;
     toast(t("contextMenu.attachSqliteDatabaseSuccess", { name }), 3000);
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
@@ -5805,7 +5827,10 @@ async function confirmDropDatabase() {
     notifyDatabaseBrowserMutation({ connectionId, database: node.database || node.label, operation: "drop-database" });
     queryStore.closeDatabaseTabs(connectionId, node.database || node.label);
   } catch (e: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+    const message = e?.message || String(e);
+    const otherSessions = dropDatabaseOtherSessionCount(message);
+    if (otherSessions === undefined) toast(t("contextMenu.tableOperationFailed", { message }), 5000);
+    else toast(otherSessions === null ? t("contextMenu.dropDatabaseInUse", { name: node.label }) : t("contextMenu.dropDatabaseInUseSessions", { name: node.label, count: otherSessions }), 5000);
   } finally {
     dropDatabaseLoading.value = false;
   }
@@ -5978,6 +6003,12 @@ async function confirmPasteTableImpl() {
   const mode = pasteTableMode.value;
   const copyData = pasteTableModeCopiesData(mode) && pasteTableDataCopySupported.value;
   showPasteDialog.value = false;
+  if (entries.every((entry) => entry.databaseType === "mysql")) {
+    const copies = entries.map((entry) => ({ ...entry, connection: { ...connectionStore.getConfig(entry.connectionId)! } }));
+    const completed = await useTableCopyTaskStore().run(copies, mode);
+    if (completed && shouldConsumeTableClipboard && connectionStore.treeClipboard === clipboardAtPasteStart) connectionStore.treeClipboard = null;
+    return;
+  }
   let successCount = 0;
   let pasteFailCount = 0;
   let firstPasteError: unknown;
@@ -7125,6 +7156,7 @@ function addToAiMenuItem(node: TreeNode): ContextMenuItem {
 }
 
 function exportDataSubmenu(includeSqlInsert = true): ContextMenuItem {
+  if (sidebarTableDataExportTargets(activeNode.value, connectionStore.treeNodes, acceptedSelectionIds ?? connectionStore.selectedTreeNodeIds).some((target) => mysqlDataCharsetEnabled(connectionStore.getConfig(target.connectionId ?? "")))) includeSqlInsert = false;
   const count = selectedDataExportTargetCount();
   const children: ContextMenuItem[] = [
     { label: "CSV", action: () => exportData("csv") },
@@ -7258,6 +7290,9 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
       }
     } else if (!isConnected.value) {
       items.push({ sidebarActionId: "contextMenu.openConnection", label: t("contextMenu.openConnection"), action: toggle, icon: Plug });
+    }
+    if (node.connectionId && supportsPlDebugRoutine(currentDatabaseType())) {
+      items.push({ sidebarActionId: "plDebug.recovery", label: t("plDebug.recovery.title"), action: () => openPlDebugRecovery(node.connectionId!), icon: RefreshCw });
     }
     items.push({ label: "", separator: true });
     items.push({ sidebarActionId: "contextMenu.copyName", label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
@@ -7592,7 +7627,8 @@ function buildDatabaseSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (canCreateTable.value) {
       items.push({ sidebarActionId: "contextMenu.createTable", label: t("contextMenu.createTable"), action: createTable, icon: Plus });
     }
-    if (canCreateTable.value && isTableVGroupContainerNode(node) && !node.children?.some(isGroupLabel)) {
+    const isSimpleDisplay = settingsStore.editorSettings.sidebarObjectDisplay === "simple";
+    if (canCreateTable.value && isSimpleDisplay && isTableVGroupContainerNode(node) && !node.children?.some(isGroupLabel)) {
       items.push({
         sidebarActionId: "contextMenu.createGroup",
         label: t("connectionGroup.createGroup"),
@@ -8295,6 +8331,25 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   // 8. Procedure / Function / Package
   if (node.type === "procedure" || node.type === "function") {
     const isPackageMember = node.parentType === "package" && !!node.parentName;
+    if (node.connectionId && node.database && supportsPlDebugRoutine(currentDatabaseType())) {
+      const target = {
+        connectionId: node.connectionId,
+        database: node.database,
+        databaseType: currentDatabaseType(),
+        schema: node.schema,
+        objectType: node.type === "procedure" ? "PROCEDURE" : "FUNCTION",
+        objectName: node.objectName || node.label,
+        packageName: isPackageMember ? node.parentName : undefined,
+        valid: node.valid,
+      };
+      items.push({
+        label: t("plDebug.start.title"),
+        action: () => {
+          void launchPlDebug(target);
+        },
+        icon: Play,
+      });
+    }
     if (node.type === "procedure" && !isPackageMember) {
       items.push({ label: t("contextMenu.executeProcedure"), action: openProcedureExecution, icon: Play });
     }
@@ -8836,6 +8891,10 @@ function emitNodeToggled(node: TreeNode, wasExpanded: boolean, expandedOverride?
   const liveNode = findSidebarActionTarget(connectionStore.treeNodes, createSidebarActionTarget(node)) ?? node;
   activeNode.value = liveNode;
   const isExpanded = expandedOverride ?? !wasExpanded;
+  if (canTreeNodeExpand(node.type)) {
+    node.isExpanded = isExpanded;
+    liveNode.isExpanded = isExpanded;
+  }
   if (!isExpanded) {
     collapseSubtreeDescendants(node);
     if (liveNode !== node) {

@@ -205,6 +205,7 @@ import { filterNacosNamespacesForSidebar, normalizeNacosNamespacesForDisplay } f
 import { buildPackageMemberNodes, markPackageNodesExpandable, packageMemberGroupOwnerId } from "@/lib/sidebar/packageMembers";
 import { configuredDatabaseProductName, connectionConfigFingerprint, normalizeDatabaseConnectionInfo } from "@/lib/connection/connectionDatabaseInfo";
 import { withoutSshLocalPorts } from "@/lib/connection/sshLocalPort";
+import { mysqlDataCharsetChanged, mysqlDataCharsetChangeBlocked } from "@/lib/connection/mysqlDataCharset";
 import { driverProfileObjectTreeProfileForConnection } from "@/lib/database/driverProfileExtensions";
 import { createMetadataLoadTrace, logMetadataLoadTrace, MetadataLoadCoordinator, type MetadataLoadTraceLogger } from "@/lib/metadata/metadataLoadCoordinator";
 import type { MetadataScopeInput } from "@/lib/metadata/metadataLoadScope";
@@ -238,6 +239,15 @@ const CONNECTION_HEALTH_CHECK_TIMEOUT_MS = 5000;
 const CONNECTION_PREWARM_TTL_MS = 30_000;
 const DISCONNECT_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_KEEPALIVE_INTERVAL_SECS = 30;
+/**
+ * 被动重连退避/熔断（只作用于显式标了 `passive: true` 的后台路径，用户操作永远不拦）。
+ * 企业零信任/安全接入客户端会为每一次到受保护数据库的**新建连接**做一次授权检查，
+ * 失败时弹一个原生「警告」框——所以一次故障若被面板轮询、自动刷新、页签恢复反复重连，
+ * 用户看到的就是满屏弹框。这里把「失败后的被动重连」逐级收敛：第 1 次失败后 15s、
+ * 第 2 次 60s、第 3 次 5min 内不再发起 connectDb；第 4 次起**完全停止被动重连**，
+ * 直到任意一次成功连接（含用户手动连接）清空退避。
+ */
+const AUTOMATIC_RECONNECT_BACKOFF_MS = [15_000, 60_000, 300_000] as const;
 const METADATA_LIST_PAGE_CACHE_TTL_MS = 30_000;
 const METADATA_LIST_PAGE_CACHE_MAX_ENTRIES = 160;
 const SIDEBAR_DATABASE_STORAGE_CACHE_TTL_MS = 30_000;
@@ -334,7 +344,7 @@ function isFlatMqConnection(config: ConnectionConfig | undefined): boolean {
   return kind === "kafka" || kind === "rocketmq" || kind === "rabbitmq";
 }
 
-type ImportSource = "dbx" | "navicat" | "dbeaver" | "datagrip" | "rdm";
+type ImportSource = "dbx" | "navicat" | "dbeaver" | "datagrip" | "rdm" | "another-redis";
 
 interface LocateTableTarget {
   catalog?: string;
@@ -641,6 +651,7 @@ export const useConnectionStore = defineStore("connection", () => {
     connectionId: string;
     database: string;
     schema?: string;
+    catalog?: string;
     tableName?: string;
     tableNames?: string[];
   } | null>(null);
@@ -730,6 +741,11 @@ export const useConnectionStore = defineStore("connection", () => {
     console.debug("[DBX][metadata-load:trace]", event);
   };
   const connectInFlight = new Map<string, Promise<void>>();
+  // 自动重连冷却：连接 id -> 冷却截止时间（Unix 毫秒）与最近一次失败。
+  // 只拦「自动/被动」重连；connect() 与 forceReconnect 会清掉它。
+  const automaticReconnectBlockedUntil = new Map<string, number>();
+  const automaticReconnectBlockedError = new Map<string, unknown>();
+  const automaticReconnectFailureCount = new Map<string, number>();
   const disconnectInFlight = new Map<string, Promise<void>>();
   const credentialCloseInFlight = new Map<string, Promise<void>>();
   const disconnectInFlightScoped = new Map<string, boolean>();
@@ -1613,6 +1629,34 @@ export const useConnectionStore = defineStore("connection", () => {
     return message;
   }
 
+  /** 自动重连退避中？（只用于非用户显式触发的重连，见 ensureConnected） */
+  function automaticReconnectCooldownRemainingMs(connectionId: string): number {
+    return Math.max(0, (automaticReconnectBlockedUntil.get(connectionId) ?? 0) - Date.now());
+  }
+
+  function clearAutomaticReconnectCooldown(connectionId: string) {
+    automaticReconnectBlockedUntil.delete(connectionId);
+    automaticReconnectBlockedError.delete(connectionId);
+    automaticReconnectFailureCount.delete(connectionId);
+  }
+
+  function noteAutomaticReconnectFailure(connectionId: string, error: unknown) {
+    const failures = (automaticReconnectFailureCount.get(connectionId) ?? 0) + 1;
+    automaticReconnectFailureCount.set(connectionId, failures);
+    automaticReconnectBlockedError.set(connectionId, error);
+    if (failures > AUTOMATIC_RECONNECT_BACKOFF_MS.length) {
+      // 连续多次失败：停止自动重连，等用户显式重试（避免第三方安全客户端被无限触发）。
+      automaticReconnectBlockedUntil.set(connectionId, Number.POSITIVE_INFINITY);
+      return;
+    }
+    automaticReconnectBlockedUntil.set(connectionId, Date.now() + AUTOMATIC_RECONNECT_BACKOFF_MS[failures - 1]);
+  }
+
+  function automaticReconnectCooldownError(connectionId: string): Error {
+    const lastError = automaticReconnectBlockedError.get(connectionId);
+    return lastError instanceof Error ? lastError : new Error(connectionErrorMessage(lastError));
+  }
+
   function markConnectionLost(connectionId: string, error: unknown) {
     connectedIds.value.delete(connectionId);
     clearEtcdAccessCapabilities(connectionId);
@@ -2184,6 +2228,8 @@ export const useConnectionStore = defineStore("connection", () => {
       if (vgroupResolved) {
         children = applyTableVGroupsToChildren(children, tableVGroupLayouts.value[vgroupResolved.scopeKey], vgroupResolved.scope);
       }
+    } else if (children.some((child) => child.type === "group-tables" || isTreeGroupNodeType(child.type))) {
+      children = stripTableVGroupsFromChildren(children);
     }
     parent.children = markRawLeafTreeNodes(children);
     loadedTreeNodeChildrenIds.value.add(parent.id);
@@ -2387,7 +2433,7 @@ export const useConnectionStore = defineStore("connection", () => {
     const damengRoleNode = buildDamengRoleNode(connectionId, existingConnectionNode);
     const damengJobAdminNode = buildDamengJobAdminNode(connectionId, existingConnectionNode);
     const xuguTablespacesNode = buildXuguTablespacesNode(connectionId, existingConnectionNode);
-    return [...nonUtilityChildren, buildOracleDatabaseLinksNode(connectionId, existingConnectionNode), userAdminNode, xuguUserAdminNode, damengUserNode, damengRoleNode, damengJobAdminNode, buildDatabaseJobAdminNode(connectionId), xuguTablespacesNode].filter(Boolean) as TreeNode[];
+    return [...nonUtilityChildren, buildOracleDatabaseLinksNode(connectionId, existingConnectionNode), buildDatabaseJobAdminNode(connectionId), userAdminNode, xuguUserAdminNode, damengUserNode, damengRoleNode, damengJobAdminNode, xuguTablespacesNode].filter(Boolean) as TreeNode[];
   }
 
   function withSavedSqlRoot(connectionId: string, children: TreeNode[], existingConnectionNode?: TreeNode): TreeNode[] {
@@ -3975,10 +4021,23 @@ export const useConnectionStore = defineStore("connection", () => {
     const querySchema = connectionObjectTreeQuerySchema(config, parent.database, parent.schema);
     const objectTypes = sidebarIndexedObjectGroupTypes.has(parent.type) ? (objectTypesForGroupNode(parent.type) ?? undefined) : undefined;
     const pageSize = sidebarObjectGroupPageSize();
+    // 搜索索引必须与连接的表过滤器保持一致：用户右键设置的过滤条件在正常加载路径
+    // 由服务端（SQL LIKE）执行，索引若不带同一过滤器，过滤掉的表就会在搜索时重新出现。
+    // scope 的各字段与保存过滤器的 tableNameFilterScopeForNode 使用同一节点，键必须一致。
+    const tableNameFilter = effectiveTableNameFilterForNode(
+      parent,
+      activeTableNameFilterForScope({
+        connectionId,
+        database: parent.database,
+        schema: parent.schema,
+        nodeKind: parent.type,
+        catalog: parent.catalog,
+      }),
+    );
     const entries: TableInfo[] = [];
     for (let offset = 0; ; offset += pageSize) {
       if (!sidebarTableSearchIndexGenerationIsCurrent(connectionId, cacheKey, connectionGeneration, scopeGeneration)) return [];
-      const page = await listTablesWithOptionalTableNameFilter(connectionId, parent.database, querySchema, undefined, pageSize, offset, objectTypes, parent.catalog);
+      const page = await listTablesWithOptionalTableNameFilter(connectionId, parent.database, querySchema, undefined, pageSize, offset, objectTypes, parent.catalog, tableNameFilter);
       entries.push(...page);
       if (page.length < pageSize) break;
     }
@@ -4635,6 +4694,14 @@ export const useConnectionStore = defineStore("connection", () => {
     // Edit forms do not own server-derived hints. Retain the previous hint only
     // while its protected URL still refers to the same saved JDBC target.
     config = { ...config, jdbc_dialect: keepsSavedJdbcTarget ? previousConfig.jdbc_dialect : undefined };
+    if (mysqlDataCharsetChanged(previousConfig, config)) {
+      const { useQueryStore } = await import("@/stores/queryStore");
+      if (mysqlDataCharsetChangeBlocked(useQueryStore().tabs, config.id)) throw new Error(i18n.global.t("connection.mysqlDataCharsetCloseTabs"));
+      // Retire the old decoding session before publishing a potentially writable
+      // config. Preserve SQL drafts and do not silently discard grid edits.
+      await disconnect(config.id, { skipTabHandling: true, markClosedByUser: false });
+      if (mysqlDataCharsetChangeBlocked(useQueryStore().tabs, config.id)) throw new Error(i18n.global.t("connection.mysqlDataCharsetCloseTabs"));
+    }
     const previousDatabase = previousConfig.database ?? "";
     const runtimeConfigChanged = connectionConfigFingerprint(previousConfig) !== connectionConfigFingerprint(config);
     const shouldReconnectPlugin = runtimeConfigChanged && previousConfig.db_type === "plugin" && config.db_type === "plugin" && connectedIds.value.has(config.id);
@@ -5195,6 +5262,8 @@ export const useConnectionStore = defineStore("connection", () => {
     const expectedConfigFingerprint = connectionConfigFingerprint(getConfig(config.id) ?? config);
     if (getBlockingDisconnectInFlight(config.id)) await waitForBlockingDisconnectInFlight(config.id);
     if (passwordChangeReconnectRequired.get(config.id) !== passwordChangeState) throw new Error(i18n.global.t("userAdmin.passwordChangedReconnect"));
+    // 用户显式连接：清掉自动重连冷却，保证“点连接/重试”永远真的会再试一次。
+    clearAutomaticReconnectCooldown(config.id);
     const localAttempt = beginLocalConnectionAttempt(config.id);
     const metadataRevision = connectionStateRevision(config.id);
     try {
@@ -5246,6 +5315,8 @@ export const useConnectionStore = defineStore("connection", () => {
       markConnectionHealthChecked(id);
       clearConnectionError(config.id);
       if (id !== config.id) clearConnectionError(id);
+      clearAutomaticReconnectCooldown(config.id);
+      if (id !== config.id) clearAutomaticReconnectCooldown(id);
 
       const existing = findConnectionNode(id);
       if (existing) {
@@ -5620,7 +5691,7 @@ export const useConnectionStore = defineStore("connection", () => {
    * `CONNECTION_CLOSED_BY_USER_MESSAGE`，让调用方停在"连接已关闭"的空态，而不是把连接
    * 偷偷连回来（这是"关闭连接后连接又自己回来"这类报告的根因）。
    */
-  async function ensureConnected(connectionId: string, options: { activate?: boolean; verifyHealth?: boolean; forceReconnect?: boolean; allowPasswordPrompt?: boolean; skipIfClosedByUser?: boolean } = {}) {
+  async function ensureConnected(connectionId: string, options: { activate?: boolean; verifyHealth?: boolean; forceReconnect?: boolean; allowPasswordPrompt?: boolean; skipIfClosedByUser?: boolean; passive?: boolean } = {}) {
     if (options.skipIfClosedByUser && isConnectionClosedByUser(connectionId)) throw new Error(CONNECTION_CLOSED_BY_USER_MESSAGE);
     if (passwordChangeReconnectRequired.has(connectionId)) throw new Error(i18n.global.t("userAdmin.passwordChangedReconnect"));
     if (!options.forceReconnect && connectedIds.value.has(connectionId)) {
@@ -5672,6 +5743,13 @@ export const useConnectionStore = defineStore("connection", () => {
       await existingConnect;
       if (options.activate !== false) activeConnectionId.value = connectionId;
       return;
+    }
+    // 被动重连退避：故障后后台路径（面板轮询/自动刷新/页签恢复，调用方显式传 passive）
+    // 在窗口内不再发起新的 connectDb。用户手动点击/显式重试永远不经过这里，不会被拦。
+    // 第三方安全/零信任客户端会为每次新连接做一次授权检查并弹原生框，这一步把
+    // “每个后台 tick 重连一次”收敛成少量失败，而不是一屏弹框。
+    if (options.passive && !options.forceReconnect && automaticReconnectCooldownRemainingMs(connectionId) > 0) {
+      throw automaticReconnectCooldownError(connectionId);
     }
     const localAttempt = beginLocalConnectionAttempt(connectionId);
     const metadataRevision = connectionStateRevision(connectionId);
@@ -5728,6 +5806,7 @@ export const useConnectionStore = defineStore("connection", () => {
     connectInFlight.set(connectionId, connectPromise);
     try {
       await connectPromise;
+      clearAutomaticReconnectCooldown(connectionId);
       ensureLocalConnectionAttemptActive(connectionId, localAttempt);
       if (options.activate !== false) activeConnectionId.value = connectionId;
     } catch (e) {
@@ -5745,6 +5824,8 @@ export const useConnectionStore = defineStore("connection", () => {
       // 记到连接节点上，也避免搜索每轮都重复报同一个错。
       if (isSidebarSearchLoad(connectionId) && !isSupersededConnectionAttempt(e)) recordSidebarSearchConnectionFailure(connectionId, e);
       else recordConnectionError(connectionId, e);
+      // 只有后台/被动路径的失败才计入退避；用户主动发起的失败不惩罚后续用户操作。
+      if (options.passive && !isSupersededConnectionAttempt(e)) noteAutomaticReconnectFailure(connectionId, e);
       clearConnectionNodeLoading(connectionId);
       throw e;
     } finally {
@@ -8775,6 +8856,12 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function refreshTreeNodeForTableNameFilter(node: TreeNode, scopeKey: string, revision: number) {
     invalidateMetadataCachesForNode(node);
+    // 侧栏搜索索引的生命周期独立于元数据缓存：过滤器变更后若不失效旧索引，
+    // 顶部搜索会继续用未过滤的索引把过滤掉的表重新列出来。
+    const searchIndexScope = sidebarTableSearchIndexScopeForNode(node);
+    if (searchIndexScope) {
+      await invalidateSidebarTableSearchIndexScopes([searchIndexScope], (scope) => scope.parentNodeId === node.id);
+    }
     // !node.tableName is generic: table-level structure groups (columns/indexes/fkeys/constraints/partitions/table triggers)
     // stay off the schema-level object-group loader, not just triggers.
     if (objectTypesForGroupNode(node.type) && !node.tableName) {
@@ -10602,7 +10689,14 @@ export const useConnectionStore = defineStore("connection", () => {
   function reprojectTableVGroupScope(scope: TableVGroupScope, scopeKey: string, tableName?: string, rowType?: string) {
     const container = findTableVGroupContainerNode(treeNodes.value, scope, tableName, rowType);
     if (!container?.children) return;
-    if (container.children.some((child) => child.type === "group-tables" || isTreeGroupNodeType(child.type))) return;
+    if (container.children.some((child) => child.type === "group-tables" || isTreeGroupNodeType(child.type))) {
+      container.children = stripTableVGroupsFromChildren(container.children);
+      return;
+    }
+    const parent = findParentNode(treeNodes.value, container.id);
+    if (parent?.children && parent.children.some((child) => child.type === "group-tables" || isTreeGroupNodeType(child.type))) {
+      parent.children = stripTableVGroupsFromChildren(parent.children);
+    }
     container.children = applyTableVGroupsToChildren(stripTableVGroupsFromChildren(container.children), tableVGroupLayouts.value[scopeKey], scope);
   }
 
@@ -11060,7 +11154,7 @@ export const useConnectionStore = defineStore("connection", () => {
       const { readFile } = await import("@tauri-apps/plugin-fs");
       const { decodeImportFileText } = await import("@/lib/common/decodeText");
       const path = await open({
-        filters: source === "navicat" ? [{ name: "Navicat Connection Export", extensions: ["ncx", "xml"] }] : [{ name: source === "rdm" ? "RedisDesktopManager JSON" : "DBX JSON", extensions: ["json"] }],
+        filters: source === "another-redis" ? [{ name: "Another Redis Desktop Manager", extensions: ["ano"] }] : source === "navicat" ? [{ name: "Navicat Connection Export", extensions: ["ncx", "xml"] }] : [{ name: source === "rdm" ? "RedisDesktopManager JSON" : "DBX JSON", extensions: ["json"] }],
         multiple: false,
       });
       if (!path) return null;
@@ -11072,7 +11166,7 @@ export const useConnectionStore = defineStore("connection", () => {
       content = await new Promise<string>((resolve, reject) => {
         const input = document.createElement("input");
         input.type = "file";
-        input.accept = source === "navicat" ? ".ncx,.xml" : ".json";
+        input.accept = source === "another-redis" ? ".ano" : source === "navicat" ? ".ncx,.xml" : ".json";
         input.onchange = () => {
           const file = input.files?.[0];
           if (!file) {
@@ -11089,6 +11183,7 @@ export const useConnectionStore = defineStore("connection", () => {
     }
 
     if (source === "rdm") return { content: JSON.stringify({ format: "rdm-import", content }), encrypted: false };
+    if (source === "another-redis") return { content: JSON.stringify({ format: "another-redis-import", content }), encrypted: false };
     if (content.trimStart().startsWith("<")) {
       return { content, encrypted: false };
     }
@@ -11106,6 +11201,11 @@ export const useConnectionStore = defineStore("connection", () => {
 
     if (!passphrase) {
       const payload: unknown = JSON.parse(content);
+      if (payload && typeof payload === "object" && "format" in payload && payload.format === "another-redis-import") {
+        if (!("content" in payload) || typeof payload.content !== "string") throw new Error("Another Redis Desktop Manager: invalid import payload.");
+        const { parseAnotherRedisImport } = await import("@/lib/imports/anotherRedisImport");
+        return parseAnotherRedisImport(payload.content);
+      }
       if (payload && typeof payload === "object" && "format" in payload && payload.format === "rdm-import") {
         if (!("content" in payload) || typeof payload.content !== "string") throw new Error("RedisDesktopManager: invalid import payload.");
         const { parseRedisDesktopManagerImport } = await import("@/lib/imports/redisDesktopManagerImport");
@@ -11239,7 +11339,7 @@ export const useConnectionStore = defineStore("connection", () => {
         // 整体覆盖内存布局前，先落盘窗口内未写盘的分组编辑（防止 300ms 防抖窗口
         // 内的编辑被备份轮询/重载带回的旧快照静默回滚）。
         await flushTableVGroupPersist();
-        const [pinnedOrder, saved, , loadedTableVGroups] = await Promise.all([loadPinnedTreeNodeOrder(), api.loadConnections(), tunnelProfileStore.init(), api.loadTableVGroups()]);
+        const [pinnedOrder, saved, , loadedTableVGroups] = await Promise.all([loadPinnedTreeNodeOrder(), api.loadConnections(settingsStore.editorSettings.sidebarShowUserAdmin !== false), tunnelProfileStore.init(), api.loadTableVGroups()]);
         setPinnedTreeNodeOrder(pinnedOrder);
         await migrateTimeoutInheritance(saved);
         const loadedConnections = saved.map(normalizeConnection).map((loadedConfig) => {

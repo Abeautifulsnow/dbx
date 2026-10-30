@@ -21,7 +21,7 @@ async function getBackend(): Promise<Backend> {
 // Helper: create a forwarding function that lazily resolves the backend
 // ---------------------------------------------------------------------------
 
-function forward<K extends keyof Backend>(name: K): Backend[K] {
+function forward<K extends keyof Backend>(name: K, logErrorDetails = true): Backend[K] {
   // SAFETY: the resolved module is one of exactly two implementations of the same
   // surface — `http.ts` imports its request/response types from `tauri.ts` on
   // purpose, so both transports are kept signature-compatible by construction.
@@ -42,7 +42,7 @@ function forward<K extends keyof Backend>(name: K): Backend[K] {
       appendDebugLog("error", "[DBX][api:error]", {
         operation,
         elapsedMs: Math.round(performance.now() - startedAt),
-        error,
+        ...(logErrorDetails ? { error } : {}),
       });
       throw error;
     }
@@ -53,8 +53,22 @@ function forward<K extends keyof Backend>(name: K): Backend[K] {
 // Re-export all functions via lazy forwarding
 // ---------------------------------------------------------------------------
 
+// PL/SQL debugger
+export const plDebugBootstrap = forward("plDebugBootstrap", false);
+export const plDebugInspect = forward("plDebugInspect", false);
+export const plDebugCompile = forward("plDebugCompile", false);
+export const plDebugCompileStatus = forward("plDebugCompileStatus", false);
+export const plDebugList = forward("plDebugList", false);
+export const plDebugStart = forward("plDebugStart", false);
+export const plDebugStatus = forward("plDebugStatus", false);
+export const plDebugHeartbeat = forward("plDebugHeartbeat", false);
+export const plDebugOperation = forward("plDebugOperation", false);
+export const plDebugOperate = forward("plDebugOperate", false);
+export const plDebugRead = forward("plDebugRead", false);
+
 // Connection
 export const testConnection = forward("testConnection");
+export const connectionParameters = forward("connectionParameters", false);
 export const testSshTunnel = forward("testSshTunnel");
 export const testConnectionWithInfo = forward("testConnectionWithInfo");
 export const salesforceOauthBrowserAuthorize = forward("salesforceOauthBrowserAuthorize");
@@ -419,6 +433,14 @@ export const loadDesktopSettings = forward("loadDesktopSettings");
 export const saveDesktopSettings = forward("saveDesktopSettings");
 export const loadMcpGlobalPolicy = forward("loadMcpGlobalPolicy");
 export const saveMcpGlobalPolicy = forward("saveMcpGlobalPolicy");
+export const loadMcpToolCatalog = forward("loadMcpToolCatalog");
+export const listPluginMcpViews = forward("listPluginMcpViews");
+export const loadMcpAccessPolicy = forward("loadMcpAccessPolicy");
+export const resetInvalidMcpAccessPolicy = forward("resetInvalidMcpAccessPolicy");
+export const setMcpPluginScopeRule = forward("setMcpPluginScopeRule");
+export const loadPluginMcpView = forward("loadPluginMcpView");
+export const listMcpPluginScopes = forward("listMcpPluginScopes");
+export const savePluginMcpGrant = forward("savePluginMcpGrant");
 export const loadMaxAgentTurns = forward("loadMaxAgentTurns");
 export const loadSqlFileUploadMaxBytes = forward("loadSqlFileUploadMaxBytes");
 export const saveSqlFileUploadMaxMb = forward("saveSqlFileUploadMaxMb");
@@ -646,6 +668,7 @@ export type { DamengDumpKind, DamengDumpRequest, DamengDumpProgress } from "./da
 export const redisListDatabases = forward("redisListDatabases");
 export const redisScanKeys = forward("redisScanKeys");
 export const redisScanKeysBatch = forward("redisScanKeysBatch");
+export const redisKeyMetadataBatch = forward("redisKeyMetadataBatch");
 export const redisScanValues = forward("redisScanValues");
 export const redisGetValue = forward("redisGetValue");
 export const redisGetRawValue = forward("redisGetRawValue");
@@ -1106,6 +1129,7 @@ export type {
   RedisDatabaseInfo,
   RedisHashItem,
   RedisKeyInfo,
+  RedisKeyMetadata,
   RedisKeysExpiryResult,
   RedisListItem,
   RedisSetItem,
@@ -1206,6 +1230,7 @@ export type {
   TableImportRequest,
   TableImportSummary,
   TableImportProgress,
+  TableImportFailure,
   MongoImportFormat,
   MongoImportTypeMode,
   MongoImportInferredType,
