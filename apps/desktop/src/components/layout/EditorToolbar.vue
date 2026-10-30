@@ -529,6 +529,9 @@ const isActiveDatabaseDefault = computed(() => isDefaultDatabase(props.activeCon
 // tier contract.
 
 const showOverflowMenu = computed(() => toolbarTier.value >= 1);
+// A boolean computed keeps keystrokes from re-rendering the toolbar: it only
+// notifies when the editor flips between empty and non-empty.
+const hasSqlText = computed(() => /\S/.test(props.activeTab.sql));
 const canFormatSql = computed(() => canFormatSqlForDatabaseType(props.activeConnection?.db_type));
 const showFormatButton = computed(() => canFormatSql.value && toolbarTier.value < 2);
 const showExplainAnalyzeToggle = computed(() => toolbarTier.value < 3);
@@ -666,7 +669,7 @@ defineExpose({
       </Tooltip>
       <Tooltip>
         <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6" :class="executeAllButtonClass" :disabled="activeTab.isExecuting || activeTab.isCancelling || activeTab.isExplaining || !activeTab.sql.trim()" :aria-label="t('toolbar.executeAllSql')" @click="onExecuteAllClick">
+          <Button variant="ghost" size="icon" class="h-6 w-6" :class="executeAllButtonClass" :disabled="activeTab.isExecuting || activeTab.isCancelling || activeTab.isExplaining || !hasSqlText" :aria-label="t('toolbar.executeAllSql')" @click="onExecuteAllClick">
             <FastForward class="h-3.5 w-3.5" />
           </Button>
         </TooltipTrigger>
@@ -732,7 +735,7 @@ defineExpose({
       </Tooltip>
       <Tooltip v-if="showFormatButton">
         <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6 text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-300 dark:hover:text-amber-200" :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @click="emit('formatSql')">
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-300 dark:hover:text-amber-200" :disabled="activeTab.isExecuting || activeTab.isExplaining || !hasSqlText" @click="emit('formatSql')">
             <AlignLeft class="h-3.5 w-3.5" />
           </Button>
         </TooltipTrigger>
@@ -740,7 +743,7 @@ defineExpose({
       </Tooltip>
       <Tooltip v-if="showCompressButton">
         <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6 text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-300 dark:hover:text-amber-200" :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @click="emit('compressSql')">
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-300 dark:hover:text-amber-200" :disabled="activeTab.isExecuting || activeTab.isExplaining || !hasSqlText" @click="emit('compressSql')">
             <Minimize2 class="h-3.5 w-3.5" />
           </Button>
         </TooltipTrigger>
@@ -748,7 +751,7 @@ defineExpose({
       </Tooltip>
       <Tooltip v-if="showFoldButtons">
         <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6 text-muted-foreground hover:bg-muted hover:text-foreground" :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" :aria-label="t('toolbar.foldAll')" @click="emit('foldAll')">
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-muted-foreground hover:bg-muted hover:text-foreground" :disabled="activeTab.isExecuting || activeTab.isExplaining || !hasSqlText" :aria-label="t('toolbar.foldAll')" @click="emit('foldAll')">
             <FoldVertical class="h-3.5 w-3.5" />
           </Button>
         </TooltipTrigger>
@@ -756,7 +759,7 @@ defineExpose({
       </Tooltip>
       <Tooltip v-if="showFoldButtons">
         <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6 text-muted-foreground hover:bg-muted hover:text-foreground" :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" :aria-label="t('toolbar.unfoldAll')" @click="emit('unfoldAll')">
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-muted-foreground hover:bg-muted hover:text-foreground" :disabled="activeTab.isExecuting || activeTab.isExplaining || !hasSqlText" :aria-label="t('toolbar.unfoldAll')" @click="emit('unfoldAll')">
             <UnfoldVertical class="h-3.5 w-3.5" />
           </Button>
         </TooltipTrigger>
@@ -904,15 +907,15 @@ defineExpose({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" class="w-max min-w-56 max-w-[calc(100vw-1rem)]">
-          <DropdownMenuItem :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @select="emit('compressSql')">
+          <DropdownMenuItem :disabled="activeTab.isExecuting || activeTab.isExplaining || !hasSqlText" @select="emit('compressSql')">
             <Minimize2 class="h-3.5 w-3.5" />
             {{ t("toolbar.compressSql") }}
           </DropdownMenuItem>
-          <DropdownMenuItem :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @select="emit('foldAll')">
+          <DropdownMenuItem :disabled="activeTab.isExecuting || activeTab.isExplaining || !hasSqlText" @select="emit('foldAll')">
             <FoldVertical class="h-3.5 w-3.5" />
             {{ t("toolbar.foldAll") }}
           </DropdownMenuItem>
-          <DropdownMenuItem :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @select="emit('unfoldAll')">
+          <DropdownMenuItem :disabled="activeTab.isExecuting || activeTab.isExplaining || !hasSqlText" @select="emit('unfoldAll')">
             <UnfoldVertical class="h-3.5 w-3.5" />
             {{ t("toolbar.unfoldAll") }}
           </DropdownMenuItem>
@@ -955,7 +958,7 @@ defineExpose({
             {{ t("settings.showInsertValueHints") }}
           </DropdownMenuCheckboxItem>
           <template v-if="toolbarTier >= 2">
-            <DropdownMenuItem v-if="canFormatSql" :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @select="emit('formatSql')">
+            <DropdownMenuItem v-if="canFormatSql" :disabled="activeTab.isExecuting || activeTab.isExplaining || !hasSqlText" @select="emit('formatSql')">
               <AlignLeft class="h-3.5 w-3.5" />
               {{ t("toolbar.formatSql") }}
             </DropdownMenuItem>

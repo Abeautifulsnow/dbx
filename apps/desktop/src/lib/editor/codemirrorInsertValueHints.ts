@@ -128,6 +128,9 @@ function parseClausesNearView(view: EditorView, dialectId: string): InsertValues
     }
     if (sliceTo <= sliceFrom) continue;
     const slice = doc.sliceString(sliceFrom, sliceTo);
+    // Cheap reject before lexing: a statement window is a substring of the slice, so no INSERT in
+    // the slice means none in the window.
+    if (!/insert/i.test(slice)) continue;
     const window = expandToSqlStatementWindow(slice, range.from - sliceFrom, range.to - sliceFrom, dialectId);
     if (window.to <= window.from) continue;
     const absStart = sliceFrom + window.from;

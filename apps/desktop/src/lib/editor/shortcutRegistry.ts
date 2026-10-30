@@ -870,7 +870,26 @@ export function needsTabNavigationHistoryShortcutMigration(settings?: Partial<Sh
   return !!settings && TAB_NAVIGATION_HISTORY_ACTIONS.some((actionId) => !hasExplicitShortcut(settings, actionId));
 }
 
+// Keystroke handlers (editor keydown, global shortcut matching, Tab handling)
+// normalize the whole table on every key press, and a full pass re-parses every
+// binding. The result is a pure function of the configured values and the
+// platform, so identical input is served from a small content-keyed cache.
+const NORMALIZED_SHORTCUT_CACHE_LIMIT = 8;
+const normalizedShortcutCache = new Map<string, ShortcutSettings>();
+
 export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): ShortcutSettings {
+  // hasExplicitShortcut only counts string values, so JSON dropping `undefined`
+  // members cannot change the outcome.
+  const cacheKey = `${platform}\u0000${settings ? JSON.stringify(settings) : ""}`;
+  const cached = normalizedShortcutCache.get(cacheKey);
+  if (cached) return { ...cached };
+  const normalized = computeNormalizedShortcutSettings(settings, platform);
+  if (normalizedShortcutCache.size >= NORMALIZED_SHORTCUT_CACHE_LIMIT) normalizedShortcutCache.delete(normalizedShortcutCache.keys().next().value!);
+  normalizedShortcutCache.set(cacheKey, normalized);
+  return { ...normalized };
+}
+
+function computeNormalizedShortcutSettings(settings: Partial<ShortcutSettings> | undefined, platform: string): ShortcutSettings {
   const reservedKeyRepairedActionIds = new Set<ShortcutActionId>();
   const normalized = Object.fromEntries(
     SHORTCUT_DEFINITIONS.map((definition) => {
