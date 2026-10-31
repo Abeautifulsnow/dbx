@@ -41,7 +41,7 @@ const props = defineProps<
   }
 >();
 
-const HOT_TAB_SURFACE_CACHE_SIZE = 3;
+const HOT_TAB_SURFACE_CACHE_SIZE = 6;
 
 const emit = defineEmits<
   ContentAreaSurfaceEmits & {
