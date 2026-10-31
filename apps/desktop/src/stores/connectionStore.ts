@@ -3530,14 +3530,21 @@ export const useConnectionStore = defineStore("connection", () => {
   // (a manual collapse never rewrites the cache), so opening a connection would
   // keep auto-expanding a schema the user collapsed. Expansion state is instead
   // restored from the live tree (restoreExpandedChildren) within a session.
+  // Copy-on-write: collapsed subtrees are reused as-is, so persisting a long table page list
+  // only clones the nodes that were actually expanded.
   function stripTreeNodeExpansionState(nodes: TreeNode[]): TreeNode[] {
-    return nodes
-      .filter((node) => (node.type !== "index" || node.objectScope !== "schema") && node.loadMore?.objectType !== "INDEX")
-      .map((node) => ({
-        ...node,
-        isExpanded: false,
-        children: node.children ? stripTreeNodeExpansionState(node.children) : node.children,
-      }));
+    let stripped: TreeNode[] | undefined;
+    nodes.forEach((node, index) => {
+      const dropped = (node.type === "index" && node.objectScope === "schema") || node.loadMore?.objectType === "INDEX";
+      let next: TreeNode | undefined = dropped ? undefined : node;
+      if (!dropped) {
+        const children = node.children ? stripTreeNodeExpansionState(node.children) : node.children;
+        if (node.isExpanded !== false || children !== node.children) next = { ...node, isExpanded: false, children };
+      }
+      if (next !== node && !stripped) stripped = nodes.slice(0, index);
+      if (next) stripped?.push(next);
+    });
+    return stripped ?? nodes;
   }
 
   async function loadPersistedTreeChildren(node: TreeNode, cacheKey: string, load: TreeNodeLoadHandle, options?: { freshOnly?: boolean; isCurrent?: () => boolean; acceptChildren?: (children: TreeNode[]) => boolean }): Promise<PersistedTreeChildrenLoadResult> {

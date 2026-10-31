@@ -406,10 +406,10 @@ function syncPinnedTreeNodeStateInPlaceInternal(nodes: TreeNode[], pinnedIds: Se
     if (visited.has(node)) continue;
     visited.add(node);
     node.pinned = isPinnedKeyPresent(node, pinnedIds);
-    if (node.children) {
+    if (node.children?.length) {
       syncPinnedTreeNodeStateInPlaceInternal(node.children, pinnedIds, pinnedOrder, isFixedPriority, visited, node.type === "table-vgroup");
     }
-    if (node.hiddenChildren) {
+    if (node.hiddenChildren?.length) {
       syncPinnedTreeNodeStateInPlaceInternal(node.hiddenChildren, pinnedIds, pinnedOrder, isFixedPriority, visited, node.type === "table-vgroup");
     }
   }
