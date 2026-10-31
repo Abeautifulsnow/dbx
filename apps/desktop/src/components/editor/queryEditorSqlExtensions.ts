@@ -519,7 +519,7 @@ export function configureQueryEditorSqlExtensions(options: QueryEditorSqlExtensi
 
   function createViewDecorations() {
     const currentStatementFrameExtension = currentStatementFrameLayer(
-      { layer, RectangleMarker },
+      { layer, RectangleMarker, ViewPlugin },
       (view) => {
         if (!settingsStore.editorSettings.showCurrentStatementFrame) return null;
         if (view.state.selection.ranges.some((range) => !range.empty)) return null;
