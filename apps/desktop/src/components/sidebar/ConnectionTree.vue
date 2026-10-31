@@ -859,8 +859,10 @@ function sidebarCommentLabel(node: TreeNode): string {
 
 // Shared by the aligned comment column and the full horizontal content width.
 // Pin controls are reserved separately so unpinned siblings stay aligned too.
-const sidebarTreeLeadingWidthItems = computed(() =>
-  flatNodes.value.map(({ id, depth, node }) => {
+const sidebarTreeLeadingWidthItems = computed(() => {
+  // Only comment alignment and horizontal scrolling consume these measurements.
+  if (settingsStore.editorSettings.sidebarObjectInfoMode !== "comment-aligned" && !settingsStore.editorSettings.sidebarAllowHorizontalScroll) return [];
+  return flatNodes.value.map(({ id, depth, node }) => {
     const config = node.connectionId ? store.getConfig(node.connectionId) : undefined;
     const badges: string[] = [];
     if (node.type === "column" && node.meta) badges.push(t((node.meta as ColumnInfo).is_nullable ? "structureEditor.nullable" : "structureEditor.notNull"));
@@ -870,8 +872,8 @@ const sidebarTreeLeadingWidthItems = computed(() =>
     const secondary = sidebarTreeSecondaryValue(node, t, config ? effectiveDatabaseTypeForConnection(config) : undefined);
     const leadingExtraWidth = (secondary && node.type === "elasticsearch-index" ? 16 : 0) + (node.type === "oracle-db-links" ? 26 : 0);
     return { id, depth, node, label: sidebarCommentLabel(node), badges, secondary, leadingExtraWidth };
-  }),
-);
+  });
+});
 
 function measureSidebarTreeLeadingWidth(item: (typeof sidebarTreeLeadingWidthItems.value)[number], context: CanvasRenderingContext2D): number {
   return context.measureText(item.label).width + item.leadingExtraWidth + item.badges.reduce((width, badge) => width + context.measureText(badge).width + 24, 0) + (item.secondary ? context.measureText(item.secondary).width + 8 : 0);
@@ -917,8 +919,9 @@ function scheduleSidebarCommentLabelMeasure() {
 // Describe every expanded row, including those outside the virtual viewport.
 // Keep text measurement independent of mounted TreeItems so scrolling cannot
 // change the horizontal range or truncate a newly materialized row.
-const sidebarTreeNaturalWidthItems = computed(() =>
-  sidebarTreeLeadingWidthItems.value.map((item) => {
+const sidebarTreeNaturalWidthItems = computed(() => {
+  if (!settingsStore.editorSettings.sidebarAllowHorizontalScroll) return [];
+  return sidebarTreeLeadingWidthItems.value.map((item) => {
     const { depth, node } = item;
     const mode = settingsStore.editorSettings.sidebarObjectInfoMode;
     const comment = mode.startsWith("comment-") ? (sidebarTreeNodeComment(node, settingsStore.editorSettings.sidebarShowConnectionNotes) ?? undefined) : undefined;
@@ -945,8 +948,8 @@ const sidebarTreeNaturalWidthItems = computed(() =>
       badges,
       alignedWidth: comment && mode === "comment-aligned" && node.type !== "connection" ? (sidebarCommentLabelWidths.value.get(node.id) ?? 0) + (canTreeNodePin(node.type) ? sidebarPinnedActionSlotWidthPx : 0) : 0,
     };
-  }),
-);
+  });
+});
 
 function measureSidebarTreeContentWidth() {
   sidebarTreeContentMeasureFrame = 0;

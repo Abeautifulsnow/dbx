@@ -111,12 +111,15 @@ export function withDatabaseSavedSqlRoot(databaseNode: Pick<TreeNode, "id" | "co
 }
 
 export function decorateDatabaseSavedSqlTreeNodes(nodes: readonly TreeNode[], source: SavedSqlDatabaseSource, existingNodes: readonly TreeNode[] = []): TreeNode[] {
-  const existingById = new Map(existingNodes.map((node) => [node.id, node]));
+  let existingById: Map<string, TreeNode> | undefined;
   return nodes.map((node) => {
+    // Childless non-database nodes (the bulk of a large table page) are returned untouched.
+    if (node.type !== "database" && node.children === undefined) return node;
+    existingById ??= new Map(existingNodes.map((existingNode) => [existingNode.id, existingNode] as const));
     const existing = existingById.get(node.id);
     const children = decorateDatabaseSavedSqlTreeNodes(node.children ?? [], source, existing?.children ?? []);
     if (node.type !== "database") {
-      return node.children === undefined ? node : { ...node, children };
+      return { ...node, children };
     }
 
     const databaseNode = {
@@ -131,11 +134,12 @@ export function decorateDatabaseSavedSqlTreeNodes(nodes: readonly TreeNode[], so
 }
 
 export function stripDatabaseSavedSqlTreeNodes(nodes: readonly TreeNode[]): TreeNode[] {
-  return nodes.flatMap((node) => {
-    if (node.type === "saved-sql-root" || node.type === "saved-sql-file" || node.type === "saved-sql-folder") return [];
+  const stripped: TreeNode[] = [];
+  for (const node of nodes) {
+    if (node.type === "saved-sql-root" || node.type === "saved-sql-file" || node.type === "saved-sql-folder") continue;
     const children = node.children ? stripDatabaseSavedSqlTreeNodes(node.children) : undefined;
     const hiddenChildren = node.hiddenChildren ? stripDatabaseSavedSqlTreeNodes(node.hiddenChildren) : undefined;
-    if (children === node.children && hiddenChildren === node.hiddenChildren) return [node];
-    return [{ ...node, children, hiddenChildren }];
-  });
+    stripped.push(children === node.children && hiddenChildren === node.hiddenChildren ? node : { ...node, children, hiddenChildren });
+  }
+  return stripped;
 }
