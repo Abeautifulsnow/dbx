@@ -360,14 +360,24 @@ export function mergeSidebarRegexIndexScopes(liveNodes: readonly TreeNode[], sco
 }
 
 function applySearchCollapsedState(node: TreeNode, collapsedIds: ReadonlySet<string>): TreeNode {
-  const children = node.children?.map((child) => applySearchCollapsedState(child, collapsedIds));
-  const childrenChanged = children?.some((child, index) => child !== node.children?.[index]) ?? false;
+  // With nothing collapsed no node can change, so a matched database or schema holding thousands of
+  // tables is not walked (and every leaf is not re-allocated) on each keystroke.
+  if (collapsedIds.size === 0) return node;
+  let children: TreeNode[] | undefined;
+  const source = node.children;
+  if (source && source.length > 0) {
+    for (let index = 0; index < source.length; index++) {
+      const child = applySearchCollapsedState(source[index], collapsedIds);
+      if (child !== source[index] && !children) children = source.slice(0, index);
+      children?.push(child);
+    }
+  }
   const collapsed = collapsedIds.has(node.id);
-  if (!collapsed && !childrenChanged) return node;
+  if (!collapsed && !children) return node;
 
   return {
     ...node,
-    children: childrenChanged ? children : node.children,
+    children: children ?? node.children,
     isExpanded: collapsed ? false : node.isExpanded,
   };
 }
